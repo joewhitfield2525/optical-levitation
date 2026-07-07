@@ -1,0 +1,396 @@
+import time
+
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.integrate import solve_ivp
+
+
+# ---------------------------------------------------------------------
+# Parameters
+# ---------------------------------------------------------------------
+m = 1.0
+k = 1000.0
+damping_ratio = 0.1
+
+b = damping_ratio * 2 * np.sqrt(m * k)
+
+x0 = 1.0
+v0 = 0.0
+
+t_start = 0.0
+t_end = 5.0
+t_eval = np.linspace(t_start, t_end, 5000)
+
+
+# ---------------------------------------------------------------------
+# Analytic solution
+# ---------------------------------------------------------------------
+omega0 = np.sqrt(k / m)
+gamma = b / (2 * m)
+
+if damping_ratio >= 1:
+    raise ValueError("This analytic example is currently written for the underdamped case.")
+
+omega_d = np.sqrt(omega0**2 - gamma**2)
+
+
+def analytic_solution(t):
+    """
+    Analytic solution of:
+
+        m x'' + b x' + k x = 0
+
+    for the underdamped case.
+    """
+    A = x0
+    B = (v0 + gamma * x0) / omega_d
+
+    exp_part = np.exp(-gamma * t)
+    x = exp_part * (A * np.cos(omega_d * t) + B * np.sin(omega_d * t))
+
+    v = exp_part * (
+        -gamma * (A * np.cos(omega_d * t) + B * np.sin(omega_d * t))
+        + (-A * omega_d * np.sin(omega_d * t) + B * omega_d * np.cos(omega_d * t))
+    )
+
+    return x, v
+
+
+x_exact, v_exact = analytic_solution(t_eval)
+
+
+# ---------------------------------------------------------------------
+# Numerical model
+# ---------------------------------------------------------------------
+def damped_oscillator(t, Y):
+    x, v = Y
+    dxdt = v
+    dvdt = -(b / m) * v - (k / m) * x
+    return [dxdt, dvdt]
+
+
+methods = ["RK45", "DOP853", "Radau", "BDF", "LSODA"]
+
+results = {}
+step_results = {}
+
+for method in methods:
+    start = time.perf_counter()
+
+    sol = solve_ivp(
+        damped_oscillator,
+        [t_start, t_end],
+        [x0, v0],
+        t_eval=t_eval,
+        method=method,
+        rtol=1e-9,
+        atol=[1e-12, 1e-12],
+    )
+
+    runtime = time.perf_counter() - start
+
+    if not sol.success:
+        print(method, "failed:", sol.message)
+        continue
+
+    x_num = sol.y[0]
+    v_num = sol.y[1]
+
+    x_error = np.abs(x_num - x_exact)
+    v_error = np.abs(v_num - v_exact)
+    x_cummax_error = np.maximum.accumulate(x_error)
+    v_cummax_error = np.maximum.accumulate(v_error)
+
+    results[method] = {
+        "x": x_num,
+        "v": v_num,
+        "x_error": x_error,
+        "v_error": v_error,
+        "x_cummax_error": x_cummax_error,
+        "v_cummax_error": v_cummax_error,
+        "max_x_error": np.max(x_error),
+        "max_v_error": np.max(v_error),
+        "rms_x_error": np.sqrt(np.mean(x_error**2)),
+        "runtime": runtime,
+        "nfev": sol.nfev,
+    }
+
+    # Run again without t_eval so sol.t contains the solver's accepted
+    # internal timesteps rather than the user-requested output times.
+    step_sol = solve_ivp(
+        damped_oscillator,
+        [t_start, t_end],
+        [x0, v0],
+        method=method,
+        rtol=1e-9,
+        atol=[1e-12, 1e-12],
+    )
+
+    if step_sol.success:
+        internal_steps = np.diff(step_sol.t)
+        step_results[method] = {
+            "t": step_sol.t,
+            "steps": internal_steps,
+            "n_steps": len(internal_steps),
+            "min_step": np.min(internal_steps),
+            "max_step": np.max(internal_steps),
+            "mean_step": np.mean(internal_steps),
+            "median_step": np.median(internal_steps),
+            "nfev": step_sol.nfev,
+        }
+
+
+# ---------------------------------------------------------------------
+# Print summary table
+# ---------------------------------------------------------------------
+print("Damped oscillator solver benchmark")
+print("m =", m)
+print("k =", k)
+print("b =", b)
+print("damping ratio =", damping_ratio)
+print("omega0 =", omega0)
+print("omega_d =", omega_d)
+print()
+print(f"{'method':<8} {'runtime/s':>12} {'nfev':>8} {'max |x err|':>14} {'RMS |x err|':>14} {'max |v err|':>14}")
+
+for method, data in results.items():
+    print(
+        f"{method:<8} "
+        f"{data['runtime']:>12.5g} "
+        f"{data['nfev']:>8} "
+        f"{data['max_x_error']:>14.5e} "
+        f"{data['rms_x_error']:>14.5e} "
+        f"{data['max_v_error']:>14.5e}"
+    )
+
+print()
+print("Final cumulative max errors")
+print(f"{'method':<8} {'cummax |x err|':>18} {'cummax |v err|':>18}")
+
+for method, data in results.items():
+    print(
+        f"{method:<8} "
+        f"{data['x_cummax_error'][-1]:>18.5e} "
+        f"{data['v_cummax_error'][-1]:>18.5e}"
+    )
+
+print()
+print("Accepted internal timestep summary")
+print(
+    f"{'method':<8} "
+    f"{'steps':>8} "
+    f"{'nfev':>8} "
+    f"{'min dt':>12} "
+    f"{'median dt':>12} "
+    f"{'mean dt':>12} "
+    f"{'max dt':>12}"
+)
+
+for method, data in step_results.items():
+    print(
+        f"{method:<8} "
+        f"{data['n_steps']:>8} "
+        f"{data['nfev']:>8} "
+        f"{data['min_step']:>12.5e} "
+        f"{data['median_step']:>12.5e} "
+        f"{data['mean_step']:>12.5e} "
+        f"{data['max_step']:>12.5e}"
+    )
+
+
+# ---------------------------------------------------------------------
+# Plot displacement comparison
+# ---------------------------------------------------------------------
+plt.figure(figsize=(9, 5))
+plt.plot(t_eval, x_exact, color="black", linewidth=2, label="analytic")
+
+for method, data in results.items():
+    plt.plot(t_eval, data["x"], "--", linewidth=1, label=method)
+
+plt.xlabel("Time / s")
+plt.ylabel("Displacement x")
+plt.title("Damped harmonic oscillator: analytic vs numerical")
+plt.legend()
+plt.grid()
+plt.show()
+
+
+# ---------------------------------------------------------------------
+# Plot absolute error as a function of time
+# ---------------------------------------------------------------------
+plt.figure(figsize=(9, 5))
+
+for method, data in results.items():
+    plt.semilogy(t_eval, data["x_error"], label=method)
+
+plt.xlabel("Time / s")
+plt.ylabel("Absolute displacement error")
+plt.title("Error vs time")
+plt.legend()
+plt.grid(True, which="both")
+plt.show()
+
+
+# ---------------------------------------------------------------------
+# Energy conservation test for the undamped oscillator
+# ---------------------------------------------------------------------
+# This is a separate test for numerical heating. With b = 0, the exact
+# mechanical energy should be constant:
+#
+#     E = 0.5*m*v^2 + 0.5*k*x^2
+#
+# Upward drift in E indicates numerical heating.
+
+
+def undamped_oscillator(t, Y):
+    x, v = Y
+    dxdt = v
+    dvdt = -(k / m) * x
+    return [dxdt, dvdt]
+
+
+energy_results = {}
+
+for method in methods:
+    sol = solve_ivp(
+        undamped_oscillator,
+        [t_start, t_end],
+        [x0, v0],
+        t_eval=t_eval,
+        method=method,
+        rtol=1e-9,
+        atol=[1e-12, 1e-12],
+    )
+
+    if not sol.success:
+        print(method, "failed in energy test:", sol.message)
+        continue
+
+    x_num = sol.y[0]
+    v_num = sol.y[1]
+
+    E_num = 0.5 * m * v_num**2 + 0.5 * k * x_num**2
+    relative_energy_error = (E_num - E_num[0]) / E_num[0]
+
+    energy_results[method] = {
+        "E": E_num,
+        "relative_energy_error": relative_energy_error,
+        "max_abs_relative_energy_error": np.max(np.abs(relative_energy_error)),
+        "final_relative_energy_error": relative_energy_error[-1],
+    }
+
+
+print()
+print("Undamped energy conservation test")
+print(
+    f"{'method':<8} "
+    f"{'max |dE/E0|':>16} "
+    f"{'final dE/E0':>16}"
+)
+
+for method, data in energy_results.items():
+    print(
+        f"{method:<8} "
+        f"{data['max_abs_relative_energy_error']:>16.5e} "
+        f"{data['final_relative_energy_error']:>16.5e}"
+    )
+
+
+plt.figure(figsize=(9, 5))
+
+for method, data in energy_results.items():
+    plt.plot(t_eval, data["relative_energy_error"], label=method)
+
+plt.xlabel("Time / s")
+plt.ylabel("(E(t) - E(0)) / E(0)")
+plt.title("Relative energy drift, undamped oscillator")
+plt.legend()
+plt.grid()
+plt.show()
+
+
+plt.figure(figsize=(9, 5))
+
+for method, data in energy_results.items():
+    plt.semilogy(
+        t_eval,
+        np.abs(data["relative_energy_error"]),
+        label=method,
+    )
+
+plt.xlabel("Time / s")
+plt.ylabel("|(E(t) - E(0)) / E(0)|")
+plt.title("Absolute relative energy error, undamped oscillator")
+plt.legend()
+plt.grid(True, which="both")
+plt.show()
+
+
+# ---------------------------------------------------------------------
+# Plot cumulative maximum displacement error
+# ---------------------------------------------------------------------
+plt.figure(figsize=(9, 5))
+
+for method, data in results.items():
+    plt.semilogy(t_eval, data["x_cummax_error"], label=method)
+
+plt.xlabel("Time / s")
+plt.ylabel("Cumulative max displacement error")
+plt.title("Worst displacement error reached up to time t")
+plt.legend()
+plt.grid(True, which="both")
+plt.show()
+
+
+# ---------------------------------------------------------------------
+# Plot adaptive internal timestep for each solver
+# ---------------------------------------------------------------------
+plt.figure(figsize=(9, 5))
+
+for method, data in step_results.items():
+    plt.semilogy(data["t"][:-1], data["steps"], label=method)
+
+plt.xlabel("Time / s")
+plt.ylabel("Accepted internal timestep / s")
+plt.title("Adaptive solver timestep vs time")
+plt.legend()
+plt.grid(True, which="both")
+plt.show()
+
+
+# ---------------------------------------------------------------------
+# Plot histogram of accepted internal timesteps
+# ---------------------------------------------------------------------
+plt.figure(figsize=(9, 5))
+
+for method, data in step_results.items():
+    plt.hist(
+        data["steps"],
+        bins=40,
+        histtype="step",
+        linewidth=1.4,
+        label=method,
+    )
+
+plt.xlabel("Accepted internal timestep / s")
+plt.ylabel("Count")
+plt.title("Distribution of accepted solver timesteps")
+plt.legend()
+plt.grid()
+plt.show()
+
+
+# ---------------------------------------------------------------------
+# Plot velocity error as a function of time
+# ---------------------------------------------------------------------
+plt.figure(figsize=(9, 5))
+
+for method, data in results.items():
+    plt.semilogy(t_eval, data["v_error"], label=method)
+
+plt.xlabel("Time / s")
+plt.ylabel("Absolute velocity error")
+plt.title("Velocity error vs time")
+plt.legend()
+plt.grid(True, which="both")
+plt.show()

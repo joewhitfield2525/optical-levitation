@@ -1,0 +1,617 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.integrate import solve_ivp
+from scipy.optimize import brentq
+
+
+# ****************************************************************************************************************************************************
+# Constants
+# ****************************************************************************************************************************************************
+g = 9.81
+
+# ****************************************************************************************************************************************************
+# Particle properties
+# ****************************************************************************************************************************************************
+radius = 5e-6          # m
+density = 2200         # kg/m^3
+
+volume = (4/3) * np.pi * radius**3
+m = density * volume
+
+print("Particle mass =", m, "kg")
+print("Weight mg =", m*g, "N")
+
+# ****************************************************************************************************************************************************
+# Gas properties
+# ****************************************************************************************************************************************************
+p = 100          # pressure, Pa
+T = 293           # temperature, K
+eta = 1.8e-5      # dynamic viscosity of air, Pa s
+M_air = 0.029     # molar mass of air, kg/mol
+R = 8.314         # gas constant, J/(mol K)
+kB = 1.38e-23
+d_air = 3.7e-10
+
+rho_g = p * M_air / (R * T)
+lambda_mfp = kB * T / (np.sqrt(2) * np.pi * d_air**2 * p)
+Kn = lambda_mfp / radius
+
+print("Gas density =", rho_g, "kg/m^3")
+print("Mean free path =", lambda_mfp, "m")
+print("Knudsen number =", Kn)
+
+# ****************************************************************************************************************************************************
+# Laser / force parameters
+# ****************************************************************************************************************************************************
+zR = 100e-6       # Rayleigh-like axial length scale, m
+w0 = 20e-6        # beam waist, m
+
+# Laser power and peak intensity.
+# For a Gaussian beam, the peak intensity at the waist is:
+#
+#     I0 = 2 P_laser / (pi w0^2)
+#
+# The dimensionless intensity(x, y, z) function below then describes the
+# relative spatial shape of the beam.
+P_laser = 0.1             # W
+I0 = 2 * P_laser / (np.pi * w0**2)   # W/m^2
+
+# Scattering/radiation-pressure force scale.
+# This estimates the upward scattering force at the beam focus from the
+# local laser intensity:
+#
+#     F_scat = Q_pr * sigma_geom * I / c
+#
+# where sigma_geom = pi radius^2. Q_pr is an efficiency factor; Q_pr = 1 is
+# a reasonable order-of-magnitude starting point, but it is still a model
+# parameter unless you calculate it from Mie theory or experimental data.
+c_light = 299792458       # m/s
+Q_pr = 1.0
+sigma_geom = np.pi * radius**2
+Fs0 = Q_pr * sigma_geom * I0 / c_light
+
+# The gradient-force strength is still phenomenological for now.
+# This keeps the trap tunable while the scattering force is placed on a
+# physical laser-power scale.
+Fg0 = 1.0 * m * g
+
+# Calibrated so that on-axis Fz_grad(x=0, z) matches the old 1D gradient force.
+alpha_grad = Fg0 * zR / 2
+
+print("Laser power =", P_laser, "W")
+print("Peak intensity I0 =", I0, "W/m^2")
+print("Scattering efficiency Q_pr =", Q_pr)
+print("Fs0 from laser power =", Fs0, "N")
+print("Fs0 / mg =", Fs0 / (m*g))
+print("alpha_grad =", alpha_grad, "N m")
+
+
+def beam_width(z):
+    """
+    Gaussian-beam-like width.
+    """
+    return w0 * np.sqrt(1 + (z / zR)**2)
+
+
+def intensity(x, y, z):
+    """
+    Dimensionless 2D intensity profile.
+
+    On-axis this reduces to:
+        I(0, z) = 1 / (1 + (z/zR)^2)
+
+    so the scattering force matches the old 1D model along x = 0.
+    """
+    s = 1 + (z / zR)**2
+    return (1 / s) * np.exp(-2 * (x**2+y**2) / (w0**2 * s))
+
+
+def grad_intensity(x, y, z):
+    """
+    Analytic gradient of the dimensionless intensity.
+    Returns dI/dx and dI/dz.
+    """
+    s = 1 + (z / zR)**2
+    I = intensity(x, y, z)
+
+    dIdx = I * (-4 * x / (w0**2 * s))
+    dIdy = I * (-4 * y / (w0**2 * s))
+
+    dsdz = 2 * z / zR**2
+    dlogI_dz = dsdz * (-1 / s + 2 * (x**2+y**2) / (w0**2 * s**2))
+    dIdz = I * dlogI_dz
+
+    return dIdx, dIdy, dIdz
+
+
+def F_grad_2d(x, y, z):
+    """
+    Gradient force pulling the particle toward higher intensity.
+    """
+    dIdx, dIdy, dIdz = grad_intensity(x, y, z)
+    return alpha_grad * dIdx, alpha_grad * dIdy ,alpha_grad * dIdz
+
+
+def F_scat_2d(x, y, z):
+    """
+    Scattering/radiation-pressure force.
+    In this simple model it points only upward, in +z.
+    """
+    return 0.0, 0.0, Fs0 * intensity(x, y, z)
+
+
+# ****************************************************************************************************************************************************
+# Photophoretic force parameters
+# ****************************************************************************************************************************************************
+# -----------------------------
+# Photophoretic force parameters
+# -----------------------------
+k_particle = 1.4          # W/(m K), approximate silica
+alpha_acc = 1.0           # thermal accommodation coefficient
+kappa_t = 1.14            # thermal creep coefficient
+absorption_fraction = 1e-4
+
+
+def mean_thermal_speed():
+    return np.sqrt(8 * R * T / (np.pi * M_air))
+
+
+def photophoretic_D():
+    c_bar = mean_thermal_speed()
+    return (np.pi * c_bar * eta / (2 * T)) * np.sqrt(np.pi * kappa_t / 3)
+
+
+def photophoretic_p_max():
+    D = photophoretic_D()
+    return (3 * T / (np.pi * radius)) * D * np.sqrt(2 / alpha_acc)
+
+
+def absorbed_intensity(x, y, z):
+    return absorption_fraction * I0 * intensity(x, y, z)
+
+
+def photophoretic_force_magnitude(x, y, z):
+    D = photophoretic_D()
+    p_max_ph = photophoretic_p_max()
+
+    I_abs = absorbed_intensity(x, y, z)
+
+    F_max = (
+        0.5
+        * radius**2
+        * D
+        * np.sqrt(alpha_acc / 2)
+        * I_abs
+        / k_particle
+    )
+
+    return 2 * F_max / ((p / p_max_ph) + (p_max_ph / p))
+
+
+def F_photo_2d(x,y,  z):
+    """
+    Improved photophoretic force.
+    Positive sign means force points upward, in +z.
+    """
+    return 0.0, 0.0, photophoretic_force_magnitude(x, y,z)
+
+
+def F_optical_2d(x, y, z):
+    """
+    Total optical/photophoretic force, excluding gravity and damping.
+    """
+    Fx_grad, Fy_grad, Fz_grad = F_grad_2d(x, y, z)
+    Fx_scat, Fy_scat, Fz_scat = F_scat_2d(x, y, z)
+    Fx_photo, Fy_photo, Fz_photo = F_photo_2d(x, y, z)
+
+    Fx = Fx_grad + Fx_scat + Fx_photo
+    Fy = Fy_grad + Fy_scat + Fy_photo
+    Fz = Fz_grad + Fz_scat + Fz_photo
+
+    return Fx, Fy, Fz
+
+
+def Fz_net_on_axis(z):
+    """
+    Net vertical force along x = 0, excluding damping.
+    """
+    _, _, Fz = F_optical_2d(0.0, 0.0, z)
+    return Fz - m*g
+
+
+# ****************************************************************************************************************************************************
+# Find on-axis equilibrium
+# ****************************************************************************************************************************************************
+z_min = -500e-6
+z_max = 500e-6
+
+z_scan = np.linspace(z_min, z_max, 3000)
+F_scan = Fz_net_on_axis(z_scan)
+
+roots = []
+
+for i in range(len(z_scan) - 1):
+    if F_scan[i] * F_scan[i + 1] < 0:
+        root = brentq(Fz_net_on_axis,z_scan[i],z_scan[i + 1],xtol=1e-15,rtol=1e-15)
+        roots.append(root)
+
+print("On-axis equilibrium positions / micrometres:")
+for root in roots:
+    print(root * 1e6)
+
+
+def numerical_derivative_1d(func, z, h=1e-9):
+    return (func(z + h) - func(z - h)) / (2*h)
+
+
+stable_roots = []
+
+for root in roots:
+    slope = numerical_derivative_1d(Fz_net_on_axis, root)
+    if slope < 0:
+        stable_roots.append(root)
+
+if len(stable_roots) == 0:
+    raise ValueError("No stable on-axis equilibrium found.")
+
+x_eq = 0.0
+y_eq = 0.0
+z_eq = stable_roots[0]
+
+print("Chosen equilibrium x =", x_eq * 1e6, "micrometres")
+print("Chosen equilibrium y =", y_eq * 1e6, "micrometres")
+print("Chosen equilibrium z =", z_eq * 1e6, "micrometres")
+print("Fz_net_on_axis(z_eq) =", Fz_net_on_axis(z_eq), "N")
+
+# ****************************************************************************************************************************************************
+# Local spring constants
+# ****************************************************************************************************************************************************
+
+
+def Fx_at_x(x):
+    Fx, _ , _= F_optical_2d(x, y_eq, z_eq)
+    return Fx
+
+def Fy_at_y(y):
+    _, Fy , _= F_optical_2d(x_eq, y, z_eq)
+    return Fy
+
+
+def Fz_net_at_z(z):
+    _, _, Fz = F_optical_2d(x_eq, y_eq, z)
+    return Fz - m*g
+
+
+kx = -numerical_derivative_1d(Fx_at_x, x_eq)
+ky = -numerical_derivative_1d(Fy_at_y, y_eq)
+kz = -numerical_derivative_1d(Fz_net_at_z, z_eq)
+
+omega_x = np.sqrt(kx / m)
+omega_y = np.sqrt(ky / m)
+omega_z = np.sqrt(kz / m)
+
+print("kx =", kx, "N/m")
+print("ky =", ky, "N/m")
+print("kz =", kz, "N/m")
+print("fx =", omega_x / (2*np.pi), "Hz")
+print("fy =", omega_y / (2*np.pi), "Hz")
+print("fz =", omega_z / (2*np.pi), "Hz")
+
+x_rms_thermal = np.sqrt(kB * T / kx)
+y_rms_thermal = np.sqrt(kB * T / ky)
+z_rms_thermal = np.sqrt(kB * T / kz)
+
+print("Expected x thermal RMS =", x_rms_thermal * 1e6, "micrometres")
+print("Expected y thermal RMS =", y_rms_thermal * 1e6, "micrometres")
+print("Expected z thermal RMS =", z_rms_thermal * 1e6, "micrometres")
+
+# ****************************************************************************************************************************************************
+# Damping
+# ****************************************************************************************************************************************************
+def cunningham_correction(Kn):
+    A = 1.257
+    B = 0.4
+    C = 1.1
+    return 1 + Kn * (A + B * np.exp(-C / Kn))
+
+def damping_coefficient_stokes_cunningham(p):
+    lambda_mfp = kB * T / (np.sqrt(2) * np.pi * d_air**2 * p)
+    Kn = lambda_mfp / radius
+
+    Cc = cunningham_correction(Kn)
+    b = 6 * np.pi * eta * radius / Cc
+
+    return b
+
+b = damping_coefficient_stokes_cunningham(p)
+
+print("Pressure-dependent damping b =", b, "kg/s")
+print("Damping ratio x =", b / (2 * np.sqrt(m * kx)))
+print("Damping ratio z =", b / (2 * np.sqrt(m * kz)))
+# ****************************************************************************************************************************************************
+# Deterministic 3D nonlinear equation
+# ****************************************************************************************************************************************************
+
+
+def nonlinear_system_2d(t,Y):
+    x, y, z, vx, vy, vz = Y
+
+    Fx, Fy, Fz = F_optical_2d(x, y, z)
+
+    Fx_drag = -b * vx
+    Fy_drag = -b * vy
+    Fz_drag = -b * vz
+
+    ax = (Fx + Fx_drag) / m
+    ay = (Fy + Fy_drag) / m
+    az = (Fz - m*g + Fz_drag) / m
+
+    return [vx, vy, vz, ax, ay, az]
+
+
+# ****************************************************************************************************************************************************
+# Initial conditions
+# ****************************************************************************************************************************************************
+x_displacement = 30e-6
+y_displacement = -14e-6
+z_displacement = 51e-6
+
+x0 = x_eq + x_displacement
+y0 = y_eq +y_displacement
+z0 = z_eq + z_displacement
+vx0 = 0.0
+vy0 = 0.0
+vz0 = 0.0
+
+Y0 = [x0, y0, z0, vx0, vy0, vz0]
+
+# ****************************************************************************************************************************************************
+# Time range
+# ****************************************************************************************************************************************************
+t_start = 0
+t_end = 0.2
+t_eval = np.linspace(t_start, t_end, 10000)
+
+# ****************************************************************************************************************************************************
+# Solve deterministic 3D model
+# ****************************************************************************************************************************************************
+sol_2d = solve_ivp(
+    nonlinear_system_2d,
+    [t_start, t_end],
+    Y0,
+    t_eval=t_eval,
+    rtol=1e-10,
+    atol=[1e-14, 1e-14, 1e-14, 1e-12, 1e-12, 1e-12],
+    max_step=1e-4
+)
+
+t = sol_2d.t
+x_det = sol_2d.y[0]
+y_det = sol_2d.y[1]
+z_det = sol_2d.y[2]
+vx_det = sol_2d.y[3]
+vy_det = sol_2d.y[4]
+vz_det = sol_2d.y[5]
+
+
+
+# ****************************************************************************************************************************************************
+# Brownian / Langevin trajectory
+# ****************************************************************************************************************************************************
+rng = np.random.default_rng(seed=4)
+
+dt = 1e-6
+t_brownian = np.arange(t_start, t_end + dt, dt)
+
+x_brownian = np.zeros_like(t_brownian)
+y_brownian = np.zeros_like(t_brownian)
+z_brownian = np.zeros_like(t_brownian)
+vx_brownian = np.zeros_like(t_brownian)
+vy_brownian = np.zeros_like(t_brownian)
+vz_brownian = np.zeros_like(t_brownian)
+
+x_brownian[0] = x0
+y_brownian[0] = y0
+z_brownian[0] = z0
+vx_brownian[0] = vx0
+vy_brownian[0] = vy0
+vz_brownian[0] = vz0
+
+sigma_v = np.sqrt(2 * b * kB * T / m**2)
+
+for i in range(len(t_brownian) - 1):
+    x_i = x_brownian[i]
+    y_i = y_brownian[i]
+    z_i = z_brownian[i]
+    vx_i = vx_brownian[i]
+    vy_i = vy_brownian[i]
+    vz_i = vz_brownian[i]
+
+    Fx, Fy, Fz = F_optical_2d(x_i, y_i, z_i)
+
+    Fx_det = Fx - b * vx_i
+    Fy_det = Fy - b * vy_i
+    Fz_det = Fz - m*g - b * vz_i
+
+    vx_brownian[i + 1] = (
+        vx_i
+        + (Fx_det / m) * dt
+        + sigma_v * np.sqrt(dt) * rng.normal()
+    )
+
+    vy_brownian[i + 1] = (
+        vy_i
+        + (Fy_det / m) * dt
+        + sigma_v * np.sqrt(dt) * rng.normal()
+    )
+
+    vz_brownian[i + 1] = (
+        vz_i
+        + (Fz_det / m) * dt
+        + sigma_v * np.sqrt(dt) * rng.normal()
+    )
+
+    x_brownian[i + 1] = x_i + vx_brownian[i + 1] * dt
+    y_brownian[i + 1] = y_i + vy_brownian[i + 1] * dt
+    z_brownian[i + 1] = z_i + vz_brownian[i + 1] * dt
+
+settled = t_brownian > (0.5 * t_end)
+
+print(
+    "Late-time simulated x Brownian RMS =",
+    np.std(x_brownian[settled] - x_eq) * 1e6,
+    "micrometres"
+)
+
+print(
+    "Late-time simulated y Brownian RMS =",
+    np.std(y_brownian[settled] - y_eq) * 1e6,
+    "micrometres"
+)
+
+print(
+    "Late-time simulated z Brownian RMS =",
+    np.std(z_brownian[settled] - z_eq) * 1e6,
+    "micrometres"
+)
+
+# ****************************************************************************************************************************************************
+# Plot x(t) and z(t)
+# ****************************************************************************************************************************************************
+fig, axes = plt.subplots(3, 1, figsize=(8, 7), sharex=True)
+
+axes[0].plot(t, (x_det ) * 1e6, label="deterministic")
+axes[0].plot(t_brownian,(x_brownian ) * 1e6,linewidth=0.8,alpha=0.75,label="with Brownian motion")
+axes[0].axhline(0, linestyle=":", color="black")
+axes[0].set_ylabel("x displacement / micrometres")
+axes[0].legend()
+axes[0].grid()
+
+axes[1].plot(t, (y_det ) * 1e6, label="deterministic")
+axes[1].plot(t_brownian,(y_brownian ) * 1e6,linewidth=0.8,alpha=0.75,label="with Brownian motion")
+axes[1].axhline(0, linestyle=":", color="black")
+axes[1].set_ylabel("y displacement / micrometres")
+axes[1].legend()
+axes[1].grid()
+
+axes[2].plot(t, (z_det ) * 1e6, label="deterministic")
+axes[2].plot(t_brownian,(z_brownian ) * 1e6,linewidth=0.8,alpha=0.75,label="with Brownian motion")
+axes[2].axhline(0, linestyle=":", color="black")
+axes[2].set_xlabel("Time / s")
+axes[2].set_ylabel("z displacement / micrometres")
+axes[2].legend()
+axes[2].grid()
+
+fig.suptitle("3D optical levitation motion")
+plt.tight_layout()
+plt.show()
+
+#****************************************************************************************************************************************************
+#Fourier Tranform 
+#****************************************************************************************************************************************************
+x_signal = x_det - x_eq
+z_signal = z_det - z_eq
+
+dt_fft = t[1] - t[0]
+
+x_signal = x_signal - np.mean(x_signal)
+z_signal = z_signal - np.mean(z_signal)
+
+window = np.hanning(len(t))
+
+x_fft = np.fft.rfft(x_signal * window)
+z_fft = np.fft.rfft(z_signal * window)
+
+freqs = np.fft.rfftfreq(len(t), dt_fft)
+
+x_amp = np.abs(x_fft)
+z_amp = np.abs(z_fft)
+
+plt.figure(figsize=(8, 5))
+plt.plot(freqs, x_amp / np.max(x_amp), label="x spectrum")
+plt.plot(freqs, z_amp / np.max(z_amp), label="z spectrum")
+plt.axvline(omega_x / (2*np.pi), linestyle="--", label="linear fx")
+plt.axvline(omega_z / (2*np.pi), linestyle="--", label="linear fz")
+plt.xlim(0, 300)
+plt.xlabel("Frequency / Hz")
+plt.ylabel("Normalized amplitude")
+plt.title("Fourier spectrum of 3D motion")
+plt.legend()
+plt.grid()
+plt.show()
+
+
+# ****************************************************************************************************************************************************
+# Plot 2D trajectory
+# ****************************************************************************************************************************************************
+# plt.figure(figsize=(7, 6))
+
+# plt.plot(x_det * 1e6,z_det * 1e6,label="deterministic trajectory")
+# plt.plot(x_brownian * 1e6,z_brownian * 1e6,linewidth=0.8,alpha=0.75,label="Brownian trajectory")
+# plt.scatter([x_eq * 1e6], [z_eq * 1e6], color="black", s=30, label="equilibrium")
+
+# plt.xlabel("x / micrometres")
+# plt.ylabel("z / micrometres")
+# plt.title("2D trajectory in the x-z plane")
+# plt.axis("equal")
+# plt.legend()
+# plt.grid()
+# plt.show()
+
+fig = plt.figure(figsize=(7, 6))
+ax = fig.add_subplot(111, projection="3d")
+
+ax.plot(x_brownian * 1e6, y_brownian * 1e6, z_brownian * 1e6)
+
+ax.set_xlabel("x / micrometres")
+ax.set_ylabel("y / micrometres")
+ax.set_zlabel("z / micrometres")
+ax.set_title("3D particle trajectory")
+
+plt.show()
+
+# ****************************************************************************************************************************************************
+# Plot force field in the x-z plane at y = y_eq
+# ****************************************************************************************************************************************************
+x_values = np.linspace(-60e-6, 60e-6, 31)
+z_values = np.linspace(z_eq - 100e-6, z_eq + 100e-6, 31)
+X, Z = np.meshgrid(x_values, z_values)
+Y = y_eq * np.ones_like(X)
+
+Fx_field, Fy_field, Fz_field = F_optical_2d(X, Y, Z)
+Fz_net_field = Fz_field - m*g
+
+force_scale = m*g
+
+plt.figure(figsize=(8, 6))
+plt.contourf(X * 1e6,Z * 1e6,intensity(X, Y, Z),levels=30,cmap="viridis",alpha=0.75)
+plt.colorbar(label="Normalized intensity")
+plt.quiver(X * 1e6,Z * 1e6,Fx_field / force_scale,Fz_net_field / force_scale,color="white",pivot="mid",scale=55)
+plt.scatter([x_eq * 1e6], [z_eq * 1e6], color="red", s=35, label="equilibrium")
+
+plt.xlabel("x / micrometres")
+plt.ylabel("z / micrometres")
+plt.title("x-z net force slice over intensity at y = y_eq")
+plt.legend()
+plt.grid()
+plt.show()
+
+# ****************************************************************************************************************************************************
+# On-axis force check
+# ****************************************************************************************************************************************************
+# z_axis = np.linspace(-200e-6, 300e-6, 1000)
+# Fx_axis, Fz_axis = F_optical_2d(0.0, z_axis)
+
+# plt.figure(figsize=(8, 5))
+# plt.plot(z_axis * 1e6, Fz_axis, label="upward optical + photophoretic force")
+# plt.plot(z_axis * 1e6, Fz_axis - m*g, label="net vertical force")
+# plt.axhline(m*g, linestyle="--", label="gravity mg")
+# plt.axhline(0, linewidth=0.8, color="black")
+# plt.axvline(z_eq * 1e6, linestyle=":", label="equilibrium")
+
+# plt.xlabel("z / micrometres")
+# plt.ylabel("Force / N")
+# plt.title("On-axis vertical force check")
+# plt.legend()
+# plt.grid()
+# plt.show()
