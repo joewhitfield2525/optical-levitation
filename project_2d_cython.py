@@ -5,6 +5,18 @@ from scipy.optimize import brentq
 from scipy.signal import welch
 from time import perf_counter
 
+try:
+    import baoab_2d_cython as _baoab_2d_cython
+    solve_baoab_2d_lookup_cython = getattr(
+        _baoab_2d_cython,
+        "solve_baoab_2d_lookup_cython",
+        None
+    )
+    cython_baoab_available = solve_baoab_2d_lookup_cython is not None
+except ImportError:
+    solve_baoab_2d_lookup_cython = None
+    cython_baoab_available = False
+
 script_start_time = perf_counter()
 
 # ****************************************************************************************************************************************************
@@ -343,6 +355,8 @@ force_lookup_x_values = None
 force_lookup_z_values = None
 force_lookup_Fx_interpolator = None
 force_lookup_Fz_interpolator = None
+force_lookup_Fx_table = None
+force_lookup_Fz_table = None
 
 
 def build_force_lookup_table(x_min, x_max, z_min, z_max):
@@ -359,6 +373,8 @@ def build_force_lookup_table(x_min, x_max, z_min, z_max):
     global force_lookup_z_values
     global force_lookup_Fx_interpolator
     global force_lookup_Fz_interpolator
+    global force_lookup_Fx_table
+    global force_lookup_Fz_table
 
     force_lookup_start_time = perf_counter()
 
@@ -396,6 +412,8 @@ def build_force_lookup_table(x_min, x_max, z_min, z_max):
         Fz_table,
         bounds_error=True
     )
+    force_lookup_Fx_table = np.ascontiguousarray(Fx_table, dtype=np.float64)
+    force_lookup_Fz_table = np.ascontiguousarray(Fz_table, dtype=np.float64)
 
     force_lookup_ready = True
 
@@ -730,7 +748,7 @@ else:
 # Time range
 # ****************************************************************************************************************************************************
 t_start = 0
-t_end = 2.0
+t_end = 2
 dt_baoab = 1 / 200000
 t_baoab = np.arange(t_start, t_end + 0.5 * dt_baoab, dt_baoab)
 
@@ -846,6 +864,58 @@ def solve_baoab_2d_with_power(
     brownian_normals_x,
     brownian_normals_z
 ):
+    """
+    Run BAOAB with the fastest available force path.
+
+    The preferred path is the Cython loop over the precomputed force lookup
+    table. If the extension has not been built, this falls back to the original
+    Python implementation.
+    """
+    if cython_baoab_available and use_force_lookup_table and force_lookup_ready:
+        (
+            x_out,
+            z_out,
+            vx_out,
+            vz_out,
+            out_of_bounds_count,
+        ) = solve_baoab_2d_lookup_cython(
+            np.ascontiguousarray(force_lookup_x_values, dtype=np.float64),
+            np.ascontiguousarray(force_lookup_z_values, dtype=np.float64),
+            np.ascontiguousarray(force_lookup_Fx_table, dtype=np.float64),
+            np.ascontiguousarray(force_lookup_Fz_table, dtype=np.float64),
+            np.ascontiguousarray(power_factor_time, dtype=np.float64),
+            np.ascontiguousarray(brownian_normals_x, dtype=np.float64),
+            np.ascontiguousarray(brownian_normals_z, dtype=np.float64),
+            dt_baoab,
+            m,
+            m * g,
+            baoab_damping_factor,
+            baoab_thermal_velocity_scale,
+            x0,
+            z0,
+            vx0,
+            vz0,
+        )
+
+        if out_of_bounds_count > 0:
+            print(
+                "Warning: Cython BAOAB clamped",
+                out_of_bounds_count,
+                "force lookups to the edge of the lookup table.",
+            )
+            print(
+                "Consider increasing force_lookup_x_half_width or "
+                "force_lookup_z_half_width."
+            )
+
+        return x_out, z_out, vx_out, vz_out
+
+    if use_force_lookup_table and force_lookup_ready and not cython_baoab_available:
+        print(
+            "Cython BAOAB unavailable; using slower Python BAOAB loop. "
+            "Build it with: python3 setup_baoab_2d.py build_ext --inplace"
+        )
+
     x_out = np.zeros_like(t_baoab)
     z_out = np.zeros_like(t_baoab)
     vx_out = np.zeros_like(t_baoab)

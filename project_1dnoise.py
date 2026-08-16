@@ -30,7 +30,7 @@ print("Bare particle weight mg =", F_weight, "N")
 # Use one pressure value throughout the model. This pressure is used for
 # gas density, mean free path, photophoresis, and damping.
 p = 30          # pressure, Pa
-T = 130           # temperature, K
+T = 300           # temperature, K
 eta = 1.8e-5      # dynamic viscosity of air, Pa s
 M_air = 0.029     # molar mass of air, kg/mol
 R = 8.314         # gas constant, J/(mol K)
@@ -61,14 +61,6 @@ zR=(np.pi*w0**2)/wavelength                                 #rayleigh length, m
 
 P_laser = 0.1                                               # Laser power W
 I0 = 2 * P_laser / (np.pi * w0**2)                          # peak Gaussian intensity.
-
-# Stepwise laser-power noise used in the BAOAB Brownian simulation.
-# The power is held constant for laser_noise_step_duration, then randomly
-# moves between 0.99 P_laser, P_laser, and 1.01 P_laser.
-laser_noise_fraction = 0.01
-laser_noise_step_duration = 0.01                             # seconds
-
-
 
 
 c_light = 299792458                                         # m/s
@@ -400,7 +392,7 @@ def linear_system(t, Y):
 # Initial conditions
 # ******************************************************************************************************************
 # Start slightly away from equilibrium
-displacement = 50e-6
+displacement = 20e-6
 
 z0 = z_eq + displacement
 v0 = 0.0
@@ -414,8 +406,8 @@ Y0_linear = [x0, v0]
 # Time range
 # ******************************************************************************************************************
 t_start = 0
-t_end = 10.0
-t_eval = np.linspace(t_start, t_end, 10000)
+t_end = 3.0
+t_eval = np.linspace(t_start, t_end, 100000)
 
 # ******************************************************************************************************************
 # Solve nonlinear model
@@ -464,38 +456,10 @@ sol_linear = solve_ivp(
 #     B: half deterministic-force kick
 
 rng = np.random.default_rng(seed=4)
-laser_rng = np.random.default_rng(seed=12)
 
 dt_baoab = t_eval[1] - t_eval[0]
 t_baoab = np.arange(t_start, t_end + 0.5 * dt_baoab, dt_baoab)
-
-laser_step_samples = max(1, int(round(laser_noise_step_duration / dt_baoab)))
-laser_step_duration_actual = laser_step_samples * dt_baoab
-laser_allowed_power_factors = np.array(
-    [1 - laser_noise_fraction, 1.0, 1 + laser_noise_fraction]
-)
-n_laser_steps = int(np.ceil(len(t_baoab) / laser_step_samples))
-
-laser_step_power_factors = np.zeros(n_laser_steps)
-laser_step_power_factors[0] = laser_rng.choice(laser_allowed_power_factors)
-
-for j in range(1, n_laser_steps):
-    previous_factor = laser_step_power_factors[j - 1]
-
-    if np.isclose(previous_factor, 1 + laser_noise_fraction):
-        possible_factors = np.array([1.0, 1 + laser_noise_fraction])
-    elif np.isclose(previous_factor, 1 - laser_noise_fraction):
-        possible_factors = np.array([1 - laser_noise_fraction, 1.0])
-    else:
-        possible_factors = laser_allowed_power_factors
-
-    laser_step_power_factors[j] = laser_rng.choice(possible_factors)
-
-laser_power_factor = np.repeat(
-    laser_step_power_factors,
-    laser_step_samples
-)[:len(t_baoab)]
-laser_power_time = P_laser * laser_power_factor
+constant_power_factor = np.ones_like(t_baoab)
 
 gamma_baoab = b / m
 baoab_damping_factor = np.exp(-gamma_baoab * dt_baoab)
@@ -507,9 +471,7 @@ print("BAOAB timestep =", dt_baoab, "s")
 print("BAOAB sampling frequency =", 1 / dt_baoab, "Hz")
 print("BAOAB damping factor =", baoab_damping_factor)
 print("BAOAB thermal velocity scale =", baoab_thermal_velocity_scale, "m/s")
-print("Laser noise levels =", P_laser * laser_allowed_power_factors, "W")
-print("Laser noise requested step duration =", laser_noise_step_duration, "s")
-print("Laser noise actual step duration =", laser_step_duration_actual, "s")
+print("Laser power is constant =", P_laser, "W")
 
 
 def deterministic_force_no_drag(z, power_factor=1.0):
@@ -529,10 +491,6 @@ def deterministic_force_no_drag(z, power_factor=1.0):
 def solve_baoab_with_power(power_factor_time, brownian_normals):
     """
     Run BAOAB for a specified laser-power factor time series.
-
-    The same brownian_normals can be reused for two runs so that any
-    difference between them is caused by laser-power noise rather than by a
-    different random Brownian sequence.
     """
     z_out = np.zeros_like(t_baoab)
     v_out = np.zeros_like(t_baoab)
@@ -570,91 +528,91 @@ def solve_baoab_with_power(power_factor_time, brownian_normals):
 
 
 brownian_normals = rng.normal(size=len(t_baoab) - 1)
-constant_power_factor = np.ones_like(t_baoab)
 
-z_baoab_constant_power, v_baoab_constant_power = solve_baoab_with_power(
+z_baoab, v_baoab = solve_baoab_with_power(
     constant_power_factor,
     brownian_normals,
 )
-
-z_baoab, v_baoab = solve_baoab_with_power(
-    laser_power_factor,
-    brownian_normals,
-)
-
-laser_noise_displacement_difference = z_baoab - z_baoab_constant_power
 
 print(
     "BAOAB RMS displacement from equilibrium =",
     np.std(z_baoab - z_eq) * 1e6,
     "micrometres"
 )
-print(
-    "RMS laser-noise displacement effect =",
-    np.std(laser_noise_displacement_difference) * 1e9,
-    "nm"
-)
-print(
-    "Maximum absolute laser-noise displacement effect =",
-    np.max(np.abs(laser_noise_displacement_difference)) * 1e9,
-    "nm"
-)
 
 # ******************************************************************************************************************
-# Plot laser-power noise
+# Position histogram for the Brownian trajectory
 # ******************************************************************************************************************
-plt.figure(figsize=(8, 5))
-plt.step(
-    t_baoab,
-    laser_power_time,
-    where="post",
-    linewidth=1.0,
-    label="stepwise laser power"
+# A harmonic thermal distribution should be Gaussian:
+#
+#     p(z) proportional to exp[-k (z - z_eq)^2 / (2 kB T)]
+#
+# The late-time mask removes the large initial transient, so the histogram is
+# mostly testing the steady Brownian motion in the trap.
+histogram_mask = t_baoab > (0.25 * t_end)
+
+if np.count_nonzero(histogram_mask) < 1024:
+    histogram_mask = np.ones_like(t_baoab, dtype=bool)
+
+z_hist_nm = (z_baoab[histogram_mask] - z_eq) * 1e9
+z_hist_std_nm = np.std(z_hist_nm)
+z_thermal_std_nm = np.sqrt(kB * T / k) * 1e9
+
+hist_counts, hist_edges = np.histogram(z_hist_nm, bins=80, density=True)
+hist_centres = 0.5 * (hist_edges[:-1] + hist_edges[1:])
+
+z_gaussian_nm = np.linspace(hist_edges[0], hist_edges[-1], 600)
+gaussian_pdf = (
+    1
+    / (np.sqrt(2 * np.pi) * z_thermal_std_nm)
+    * np.exp(-0.5 * (z_gaussian_nm / z_thermal_std_nm)**2)
 )
-plt.axhline(P_laser, linestyle="--", label="nominal power")
-plt.axhline(P_laser * (1 + laser_noise_fraction), linestyle=":", label="+1% level")
-plt.axhline(P_laser * (1 - laser_noise_fraction), linestyle=":", label="-1% level")
-plt.xlabel("Time / s")
-plt.ylabel("Laser power / W")
-plt.title("Stepwise laser-power noise")
+
+print("Position histogram RMS =", z_hist_std_nm, "nm")
+print("Thermal Gaussian RMS =", z_thermal_std_nm, "nm")
+
+plt.figure(figsize=(8, 5))
+plt.hist(
+    z_hist_nm,
+    bins=80,
+    density=True,
+    alpha=0.65,
+    label="BAOAB position histogram"
+)
+plt.plot(
+    z_gaussian_nm,
+    gaussian_pdf,
+    "k--",
+    linewidth=2,
+    label="thermal Gaussian theory"
+)
+plt.xlabel("Displacement from equilibrium / nm")
+plt.ylabel("Probability density / nm$^{-1}$")
+plt.title("Position histogram of Brownian motion")
 plt.legend()
 plt.grid()
 plt.show()
 
-# ******************************************************************************************************************
-# Plot isolated effect of laser-power noise
-# ******************************************************************************************************************
-plt.figure(figsize=(8, 5))
-plt.plot(
-    t_baoab,
-    z_baoab_constant_power * 1e6,
-    label="BAOAB, constant laser power"
-)
-plt.plot(
-    t_baoab,
-    z_baoab * 1e6,
-    linewidth=0.9,
-    alpha=0.8,
-    label="BAOAB, stepwise laser-power noise"
-)
-plt.axhline(z_eq * 1e6, linestyle=":", label="Equilibrium")
-plt.xlabel("Time / s")
-plt.ylabel("Height z / micrometres")
-plt.title("Motion with and without laser-power noise")
-plt.legend()
-plt.grid()
-plt.show()
+positive_hist_mask = hist_counts > 0
 
 plt.figure(figsize=(8, 5))
-plt.plot(
-    t_baoab,
-    laser_noise_displacement_difference * 1e9,
-    label="noisy power minus constant power"
+plt.semilogy(
+    hist_centres[positive_hist_mask],
+    hist_counts[positive_hist_mask],
+    "o",
+    markersize=4,
+    label="BAOAB position histogram"
 )
-plt.axhline(0, color="black", linewidth=0.8)
-plt.xlabel("Time / s")
-plt.ylabel("Displacement difference / nm")
-plt.title("Isolated displacement effect of laser-power noise")
+plt.semilogy(
+    z_gaussian_nm,
+    gaussian_pdf,
+    "k--",
+    linewidth=2,
+    label="thermal Gaussian theory"
+)
+plt.xlabel("Displacement from equilibrium / nm")
+plt.ylabel("Probability density / nm$^{-1}$")
+plt.title("Position histogram, semilog view")
 plt.legend()
 plt.grid()
 plt.show()
@@ -741,6 +699,50 @@ plt.show()
 # plt.legend()
 # plt.grid()
 # plt.show()
+
+# ******************************************************************************************************************
+#  PSD helper
+# ******************************************************************************************************************
+
+def welch_psd(signal, time_array, target_bin_width=None):
+    """
+    Return positive-frequency Welch PSD in m^2/Hz.
+    """
+    signal = signal - np.mean(signal)
+    dt_local = time_array[1] - time_array[0]
+    sampling_frequency_local = 1 / dt_local
+
+    if target_bin_width is None:
+        target_bin_width = max(1.0, (omega / (2*np.pi)) / 20)
+
+    nperseg_local = min(
+        len(signal),
+        int(np.ceil(sampling_frequency_local / target_bin_width))
+    )
+    nperseg_local = max(256, nperseg_local)
+
+    psd_freqs_local, psd_local = welch(
+        signal,
+        fs=sampling_frequency_local,
+        window="hann",
+        nperseg=nperseg_local,
+        noverlap=nperseg_local // 2,
+        detrend="constant",
+        scaling="density",
+    )
+
+    positive_mask = (
+        (psd_freqs_local > 0)
+        & np.isfinite(psd_local)
+        & (psd_local > 0)
+    )
+
+    return (
+        psd_freqs_local[positive_mask],
+        psd_local[positive_mask],
+        sampling_frequency_local / nperseg_local,
+        nperseg_local,
+    )
 
 # ******************************************************************************************************************
 #  Fourier Transform 
@@ -831,6 +833,29 @@ print("Lower frequency shown on plot =", minimum_plot_frequency, "Hz")
 # plt.grid(True, which="both")
 # plt.show()
 
+det_psd_freqs, det_psd, det_psd_bin_width, det_psd_nperseg = welch_psd(
+    z_nonlinear - z_eq,
+    t,
+)
+
+print("Deterministic nonlinear PSD nperseg =", det_psd_nperseg)
+print("Deterministic nonlinear PSD frequency bin size =", det_psd_bin_width, "Hz")
+
+plt.figure(figsize=(8, 5))
+plt.loglog(
+    det_psd_freqs,
+    det_psd * 1e18,
+    label="nonlinear model PSD"
+)
+plt.axvline(omega / (2*np.pi), linestyle="--", label="linear fz")
+plt.xlim(max(det_psd_freqs[0] * 0.95, 1e-12), min(fft_plot_max / 10, nyquist_frequency))
+plt.xlabel("Frequency / Hz")
+plt.ylabel("Displacement PSD / nm$^2$/Hz")
+plt.title("PSD of nonlinear deterministic motion")
+plt.legend()
+plt.grid(True, which="both")
+plt.show()
+
 # ******************************************************************************************************************
 #  BAOAB Brownian Fourier analysis
 # ******************************************************************************************************************
@@ -880,82 +905,28 @@ plt.legend()
 plt.grid(True, which="both")
 plt.show()
 
-if np.max(np.abs(laser_noise_displacement_difference)) > 0:
-    laser_effect_freqs, laser_effect_amp_norm, dt_fft_laser_effect = normalised_fft(
-        laser_noise_displacement_difference,
-        t_baoab,
-    )
+baoab_psd_freqs, baoab_psd, baoab_psd_bin_width, baoab_psd_nperseg = welch_psd(
+    z_baoab - z_eq,
+    t_baoab,
+)
 
-    laser_effect_nyquist = 0.5 / dt_fft_laser_effect
-    laser_effect_fft_max = min(fft_plot_max / 10, laser_effect_nyquist)
+print("BAOAB full-trajectory PSD nperseg =", baoab_psd_nperseg)
+print("BAOAB full-trajectory PSD frequency bin size =", baoab_psd_bin_width, "Hz")
 
-    plt.figure(figsize=(8, 5))
-    plt.semilogy(
-        laser_effect_freqs,
-        laser_effect_amp_norm,
-        label="laser-noise displacement effect"
-    )
-    plt.axvline(omega / (2*np.pi), linestyle="--", label="linear fz")
-    plt.xscale("log")
-    plt.xlim(max(laser_effect_freqs[0] * 0.95, 1e-12), laser_effect_fft_max)
-    plt.ylim(1e-12, 1.2)
-    plt.xlabel("Frequency / Hz")
-    plt.ylabel("Normalized amplitude")
-    plt.title("Fourier spectrum of isolated laser-noise effect")
-    plt.legend()
-    plt.grid(True, which="both")
-    plt.show()
-
-    laser_effect_signal = laser_noise_displacement_difference - np.mean(
-        laser_noise_displacement_difference
-    )
-    laser_effect_sampling_frequency = 1 / dt_fft_laser_effect
-    laser_effect_target_bin_width = max(1.0, (omega / (2*np.pi)) / 20)
-    laser_effect_nperseg = min(
-        len(laser_effect_signal),
-        int(np.ceil(laser_effect_sampling_frequency / laser_effect_target_bin_width))
-    )
-    laser_effect_nperseg = max(256, laser_effect_nperseg)
-
-    laser_effect_psd_freqs, laser_effect_psd = welch(
-        laser_effect_signal,
-        fs=laser_effect_sampling_frequency,
-        window="hann",
-        nperseg=laser_effect_nperseg,
-        noverlap=laser_effect_nperseg // 2,
-        detrend="constant",
-        scaling="density",
-    )
-
-    laser_effect_psd_mask = (
-        (laser_effect_psd_freqs > 0)
-        & np.isfinite(laser_effect_psd)
-        & (laser_effect_psd > 0)
-    )
-
-    print(
-        "Laser-noise effect PSD frequency bin size =",
-        laser_effect_sampling_frequency / laser_effect_nperseg,
-        "Hz"
-    )
-
-    plt.figure(figsize=(8, 5))
-    plt.loglog(
-        laser_effect_psd_freqs[laser_effect_psd_mask],
-        laser_effect_psd[laser_effect_psd_mask] * 1e18,
-        label="laser-noise displacement effect PSD"
-    )
-    plt.axvline(omega / (2*np.pi), linestyle="--", label="linear fz")
-    plt.xlim(
-        max(laser_effect_psd_freqs[laser_effect_psd_mask][0] * 0.95, 1e-12),
-        laser_effect_fft_max
-    )
-    plt.xlabel("Frequency / Hz")
-    plt.ylabel("Displacement PSD / nm$^2$/Hz")
-    plt.title("PSD of isolated laser-noise effect")
-    plt.legend()
-    plt.grid(True, which="both")
-    plt.show()
+plt.figure(figsize=(8, 5))
+plt.loglog(
+    baoab_psd_freqs,
+    baoab_psd * 1e18,
+    label="BAOAB full trajectory PSD"
+)
+plt.axvline(omega / (2*np.pi), linestyle="--", label="linear fz")
+plt.xlim(max(baoab_psd_freqs[0] * 0.95, 1e-12), baoab_fft_max)
+plt.xlabel("Frequency / Hz")
+plt.ylabel("Displacement PSD / nm$^2$/Hz")
+plt.title("BAOAB full-trajectory PSD")
+plt.legend()
+plt.grid(True, which="both")
+plt.show()
 
 
 # Early BAOAB FFT. This is the one to inspect when displacement is large and
@@ -984,6 +955,31 @@ plt.ylim(1e-12, 1.2)
 plt.xlabel("Frequency / Hz")
 plt.ylabel("Normalized amplitude")
 plt.title("BAOAB early-transient Fourier spectrum")
+plt.legend()
+plt.grid(True, which="both")
+plt.show()
+
+early_psd_freqs, early_psd, early_psd_bin_width, early_psd_nperseg = welch_psd(
+    z_early,
+    t_early,
+)
+
+print("Early BAOAB PSD nperseg =", early_psd_nperseg)
+print("Early BAOAB PSD frequency bin size =", early_psd_bin_width, "Hz")
+
+plt.figure(figsize=(8, 5))
+plt.loglog(
+    early_psd_freqs,
+    early_psd * 1e18,
+    label="BAOAB early transient PSD"
+)
+plt.axvline(omega / (2*np.pi), linestyle="--", label="linear fz")
+plt.axvline(2*omega / (2*np.pi), linestyle="--", label="second harmonic fz")
+plt.axvline(3*omega / (2*np.pi), linestyle="--", label="third fz")
+plt.xlim(max(early_psd_freqs[0] * 0.95, 1e-12), early_fft_max)
+plt.xlabel("Frequency / Hz")
+plt.ylabel("Displacement PSD / nm$^2$/Hz")
+plt.title("BAOAB early-transient PSD")
 plt.legend()
 plt.grid(True, which="both")
 plt.show()
@@ -1033,19 +1029,18 @@ print("Welch PSD nperseg =", nperseg)
 print("Welch PSD frequency bin size =", sampling_frequency_psd / nperseg, "Hz")
 
 plt.figure(figsize=(8, 5))
-plt.semilogy(
+plt.loglog(
     psd_freqs[positive_psd_mask],
     z_psd[positive_psd_mask] * 1e18,
     label="BAOAB late-time PSD"
 )
-plt.semilogy(
+plt.loglog(
     psd_freqs[positive_psd_mask],
     z_psd_theory[positive_psd_mask] * 1e18,
     "--",
     label="linear theory PSD"
 )
 plt.axvline(omega / (2*np.pi), linestyle="--", label="linear fz")
-plt.xscale("log")
 plt.xlim(max(psd_freqs[positive_psd_mask][0] * 0.95, 1e-12), baoab_fft_max)
 plt.xlabel("Frequency / Hz")
 plt.ylabel("Displacement PSD / nm$^2$/Hz")

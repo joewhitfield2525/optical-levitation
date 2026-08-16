@@ -11,7 +11,23 @@ from scipy.signal import welch
 # BAOAB trajectory and which noise-specific plots are shown.
 
 USE_BROWNIAN_NOISE = True
-USE_LASER_POWER_NOISE = True
+USE_LASER_POWER_NOISE = True 
+USE_PD_FEEDBACK = True 
+
+# ****************************************************************************************************************************************************
+# Feedback settings
+# ****************************************************************************************************************************************************
+# The PD loop reads the measured particle position, estimates velocity, and
+# changes laser power to push the particle back towards equilibrium.
+
+USE_FEEDBACK_POSITION_NOISE = False
+FEEDBACK_POSITION_NOISE_RMS = 50e-9         # m RMS, represents a <100 nm PSD readout
+TOTAL_LOOP_DELAY_SECONDS = 50e-6           # s, PSD/TIA/ADC/computer/laser delay
+FEEDBACK_KP_MULTIPLIER = 0.2                # Kp = this number * trap spring constant
+FEEDBACK_KD_MULTIPLIER = 8.0                # Kd = this number * gas damping coefficient
+FEEDBACK_POWER_MIN_FACTOR = 0.80            # minimum command = this * nominal power
+FEEDBACK_POWER_MAX_FACTOR = 1.20            # maximum command = this * nominal power
+VELOCITY_FILTER_ALPHA = 0.25                # lower value gives smoother velocity estimate
 
 # ****************************************************************************************************************************************************
 # Constants
@@ -39,7 +55,7 @@ print("Bare particle weight mg =", F_weight, "N")
 # Use one pressure value throughout the model. This pressure is used for
 # gas density, mean free path, photophoresis, and damping.
 p = 30          # pressure, Pa
-T = 130           # temperature, K
+T = 300           # temperature, K
 eta = 1.8e-5      # dynamic viscosity of air, Pa s
 M_air = 0.029     # molar mass of air, kg/mol
 R = 8.314         # gas constant, J/(mol K)
@@ -598,6 +614,160 @@ def solve_baoab_with_power(power_factor_time, brownian_normals):
     return z_out, v_out
 
 
+FEEDBACK_UPDATE_FREQUENCY = experimental_sampling_frequency
+PD_KP = FEEDBACK_KP_MULTIPLIER * k
+PD_KD = FEEDBACK_KD_MULTIPLIER * b
+P_MIN = FEEDBACK_POWER_MIN_FACTOR * P_laser
+P_MAX = FEEDBACK_POWER_MAX_FACTOR * P_laser
+
+
+def measure_position_for_feedback(z_actual, rng):
+    """
+    Synthetic position measurement used by the feedback loop.
+
+    For now this is a simple calibrated PSD-like readout: the true position
+    plus optional measurement noise. The delay is handled in the controller.
+    """
+    z_measured = z_actual
+
+    if USE_FEEDBACK_POSITION_NOISE and FEEDBACK_POSITION_NOISE_RMS > 0:
+        z_measured = z_measured + rng.normal(0.0, FEEDBACK_POSITION_NOISE_RMS)
+
+    return z_measured
+
+
+def solve_baoab_with_pd_feedback(disturbance_power_factor_time, brownian_normals):
+    """
+    Run BAOAB with a delayed PD feedback loop controlling the laser power.
+
+    disturbance_power_factor_time is the laser-power noise. The controller
+    command is multiplied by this disturbance, so the feedback fights the same
+    laser noise used in the no-feedback BAOAB trajectory.
+    """
+    feedback_rng = np.random.default_rng(seed=107)
+    baoab_sampling_frequency = 1 / dt_baoab
+    control_decimation = int(round(baoab_sampling_frequency / FEEDBACK_UPDATE_FREQUENCY))
+
+    if control_decimation < 1:
+        raise ValueError("FEEDBACK_UPDATE_FREQUENCY cannot exceed the BAOAB sampling frequency.")
+
+    if not np.isclose(baoab_sampling_frequency / FEEDBACK_UPDATE_FREQUENCY, control_decimation):
+        raise ValueError("Choose FEEDBACK_UPDATE_FREQUENCY so it divides the BAOAB sampling frequency.")
+
+    dt_control = control_decimation * dt_baoab
+
+    if TOTAL_LOOP_DELAY_SECONDS <= 0:
+        loop_delay_control_steps = 0
+    else:
+        loop_delay_control_steps = int(np.ceil(TOTAL_LOOP_DELAY_SECONDS / dt_control))
+
+    loop_delay_baoab_steps = loop_delay_control_steps * control_decimation
+    actual_loop_delay = loop_delay_control_steps * dt_control
+
+    force_per_watt = F_total(z_eq, power_factor=1.0) / P_laser
+    if abs(force_per_watt) < 1e-30:
+        raise ValueError("Force per watt is too close to zero for laser-power feedback.")
+
+    z_out = np.zeros_like(t_baoab)
+    v_out = np.zeros_like(t_baoab)
+    command_power_time = np.zeros_like(t_baoab)
+    actual_power_time = np.zeros_like(t_baoab)
+
+    control_times = []
+    measurement_times = []
+    measured_positions = []
+    filtered_positions = []
+    requested_powers = []
+
+    z_out[0] = z0
+    v_out[0] = v0
+
+    command_power = P_laser
+    filtered_z_previous = None
+
+    for i in range(len(t_baoab) - 1):
+        if i % control_decimation == 0:
+            delayed_i = max(0, i - loop_delay_baoab_steps)
+            z_measured = measure_position_for_feedback(z_out[delayed_i], feedback_rng)
+
+            if filtered_z_previous is None:
+                z_filtered = z_measured
+                measured_velocity = 0.0
+            else:
+                z_filtered = (
+                    VELOCITY_FILTER_ALPHA * z_measured
+                    + (1 - VELOCITY_FILTER_ALPHA) * filtered_z_previous
+                )
+                measured_velocity = (z_filtered - filtered_z_previous) / dt_control
+
+            error = z_filtered - z_eq
+            feedback_force = -PD_KP * error - PD_KD * measured_velocity
+            power_change = feedback_force / force_per_watt
+            command_power = np.clip(P_laser + power_change, P_MIN, P_MAX)
+
+            control_times.append(t_baoab[i])
+            measurement_times.append(t_baoab[delayed_i])
+            measured_positions.append(z_measured)
+            filtered_positions.append(z_filtered)
+            requested_powers.append(command_power)
+
+            filtered_z_previous = z_filtered
+
+        command_factor = command_power / P_laser
+        actual_power_factor = command_factor * disturbance_power_factor_time[i]
+        actual_power_factor = np.clip(
+            actual_power_factor,
+            FEEDBACK_POWER_MIN_FACTOR,
+            FEEDBACK_POWER_MAX_FACTOR,
+        )
+
+        z_i = z_out[i]
+        v_i = v_out[i]
+
+        # B: half deterministic-force kick
+        v_i = v_i + 0.5 * dt_baoab * deterministic_force_no_drag(z_i, actual_power_factor) / m
+
+        # A: half drift
+        z_i = z_i + 0.5 * dt_baoab * v_i
+
+        # O: exact damping + thermal Brownian velocity update
+        v_i = (
+            baoab_damping_factor * v_i
+            + baoab_thermal_velocity_scale * brownian_normals[i]
+        )
+
+        # A: second half drift
+        z_i = z_i + 0.5 * dt_baoab * v_i
+
+        # B: second half deterministic-force kick
+        v_i = v_i + 0.5 * dt_baoab * deterministic_force_no_drag(z_i, actual_power_factor) / m
+
+        z_out[i + 1] = z_i
+        v_out[i + 1] = v_i
+        command_power_time[i] = command_power
+        actual_power_time[i] = P_laser * actual_power_factor
+
+    command_power_time[-1] = command_power
+    actual_power_time[-1] = actual_power_time[-2]
+
+    return {
+        "t": t_baoab,
+        "z": z_out,
+        "v": v_out,
+        "command_power": command_power_time,
+        "actual_power": actual_power_time,
+        "control_t": np.array(control_times),
+        "measurement_t": np.array(measurement_times),
+        "z_measured": np.array(measured_positions),
+        "z_filtered": np.array(filtered_positions),
+        "requested_power": np.array(requested_powers),
+        "dt_control": dt_control,
+        "loop_delay_control_steps": loop_delay_control_steps,
+        "actual_loop_delay": actual_loop_delay,
+        "force_per_watt": force_per_watt,
+    }
+
+
 brownian_normals = rng.normal(size=len(t_baoab) - 1)
 zero_brownian_normals = np.zeros_like(brownian_normals)
 
@@ -636,6 +806,18 @@ z_baoab, v_baoab = solve_baoab_with_power(
     main_brownian_normals,
 )
 
+if USE_PD_FEEDBACK:
+    feedback_result = solve_baoab_with_pd_feedback(
+        main_power_factor,
+        main_brownian_normals,
+    )
+    z_baoab_feedback = feedback_result["z"]
+    v_baoab_feedback = feedback_result["v"]
+else:
+    feedback_result = None
+    z_baoab_feedback = None
+    v_baoab_feedback = None
+
 if USE_BROWNIAN_NOISE:
     print(
         "BAOAB Brownian-only RMS displacement from equilibrium =",
@@ -659,6 +841,31 @@ if USE_LASER_POWER_NOISE:
 else:
     print("Laser-power noise is OFF, so laser-noise-only plots and RMS values are skipped.")
 
+if USE_PD_FEEDBACK:
+    no_feedback_rms_nm = np.std(z_baoab - z_eq) * 1e9
+    feedback_rms_nm = np.std(z_baoab_feedback - z_eq) * 1e9
+
+    print("PD feedback ON =", USE_PD_FEEDBACK)
+    print("Feedback update frequency =", 1 / feedback_result["dt_control"], "Hz")
+    print("Requested total loop delay =", TOTAL_LOOP_DELAY_SECONDS, "s")
+    print("Actual total loop delay used =", feedback_result["actual_loop_delay"], "s")
+    print("Loop delay in controller updates =", feedback_result["loop_delay_control_steps"])
+    print("PD Kp =", PD_KP, "N/m")
+    print("PD Kd =", PD_KD, "kg/s")
+    print("Feedback position noise ON =", USE_FEEDBACK_POSITION_NOISE)
+    print("Feedback position noise RMS =", FEEDBACK_POSITION_NOISE_RMS * 1e9, "nm")
+    print("Laser command limits =", P_MIN, "to", P_MAX, "W")
+    print("Force per watt at equilibrium =", feedback_result["force_per_watt"], "N/W")
+    print("No-feedback RMS displacement =", no_feedback_rms_nm, "nm")
+    print("With-feedback RMS displacement =", feedback_rms_nm, "nm")
+    print("Feedback RMS / no-feedback RMS =", feedback_rms_nm / no_feedback_rms_nm)
+    print("Minimum feedback command power =", np.min(feedback_result["command_power"]), "W")
+    print("Maximum feedback command power =", np.max(feedback_result["command_power"]), "W")
+    print("Minimum actual feedback laser power =", np.min(feedback_result["actual_power"]), "W")
+    print("Maximum actual feedback laser power =", np.max(feedback_result["actual_power"]), "W")
+else:
+    print("PD feedback is OFF.")
+
 # ******************************************************************************************************************
 # Laser power as a function of time
 # ******************************************************************************************************************
@@ -675,6 +882,53 @@ if USE_LASER_POWER_NOISE:
     plt.grid()
     plt.tight_layout()
     plt.show()
+
+if USE_PD_FEEDBACK:
+    actual_power_label = "actual power after laser noise" if USE_LASER_POWER_NOISE else "actual laser power"
+
+    plt.figure(figsize=(8, 4))
+    plt.plot(
+        feedback_result["t"],
+        feedback_result["command_power"] * 1e3,
+        label="PD command power"
+    )
+    plt.plot(
+        feedback_result["t"],
+        feedback_result["actual_power"] * 1e3,
+        alpha=0.65,
+        label=actual_power_label
+    )
+    plt.axhline(P_laser * 1e3, linestyle="--", color="black", label="nominal power")
+    plt.axhline(P_MIN * 1e3, linestyle=":", color="tab:red", label="command limits")
+    plt.axhline(P_MAX * 1e3, linestyle=":", color="tab:red")
+    plt.xlabel("Time / s")
+    plt.ylabel("Laser power / mW")
+    plt.title("PD feedback laser power")
+    plt.legend()
+    plt.grid()
+    plt.tight_layout()
+    plt.show()
+
+    # plt.figure(figsize=(8, 5))
+    # plt.plot(
+    #     feedback_result["control_t"],
+    #     (feedback_result["z_measured"] - z_eq) * 1e9,
+    #     alpha=0.45,
+    #     label="delayed noisy measured position"
+    # )
+    # plt.plot(
+    #     feedback_result["control_t"],
+    #     (feedback_result["z_filtered"] - z_eq) * 1e9,
+    #     label="filtered position used by controller"
+    # )
+    # plt.axhline(0, color="black", linestyle=":", linewidth=0.8)
+    # plt.xlabel("Time / s")
+    # plt.ylabel("Measured displacement / nm")
+    # plt.title("PD feedback measurement signal")
+    # plt.legend()
+    # plt.grid()
+    # plt.tight_layout()
+    # plt.show()
 
 # ******************************************************************************************************************
 # Isolated displacement effects from each noise source
@@ -720,73 +974,73 @@ if USE_BROWNIAN_NOISE:
 #
 # The late-time mask removes the large initial transient, so the histogram is
 # mostly testing the steady Brownian motion in the trap.
-# histogram_mask = t_baoab > (0.25 * t_end)
+histogram_mask = t_baoab > (0.25 * t_end)
 
-# if np.count_nonzero(histogram_mask) < 1024:
-#     histogram_mask = np.ones_like(t_baoab, dtype=bool)
+if np.count_nonzero(histogram_mask) < 1024:
+    histogram_mask = np.ones_like(t_baoab, dtype=bool)
 
-# z_hist_nm = (z_baoab_brownian_only[histogram_mask] - z_eq) * 1e9
-# z_hist_std_nm = np.std(z_hist_nm)
-# z_thermal_std_nm = np.sqrt(kB * T / k) * 1e9
+z_hist_nm = (z_baoab_brownian_only[histogram_mask] - z_eq) * 1e9
+z_hist_std_nm = np.std(z_hist_nm)
+z_thermal_std_nm = np.sqrt(kB * T / k) * 1e9
 
-# hist_counts, hist_edges = np.histogram(z_hist_nm, bins=80, density=True)
-# hist_centres = 0.5 * (hist_edges[:-1] + hist_edges[1:])
+hist_counts, hist_edges = np.histogram(z_hist_nm, bins=80, density=True)
+hist_centres = 0.5 * (hist_edges[:-1] + hist_edges[1:])
 
-# z_gaussian_nm = np.linspace(hist_edges[0], hist_edges[-1], 600)
-# gaussian_pdf = (
-#     1
-#     / (np.sqrt(2 * np.pi) * z_thermal_std_nm)
-#     * np.exp(-0.5 * (z_gaussian_nm / z_thermal_std_nm)**2)
-# )
+z_gaussian_nm = np.linspace(hist_edges[0], hist_edges[-1], 600)
+gaussian_pdf = (
+    1
+    / (np.sqrt(2 * np.pi) * z_thermal_std_nm)
+    * np.exp(-0.5 * (z_gaussian_nm / z_thermal_std_nm)**2)
+)
 
-# print("Position histogram RMS =", z_hist_std_nm, "nm")
-# print("Thermal Gaussian RMS =", z_thermal_std_nm, "nm")
+print("Position histogram RMS =", z_hist_std_nm, "nm")
+print("Thermal Gaussian RMS =", z_thermal_std_nm, "nm")
 
-# plt.figure(figsize=(8, 5))
-# plt.hist(
-#     z_hist_nm,
-#     bins=80,
-#     density=True,
-#     alpha=0.65,
-#     label="BAOAB position histogram"
-# )
-# plt.plot(
-#     z_gaussian_nm,
-#     gaussian_pdf,
-#     "k--",
-#     linewidth=2,
-#     label="thermal Gaussian theory"
-# )
-# plt.xlabel("Displacement from equilibrium / nm")
-# plt.ylabel("Probability density / nm$^{-1}$")
-# plt.title("Position histogram of Brownian motion")
-# plt.legend()
-# plt.grid()
-# plt.show()
+plt.figure(figsize=(8, 5))
+plt.hist(
+    z_hist_nm,
+    bins=80,
+    density=True,
+    alpha=0.65,
+    label="BAOAB position histogram"
+)
+plt.plot(
+    z_gaussian_nm,
+    gaussian_pdf,
+    "k--",
+    linewidth=2,
+    label="thermal Gaussian theory"
+)
+plt.xlabel("Displacement from equilibrium / nm")
+plt.ylabel("Probability density / nm$^{-1}$")
+plt.title("Position histogram of Brownian motion")
+plt.legend()
+plt.grid()
+plt.show()
 
-# positive_hist_mask = hist_counts > 0
+positive_hist_mask = hist_counts > 0
 
-# plt.figure(figsize=(8, 5))
-# plt.semilogy(
-#     hist_centres[positive_hist_mask],
-#     hist_counts[positive_hist_mask],
-#     "o",
-#     markersize=4,
-#     label="BAOAB position histogram"
-# )
-# plt.semilogy(
-#     z_gaussian_nm,
-#     gaussian_pdf,
-#     "k--",
-#     linewidth=2,
-#     label="thermal Gaussian theory"
-# )
-# plt.xlabel("Displacement from equilibrium / nm")
-# plt.ylabel("Probability density / nm$^{-1}$")
-# plt.title("Position histogram, semilog view")
-# plt.legend()
-# plt.grid()
-# plt.show()
+plt.figure(figsize=(8, 5))
+plt.semilogy(
+    hist_centres[positive_hist_mask],
+    hist_counts[positive_hist_mask],
+    "o",
+    markersize=4,
+    label="BAOAB position histogram"
+)
+plt.semilogy(
+    z_gaussian_nm,
+    gaussian_pdf,
+    "k--",
+    linewidth=2,
+    label="thermal Gaussian theory"
+)
+plt.xlabel("Displacement from equilibrium / nm")
+plt.ylabel("Probability density / nm$^{-1}$")
+plt.title("Position histogram, semilog view")
+plt.legend()
+plt.grid()
+plt.show()
 
 # ******************************************************************************************************************
 # Extract solutions
@@ -820,7 +1074,7 @@ else:
 
 plt.figure(figsize=(8, 5))
 
-plt.plot(t, z_nonlinear * 1e6, label="Nonlinear model")
+#plt.plot(t, z_nonlinear * 1e6, label="Nonlinear model")
 #plt.plot(t, z_linear * 1e6, "--", label="Linear SHM approximation")
 plt.plot(
     t_baoab,
@@ -829,6 +1083,15 @@ plt.plot(
     alpha=0.75,
     label=baoab_noise_label
 )
+
+if USE_PD_FEEDBACK:
+    plt.plot(
+        t_baoab,
+        z_baoab_feedback * 1e6,
+        linewidth=1.2,
+        label="Nonlinear BAOAB with PD feedback"
+    )
+
 plt.axhline(z_eq * 1e6, linestyle=":", label="Equilibrium")
 
 plt.xlabel("Time / s")
@@ -837,6 +1100,27 @@ plt.title("Separated optical forces vs linear SHM approximation")
 plt.legend()
 plt.grid()
 plt.show()
+
+if USE_PD_FEEDBACK:
+    plt.figure(figsize=(8, 5))
+    plt.plot(
+        t_baoab,
+        (z_baoab - z_eq) * 1e6,
+        label="without feedback"
+    )
+    plt.plot(
+        t_baoab,
+        (z_baoab_feedback - z_eq) * 1e6,
+        label="with PD feedback"
+    )
+    plt.axhline(0, color="black", linestyle=":", linewidth=0.8)
+    plt.xlabel("Time / s")
+    plt.ylabel("Displacement from equilibrium / micrometres")
+    plt.title("Particle trajectory with and without feedback")
+    plt.legend()
+    plt.grid()
+    plt.tight_layout()
+    plt.show()
 
 # ******************************************************************************************************************
 # Plot force curves
@@ -1134,6 +1418,21 @@ print("BAOAB PSD Nyquist frequency =", baoab_nyquist, "Hz")
 
 plt.figure(figsize=(8, 5))
 plt.loglog(baoab_psd_freqs, baoab_psd_nm2, label=baoab_noise_label + " PSD")
+
+if USE_PD_FEEDBACK:
+    feedback_psd_freqs, feedback_psd_nm2, dt_psd_feedback, feedback_psd_nperseg = (
+        positive_welch_psd(
+            z_baoab_feedback - z_eq,
+            t_baoab,
+        )
+    )
+    plt.loglog(
+        feedback_psd_freqs,
+        feedback_psd_nm2,
+        label="Nonlinear BAOAB with PD feedback PSD"
+    )
+    print("Feedback PSD nperseg =", feedback_psd_nperseg)
+
 plt.axvline(omega / (2*np.pi), linestyle="--", label="linear fz")
 plt.axvline(2*omega / (2*np.pi), linestyle="--", label="second harmonic fz")
 plt.axvline(3*omega / (2*np.pi), linestyle="--", label="third harmonic fz")

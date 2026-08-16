@@ -1,0 +1,6163 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.interpolate import RegularGridInterpolator
+from scipy.optimize import brentq, least_squares
+from scipy.signal import welch
+from scipy.special import spherical_jn, spherical_yn
+from time import perf_counter
+
+from pathlib import Path
+import csv
+import sys
+
+CYTHON_DIR = Path("/Users/josephwhitfield/Masters/Summer Project/cython_improved")
+sys.path.insert(0, str(CYTHON_DIR))
+
+try:
+    import baoab_3d_cython as _baoab_3d_cython
+    solve_baoab_3d_lookup_cython = getattr(
+        _baoab_3d_cython,
+        "solve_baoab_3d_lookup_cython",
+        None
+    )
+    solve_baoab_3d_feedback_lookup_cython = getattr(
+        _baoab_3d_cython,
+        "solve_baoab_3d_feedback_lookup_cython",
+        None
+    )
+    cython_baoab_available = solve_baoab_3d_lookup_cython is not None
+    cython_feedback_baoab_available = solve_baoab_3d_feedback_lookup_cython is not None
+except ImportError:
+    solve_baoab_3d_lookup_cython = None
+    solve_baoab_3d_feedback_lookup_cython = None
+    cython_baoab_available = False
+    cython_feedback_baoab_available = False
+
+script_start_time = perf_counter()
+brownian_force_scaling_only = "--brownian-force-scaling-only" in sys.argv
+psd_normalisation_only = "--psd-normalisation-only" in sys.argv
+welch_averaging_only = "--welch-averaging-only" in sys.argv
+thermal_distribution_only = "--thermal-distribution-only" in sys.argv
+damped_harmonic_only = "--damped-harmonic-only" in sys.argv
+multiple_seeds_only = "--multiple-seeds-only" in sys.argv
+
+# ****************************************************************************************************************************************************
+# Constants
+# ****************************************************************************************************************************************************
+g = 9.81
+c_light = 299792458
+
+# ****************************************************************************************************************************************************
+# User-adjustable parameters
+# ****************************************************************************************************************************************************
+# Particle properties
+radius = 7e-6          # m
+density = 1100         # kg/m^3
+n_particle = 1.555      # particle refractive index
+n_medium = 1.00027     # surrounding medium refractive index, air
+
+# Gas properties
+p = 100000        # pressure, Pa
+T = 300           # impinging/ambient gas temperature, K
+eta = 1.8e-5      # dynamic viscosity of air, Pa s
+M_air = 0.018     # molar mass of air, kg/mol
+R = 8.314         # gas constant, J/(mol K)
+kB = 1.38e-23
+d_air = 3.7e-10
+
+# Hot-Brownian model
+# The particle surface can be hotter than the impinging gas.  This changes both
+# the Brownian noise temperature and the gas drag used by the Langevin step.
+use_hot_brownian_model = True
+input_surface_temperature = 16000.0          # K, particle surface temperature T_sur
+brownian_surface_temperature_accommodation_alpha = 1.0
+viscosity_reference_temperature = 291.15   # K, Sutherland reference T0
+viscosity_reference_eta = 18.27e-6         # Pa s, air viscosity at T0
+sutherland_constant_air = 120.0            # K
+mean_free_path_reference = 66.5e-9         # m, air at T0 and P0
+mean_free_path_reference_pressure = 101325.0  # Pa
+
+
+def hot_brownian_temperatures(T_imp, T_sur, alpha):
+    """
+    Hot-Brownian temperatures from the not-cold Brownian model.
+
+    Emerging gas temperature:
+
+        T_em = T_imp + alpha (T_sur - T_imp)
+
+    Centre-of-mass Brownian temperature:
+
+        T_CM = (T_imp^(3/2) + pi T_em^(3/2) / 8)
+               / (T_imp^(1/2) + pi T_em^(1/2) / 8)
+    """
+    T_imp = float(T_imp)
+    T_sur = float(T_sur)
+    alpha = float(alpha)
+    T_em = T_imp + alpha * (T_sur - T_imp)
+    T_cm = (
+        T_imp**1.5 + (np.pi / 8) * T_em**1.5
+    ) / (
+        T_imp**0.5 + (np.pi / 8) * T_em**0.5
+    )
+    return T_em, T_cm
+
+
+def hot_brownian_cm_damping_factor(T_imp, T_em):
+    """
+    Ratio between heated and cold centre-of-mass damping rates:
+
+        Gamma_CM / Gamma_0 = (1 + pi sqrt(T_em / T_imp) / 8) / (1 + pi / 8)
+    """
+    return (
+        1 + (np.pi / 8) * np.sqrt(T_em / T_imp)
+    ) / (1 + np.pi / 8)
+
+
+def sutherland_viscosity(temperature):
+    """Temperature-dependent air viscosity from Sutherland's law."""
+    return viscosity_reference_eta * (
+        (temperature / viscosity_reference_temperature)**1.5
+        * (viscosity_reference_temperature + sutherland_constant_air)
+        / (temperature + sutherland_constant_air)
+    )
+
+
+def effective_mean_free_path(temperature, pressure):
+    """Ideal-gas mean-free-path correction at the local gas temperature."""
+    return mean_free_path_reference * (
+        temperature / viscosity_reference_temperature
+    ) * (
+        mean_free_path_reference_pressure / pressure
+    )
+
+
+if use_hot_brownian_model:
+    hot_brownian_emerging_temperature, brownian_temperature = hot_brownian_temperatures(
+        T,
+        input_surface_temperature,
+        brownian_surface_temperature_accommodation_alpha,
+    )
+else:
+    hot_brownian_emerging_temperature = T
+    brownian_temperature = T
+
+# Laser / force parameters
+w0 = 20e-6        # beam waist, m
+wavelength = 532e-9
+M2 = 1.2
+use_m2_rayleigh_range = True
+zR_manual = 100e-6
+P_laser = 0.075           # W, example laser power
+use_laser_power_noise = True
+laser_noise_model = "synthetic_step"
+# Choose one of:
+#   "synthetic_step"  old three-level random walk using laser_noise_fraction
+#   "measured_csv"    measured trace shape, scaled so its mean is P_laser
+laser_noise_fraction = 0.01
+laser_noise_frequency = 300
+laser_noise_step_duration = 1 / laser_noise_frequency     # s
+measured_laser_noise_csv = Path(
+    "/Users/josephwhitfield/Masters/Summer Project/Power_02min.csv"
+)
+measured_laser_noise_loop = True
+measured_laser_noise_match_input_mean = True
+measured_laser_noise_equilibrium_points = 31
+
+# Optical force model
+optical_force_model = "ray_optics"
+# Choose one of:
+#   "ray_optics"      Ashkin ray-optics force with Fresnel reflection/refraction
+#   "mie"             Mie plane-wave radiation-pressure efficiency for the
+#                     scattering-like part, plus the ray-optics gradient term.
+#                     This is a practical comparison model, not full GLMT.
+#   "mie_scattering"  Pure Mie radiation-pressure diagnostic. This often has
+#                     no transverse restoring force and may fail trap stability.
+#   "external_lookup" Optical force from an externally generated .npz lookup
+#                     table, for example from MiePy/GLMT/T-matrix calculations.
+external_optical_force_table_path = "miepy_optical_force_table.npz"
+
+# Ashkin ray-optics sampling
+ray_grid_points = 200
+
+# Photophoretic force parameters
+k_particle = 0.135       # W/(m K)
+alpha_acc = 1.0
+kappa_t = 1.14
+absorption_fraction = 1e-3
+
+# 3D force lookup table
+use_force_lookup_table = True
+force_lookup_grid_points_r = 101
+force_lookup_grid_points_z = 201
+force_lookup_r_min = 0.0
+force_lookup_r_base_max = 80e-6
+force_lookup_r_displacement_factor = 4
+force_lookup_r_thermal_factor = 8
+force_lookup_z_base_half_width = 150e-6
+force_lookup_z_displacement_factor = 4
+force_lookup_z_thermal_factor = 8
+
+# Equilibrium and derivative settings
+x_equilibrium = 0.0
+y_equilibrium = 0.0
+equilibrium_z_min = -10e-3
+equilibrium_z_max = 10e-3
+equilibrium_scan_points = 3000
+equilibrium_root_index = 0
+root_finding_xtol = 1e-15
+root_finding_rtol = 1e-15
+numerical_derivative_step = 1e-9
+allow_no_stable_equilibrium_trajectory = False
+no_stable_stop_below_lowest_equilibrium = 1000e-6
+no_stable_diagnostic_max_time = 20
+
+# Damping model
+drag_model = "auto"
+# Choose one of:
+#   "stokes"       continuum Stokes drag, best for Kn << 1
+#   "cunningham"  Stokes drag with slip correction, useful in transition regime
+#   "epstein"     free-molecular Epstein drag, best for Kn >> 1
+#   "auto"        pick a model from Knudsen number
+cunningham_A = 1.257
+cunningham_B = 0.4
+cunningham_C = 1.1
+epstein_accommodation_alpha = 1.0
+
+# Initial conditions relative to the chosen equilibrium
+x_displacement = 0e-6
+y_displacement = 0e-6
+z_displacement = 0e-6
+vx0 = 0.0
+vy0 = 0.0
+vz0 = 0.0
+
+# Time integration
+t_start = 0
+t_end =35.0
+dt_baoab = 1 / 200000
+use_brownian_noise = True
+brownian_seed = 747
+laser_noise_seed = 132
+
+if psd_normalisation_only or welch_averaging_only:
+    t_end = min(t_end, 5.0)
+    use_laser_power_noise = False
+
+if thermal_distribution_only:
+    use_laser_power_noise = False
+
+if multiple_seeds_only:
+    t_end = min(t_end, 20.0)
+    use_laser_power_noise = False
+
+# Trap-loss termination
+# The automatic limits are intentionally wider than the thermal motion but
+# local to the trapped region. Set either manual limit to a number in metres to
+# override the corresponding automatic value.
+terminate_on_trap_loss = False
+trap_loss_check_interval_steps = 20000
+trap_loss_radial_limit_manual = None
+trap_loss_axial_limit_manual = None
+trap_loss_radial_beam_waists = 10.0
+trap_loss_axial_rayleigh_ranges = 3.0
+
+# Optional laser feedback loop
+# Set this to True to add a delayed PD loop that reads z and varies laser power.
+use_pd_feedback = False
+feedback_update_frequency = 200000              # Hz, 50 microsecond updates
+feedback_noise_seed = 17
+use_feedback_position_noise = True
+feedback_position_noise_rms = 0e-9           # m RMS
+feedback_total_loop_frequency=20000
+feedback_total_loop_delay = 1/feedback_total_loop_frequency            # s
+feedback_kp_multiplier = 0.2                  # Kp = this number * axial spring constant kz
+feedback_kd_multiplier = 8.0                  # Kd = this number * gas damping coefficient b
+feedback_power_min_factor = 0.80              # minimum command = this * nominal power
+feedback_power_max_factor = 1.20              # maximum command = this * nominal power
+feedback_velocity_filter_alpha = 0.25         # lower values smooth velocity more
+
+# Numerical tolerances
+focus_zero_tolerance = 1e-30
+radial_zero_tolerance = 1e-30
+near_axis_tolerance = 1e-12
+
+# Plotting and diagnostic ranges
+display_plots = True
+if (
+    psd_normalisation_only
+    or welch_averaging_only
+    or thermal_distribution_only
+    or damped_harmonic_only
+    or multiple_seeds_only
+):
+    display_plots = False
+max_plot_points = 200000
+plot_damped_harmonic_comparison = True
+if multiple_seeds_only:
+    plot_damped_harmonic_comparison = False
+save_damped_harmonic_comparison_plot = True
+stop_after_damped_harmonic_comparison = damped_harmonic_only
+damped_harmonic_comparison_duration = None
+damped_harmonic_comparison_max_duration = 20.0
+damped_harmonic_comparison_max_points = max_plot_points
+damped_harmonic_plot_current_laser_noise = True
+damped_harmonic_plot_current_brownian_noise = True
+psd_plot_max_frequency_override = None
+psd_min_frequency_factor = 0.95
+psd_min_value = 1e-30
+psd_max_value = None
+psd_segment_duration_seconds = 20.0
+welch_average_segment_duration_seconds = 2.0
+psd_segment_samples = None
+psd_overlap_fraction = 0.5
+psd_overlap_samples = None
+include_z_detector_resolution_psd = True
+include_analytic_langevin_validation_psd = True
+detector_position_resolution_nm = 100.0
+transverse_force_x_min = -40e-6
+transverse_force_x_max = 40e-6
+transverse_force_points = 401
+vertical_force_half_width = 500e-6
+vertical_force_points = 1000
+force_field_x_min = -60e-6
+force_field_x_max = 60e-6
+force_field_x_points = 31
+force_field_z_half_width = 100e-6
+force_field_z_points = 31
+force_field_contour_levels = 30
+force_field_quiver_scale = 55
+on_axis_check_z_min = -200e-6
+on_axis_check_z_max = 300e-6
+on_axis_check_points = 1000
+time_trace_figsize = (8, 8)
+single_diagnostic_figsize = (8, 4)
+spectrum_figsize = (8, 5)
+trajectory_3d_figsize = (8, 6)
+trajectory_projection_figsize = (13, 4)
+force_check_figsize = (8, 5)
+force_field_figsize = (8, 6)
+
+# Validation output
+validation_plot_dir = Path("/Users/josephwhitfield/Documents/optical levitation/validation_plots")
+run_brownian_force_scaling_validation = brownian_force_scaling_only
+run_psd_normalisation_validation = True
+run_welch_averaging_validation = True
+run_thermal_distribution_validation = True
+run_multiple_seed_validation = multiple_seeds_only
+brownian_force_pressure_min = 1e-2
+brownian_force_pressure_max = 1e5
+brownian_force_pressure_points = 140
+brownian_force_scaling_sample_count = 200000
+multiple_seed_validation_seeds = np.array([101, 203, 307, 409, 503, 607, 709, 811])
+multiple_seed_burn_in_fraction = 0.10
+
+# Experimental comparison plot
+plot_experimental_comparison = True
+experimental_data_npy = Path(
+    "/Users/josephwhitfield/Masters/Summer Project/11_06_2026 PSD/Particle_02_WP_27_1.15V_75mW.npy"
+)
+experimental_use_recorded_time = True
+experimental_dt_s = 1 / 20000
+experimental_adc_min = 32500.0
+experimental_adc_max = 31.0
+experimental_position_scale_um = 1750.0 / 6.0
+experimental_plot_seconds = None
+# Convert the simulation time used only in the experiment/simulation overlay.
+# Use 1e-3 when the simulation time array is in ms; use 1.0 if it is already in s.
+experimental_comparison_simulation_time_to_seconds = 1
+experimental_comparison_figsize = (11, 6)
+plot_experimental_psd_comparison = True
+experimental_psd_comparison_figsize = (11, 6)
+plot_experimental_psd_four_panel = True
+experimental_psd_four_panel_figsize = (11, 8)
+experimental_psd_min_frequency = None
+experimental_psd_max_frequency = None
+experimental_psd_min_value = 1e-12
+fit_experimental_psd_parameters = True
+experimental_psd_fit_min_frequency = 50
+experimental_psd_fit_max_frequency = 5000
+
+
+def finish_plot():
+    if display_plots:
+        plt.show()
+    else:
+        plt.close()
+
+
+def save_validation_plot(filename):
+    validation_plot_dir.mkdir(parents=True, exist_ok=True)
+    output_path = validation_plot_dir / filename
+    plt.savefig(output_path, dpi=220, bbox_inches="tight")
+    print("Saved validation plot:", output_path)
+
+
+def _time_column_scale(header_text):
+    header_text = header_text.lower()
+
+    if "ns" in header_text:
+        return 1e-9
+    if "us" in header_text or "micro" in header_text:
+        return 1e-6
+    if "ms" in header_text or "milli" in header_text:
+        return 1e-3
+
+    return 1.0
+
+
+def load_measured_laser_power_trace(csv_path):
+    csv_path = Path(csv_path)
+
+    with csv_path.open("r", encoding="utf-8-sig", newline="") as file:
+        rows = list(csv.reader(file))
+
+    graph_data_index = None
+
+    for index, row in enumerate(rows):
+        if row and row[0].strip() == "--Graph Data--":
+            graph_data_index = index
+            break
+
+    if graph_data_index is None:
+        header_index = 0
+        data_rows = rows[1:]
+    else:
+        header_index = graph_data_index + 1
+        data_rows = rows[header_index + 1:]
+
+    if header_index >= len(rows) or len(rows[header_index]) < 2:
+        raise ValueError(f"Could not find two-column graph data in {csv_path}.")
+
+    time_scale = _time_column_scale(rows[header_index][0])
+    time_s = []
+    power_w = []
+
+    for row in data_rows:
+        if len(row) < 2 or not row[0].strip() or not row[1].strip():
+            continue
+
+        try:
+            time_s.append(float(row[0]) * time_scale)
+            power_w.append(float(row[1]))
+        except ValueError:
+            continue
+
+    if len(time_s) < 2:
+        raise ValueError(f"Need at least two measured laser-power samples in {csv_path}.")
+
+    time_s = np.asarray(time_s, dtype=float)
+    power_w = np.asarray(power_w, dtype=float)
+    finite_mask = np.isfinite(time_s) & np.isfinite(power_w)
+    time_s = time_s[finite_mask]
+    power_w = power_w[finite_mask]
+
+    if len(time_s) < 2:
+        raise ValueError(f"Measured laser-power data in {csv_path} is not finite.")
+
+    order = np.argsort(time_s)
+    time_s = time_s[order]
+    power_w = power_w[order]
+    increasing_mask = np.concatenate(([True], np.diff(time_s) > 0))
+    time_s = time_s[increasing_mask]
+    power_w = power_w[increasing_mask]
+
+    if len(time_s) < 2:
+        raise ValueError(f"Measured laser-power times in {csv_path} are not increasing.")
+
+    if np.mean(power_w) <= 0:
+        raise ValueError(f"Measured laser-power mean must be positive in {csv_path}.")
+
+    return time_s - time_s[0], power_w
+
+
+def measured_laser_power_factor_from_trace(
+    target_time_s,
+    csv_path,
+    loop_trace=True,
+    match_input_mean=True
+):
+    example_time_s, example_power_w = load_measured_laser_power_trace(csv_path)
+    relative_power = example_power_w / np.mean(example_power_w)
+    target_time_s = np.asarray(target_time_s, dtype=float) - target_time_s[0]
+    example_duration_s = example_time_s[-1]
+
+    if example_duration_s <= 0:
+        raise ValueError("Measured laser-power trace must have a positive duration.")
+
+    if loop_trace:
+        interpolation_time_s = np.mod(target_time_s, example_duration_s)
+    else:
+        interpolation_time_s = np.clip(target_time_s, 0.0, example_duration_s)
+
+    power_factor = np.interp(
+        interpolation_time_s,
+        example_time_s,
+        relative_power
+    )
+
+    if match_input_mean:
+        power_factor_mean = np.mean(power_factor)
+
+        if power_factor_mean <= 0:
+            raise ValueError("Measured laser-power factor mean must be positive.")
+
+        power_factor = power_factor / power_factor_mean
+
+    return power_factor, example_time_s, example_power_w
+
+
+def finite_experimental_trace(time_s, position_um):
+    time_s = np.asarray(time_s, dtype=float)
+    position_um = np.asarray(position_um, dtype=float)
+    finite_mask = np.isfinite(time_s) & np.isfinite(position_um)
+    time_s = time_s[finite_mask]
+    position_um = position_um[finite_mask]
+
+    if len(time_s) < 2:
+        raise ValueError("Experimental trace has fewer than two finite samples.")
+
+    return time_s - time_s[0], position_um
+
+
+def downsample_for_plot(x_values, y_values, max_points):
+    stride = max(1, len(x_values) // max_points)
+    return x_values[::stride], y_values[::stride]
+
+
+def load_experimental_photodiode_motion():
+    data = np.load(experimental_data_npy)
+
+    if data.ndim != 2:
+        raise ValueError(f"Expected a 2D experimental NPY array, got {data.shape}.")
+
+    if data.shape[0] >= 5:
+        channels = data
+    elif data.shape[1] >= 5:
+        channels = data.T
+    else:
+        raise ValueError(
+            "Experimental NPY must contain four photodiode channels plus time."
+        )
+
+    sample_count = channels.shape[1]
+    adc_delta = experimental_adc_min - experimental_adc_max
+
+    channel_1 = channels[0].astype(float) - adc_delta
+    channel_2 = channels[1].astype(float) - adc_delta
+    channel_3 = channels[2].astype(float) - adc_delta
+    channel_4 = channels[3].astype(float) - adc_delta
+
+    if experimental_use_recorded_time:
+        time_s = channels[4].astype(float) / 1e9
+        time_s = time_s - time_s[0]
+    else:
+        time_s = np.arange(sample_count, dtype=float) * experimental_dt_s
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        vertical_um = (
+            (channel_2 - channel_1)
+            / (channel_1 + channel_2)
+            * experimental_position_scale_um
+        )
+        horizontal_um = (
+            (channel_4 - channel_3)
+            / (channel_3 + channel_4)
+            * experimental_position_scale_um
+        )
+
+    horizontal_time_s, horizontal_um = finite_experimental_trace(
+        time_s,
+        horizontal_um,
+    )
+    vertical_time_s, vertical_um = finite_experimental_trace(
+        time_s,
+        vertical_um,
+    )
+
+    return {
+        "horizontal_time_s": horizontal_time_s,
+        "horizontal_um": horizontal_um,
+        "vertical_time_s": vertical_time_s,
+        "vertical_um": vertical_um,
+    }
+
+
+
+def experimental_comparison_single_record_psd(time_s, displacement_um):
+    time_s = np.asarray(time_s, dtype=float)
+    displacement_um = np.asarray(displacement_um, dtype=float)
+    finite_mask = np.isfinite(time_s) & np.isfinite(displacement_um)
+    time_s = time_s[finite_mask]
+    displacement_um = displacement_um[finite_mask]
+
+    if len(time_s) < 4:
+        raise ValueError("Need at least four samples to calculate a PSD.")
+
+    order = np.argsort(time_s)
+    time_s = time_s[order]
+    displacement_um = displacement_um[order]
+    increasing_mask = np.concatenate(([True], np.diff(time_s) > 0))
+    time_s = time_s[increasing_mask]
+    displacement_um = displacement_um[increasing_mask]
+
+    if len(time_s) < 4:
+        raise ValueError("Need at least four increasing-time samples to calculate a PSD.")
+
+    dt_s = np.median(np.diff(time_s))
+
+    if dt_s <= 0:
+        raise ValueError("PSD time step must be positive.")
+
+    displacement_um = displacement_um - np.mean(displacement_um)
+    sample_count = len(displacement_um)
+    frequencies_hz = np.fft.rfftfreq(sample_count, d=dt_s)
+    fft_values = np.fft.rfft(displacement_um)
+    psd_um2_per_hz = (dt_s / sample_count) * np.abs(fft_values) ** 2
+
+    if sample_count % 2 == 0:
+        psd_um2_per_hz[1:-1] *= 2.0
+    else:
+        psd_um2_per_hz[1:] *= 2.0
+
+    positive_mask = (frequencies_hz > 0) & (psd_um2_per_hz > 0)
+
+    return frequencies_hz[positive_mask], psd_um2_per_hz[positive_mask]
+
+
+def damped_harmonic_psd_model_hz(frequencies_hz, amplitude, f0_hz, gamma_hz, noise_floor):
+    return (
+        amplitude
+        / ((f0_hz**2 - frequencies_hz**2)**2 + (gamma_hz * frequencies_hz)**2)
+        + noise_floor
+    )
+
+
+def fit_damped_harmonic_psd_parameters(frequencies_hz, psd_values):
+    frequencies_hz = np.asarray(frequencies_hz, dtype=float)
+    psd_values = np.asarray(psd_values, dtype=float)
+    fit_mask = (
+        np.isfinite(frequencies_hz)
+        & np.isfinite(psd_values)
+        & (frequencies_hz > 0)
+        & (psd_values > 0)
+    )
+
+    if experimental_psd_fit_min_frequency is not None:
+        fit_mask &= frequencies_hz >= experimental_psd_fit_min_frequency
+
+    if experimental_psd_fit_max_frequency is not None:
+        fit_mask &= frequencies_hz <= experimental_psd_fit_max_frequency
+
+    fit_frequencies = frequencies_hz[fit_mask]
+    fit_psd = psd_values[fit_mask]
+
+    if len(fit_frequencies) < 8:
+        raise ValueError("not enough PSD points for fit")
+
+    peak_index = int(np.argmax(fit_psd))
+    f0_guess = fit_frequencies[peak_index]
+    frequency_spacing = np.median(np.diff(fit_frequencies))
+    gamma_guess = max(frequency_spacing, 0.2 * f0_guess)
+    floor_guess = max(np.percentile(fit_psd, 10), np.finfo(float).tiny)
+    peak_above_floor = max(fit_psd[peak_index] - floor_guess, np.finfo(float).tiny)
+    amplitude_guess = max(
+        peak_above_floor * (gamma_guess * f0_guess)**2,
+        np.finfo(float).tiny,
+    )
+
+    lower_frequency = max(np.min(fit_frequencies), np.finfo(float).tiny)
+    upper_frequency = max(np.max(fit_frequencies), lower_frequency * 1.01)
+    lower = np.log([
+        np.finfo(float).tiny,
+        lower_frequency,
+        max(frequency_spacing * 0.05, np.finfo(float).tiny),
+        np.finfo(float).tiny,
+    ])
+    upper = np.log([
+        np.inf,
+        upper_frequency,
+        upper_frequency * 10.0,
+        max(np.max(fit_psd) * 10.0, np.finfo(float).tiny),
+    ])
+    initial = np.log([amplitude_guess, f0_guess, gamma_guess, floor_guess])
+    initial = np.clip(initial, lower + 1e-12, upper - 1e-12)
+
+    def residual(log_parameters):
+        amplitude, f0_hz, gamma_hz, noise_floor = np.exp(log_parameters)
+        model_psd = damped_harmonic_psd_model_hz(
+            fit_frequencies,
+            amplitude,
+            f0_hz,
+            gamma_hz,
+            noise_floor,
+        )
+        return np.log10(model_psd) - np.log10(fit_psd)
+
+    result = least_squares(
+        residual,
+        initial,
+        bounds=(lower, upper),
+        max_nfev=3000,
+    )
+
+    if not result.success:
+        raise ValueError(result.message)
+
+    amplitude, f0_hz, gamma_hz, noise_floor = np.exp(result.x)
+    gamma_rad_s = 2 * np.pi * gamma_hz
+    spring_constant = m * (2 * np.pi * f0_hz)**2
+    damping_coefficient = m * gamma_rad_s
+    rms_log_residual = np.sqrt(np.mean(residual(result.x)**2))
+
+    return {
+        "f0_hz": f0_hz,
+        "gamma_hz": gamma_hz,
+        "spring_constant": spring_constant,
+        "damping_coefficient": damping_coefficient,
+        "noise_floor": noise_floor,
+        "rms_log_residual": rms_log_residual,
+    }
+
+
+def print_psd_fit_parameter_table(rows):
+    if not rows:
+        return
+
+    print()
+    print("PSD damped-harmonic fit parameters")
+    print("  Theoretical damping coefficient b =", b, "kg/s")
+    print(
+        f"{'axis':<10} "
+        f"{'trace':<14} "
+        f"{'f0 / Hz':>12} "
+        f"{'k / N m^-1':>14} "
+        f"{'fit b / kg s^-1':>18} "
+        f"{'theory b / kg s^-1':>21} "
+        f"{'log err':>9}"
+    )
+
+    for row in rows:
+        fit = row.get("fit")
+        if fit is None:
+            print(
+                f"{row['axis']:<10} "
+                f"{row['trace']:<14} "
+                f"{'fit failed':>12} "
+                f"{'-':>14} "
+                f"{'-':>18} "
+                f"{b:>21.5e} "
+                f"{row.get('error', '')}"
+            )
+            continue
+
+        print(
+            f"{row['axis']:<10} "
+            f"{row['trace']:<14} "
+            f"{fit['f0_hz']:>12.5g} "
+            f"{fit['spring_constant']:>14.5e} "
+            f"{fit['damping_coefficient']:>18.5e} "
+            f"{b:>21.5e} "
+            f"{fit['rms_log_residual']:>9.3g}"
+        )
+
+
+def plot_experimental_simulation_comparison(
+    simulation_time_s,
+    simulation_horizontal_m,
+    simulation_vertical_m,
+    horizontal_simulation_label="simulation x",
+    vertical_simulation_label="simulation z",
+):
+    if not plot_experimental_comparison:
+        return
+
+    try:
+        experiment = load_experimental_photodiode_motion()
+    except (OSError, ValueError) as exc:
+        print("Skipping experimental comparison plot:", exc)
+        return
+
+    simulation_time_s = (
+        np.asarray(simulation_time_s, dtype=float)
+        * experimental_comparison_simulation_time_to_seconds
+    )
+    simulation_horizontal_um = np.asarray(simulation_horizontal_m, dtype=float) * 1e6
+    simulation_vertical_um = np.asarray(simulation_vertical_m, dtype=float) * 1e6
+
+    fig, axes = plt.subplots(
+        2,
+        1,
+        figsize=experimental_comparison_figsize,
+        sharex=True,
+    )
+    comparisons = (
+        (
+            axes[0],
+            "Horizontal",
+            experiment["horizontal_time_s"],
+            experiment["horizontal_um"],
+            simulation_time_s,
+            simulation_horizontal_um,
+            "experiment horizontal",
+            horizontal_simulation_label,
+        ),
+        (
+            axes[1],
+            "Vertical",
+            experiment["vertical_time_s"],
+            experiment["vertical_um"],
+            simulation_time_s,
+            simulation_vertical_um,
+            "experiment vertical",
+            vertical_simulation_label,
+        ),
+    )
+
+    for (
+        ax,
+        axis_label,
+        experiment_time_s,
+        experiment_position_um,
+        simulation_time_values_s,
+        simulation_position_um,
+        experiment_label,
+        simulation_label,
+    ) in comparisons:
+        experiment_displacement_um = (
+            experiment_position_um - np.mean(experiment_position_um)
+        )
+        simulation_displacement_um = (
+            simulation_position_um - np.mean(simulation_position_um)
+        )
+
+        if experimental_plot_seconds is None:
+            experiment_mask = np.ones_like(experiment_time_s, dtype=bool)
+            simulation_mask = np.ones_like(simulation_time_values_s, dtype=bool)
+        else:
+            experiment_mask = experiment_time_s <= experimental_plot_seconds
+            simulation_mask = simulation_time_values_s <= experimental_plot_seconds
+
+        if (
+            np.count_nonzero(experiment_mask) < 2
+            or np.count_nonzero(simulation_mask) < 2
+        ):
+            ax.text(
+                0.5,
+                0.5,
+                "Not enough samples in requested plot window",
+                ha="center",
+                va="center",
+                transform=ax.transAxes,
+            )
+            ax.set_axis_off()
+            continue
+
+        exp_time_plot, exp_disp_plot = downsample_for_plot(
+            experiment_time_s[experiment_mask],
+            experiment_displacement_um[experiment_mask],
+            max_plot_points,
+        )
+        sim_time_plot, sim_disp_plot = downsample_for_plot(
+            simulation_time_values_s[simulation_mask],
+            simulation_displacement_um[simulation_mask],
+            max_plot_points,
+        )
+
+        ax.plot(
+            exp_time_plot,
+            exp_disp_plot,
+            linewidth=0.65,
+            label=experiment_label,
+        )
+        ax.plot(
+            sim_time_plot,
+            sim_disp_plot,
+            linewidth=0.9,
+            label=simulation_label,
+        )
+        ax.axhline(0.0, color="black", linestyle=":", linewidth=1.0)
+        ax.set_ylabel("Displacement / micrometres")
+        ax.set_title(f"{axis_label} time-domain comparison")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+
+    axes[-1].set_xlabel("Time / s")
+    fig.suptitle("Experimental data compared with BAOAB simulation")
+    plt.tight_layout()
+    finish_plot()
+
+    if not plot_experimental_psd_comparison:
+        return
+
+    fig_psd, psd_axes = plt.subplots(
+        2,
+        1,
+        figsize=experimental_psd_comparison_figsize,
+        sharex=True,
+    )
+    psd_fit_rows = []
+    four_panel_psd_records = []
+
+    for ax, (
+        _,
+        axis_label,
+        experiment_time_s,
+        experiment_position_um,
+        simulation_time_values_s,
+        simulation_position_um,
+        experiment_label,
+        simulation_label,
+    ) in zip(psd_axes, comparisons):
+        experiment_displacement_um = (
+            experiment_position_um - np.mean(experiment_position_um)
+        )
+        simulation_displacement_um = (
+            simulation_position_um - np.mean(simulation_position_um)
+        )
+
+        if experimental_plot_seconds is None:
+            experiment_mask = np.ones_like(experiment_time_s, dtype=bool)
+            simulation_mask = np.ones_like(simulation_time_values_s, dtype=bool)
+        else:
+            experiment_mask = experiment_time_s <= experimental_plot_seconds
+            simulation_mask = simulation_time_values_s <= experimental_plot_seconds
+
+        if (
+            np.count_nonzero(experiment_mask) < 4
+            or np.count_nonzero(simulation_mask) < 4
+        ):
+            ax.text(
+                0.5,
+                0.5,
+                "Not enough samples in requested PSD window",
+                ha="center",
+                va="center",
+                transform=ax.transAxes,
+            )
+            ax.set_axis_off()
+            continue
+
+        try:
+            exp_freqs, exp_psd = experimental_comparison_single_record_psd(
+                experiment_time_s[experiment_mask],
+                experiment_displacement_um[experiment_mask],
+            )
+            sim_freqs, sim_psd = experimental_comparison_single_record_psd(
+                simulation_time_values_s[simulation_mask],
+                simulation_displacement_um[simulation_mask],
+            )
+        except ValueError as exc:
+            ax.text(
+                0.5,
+                0.5,
+                str(exc),
+                ha="center",
+                va="center",
+                transform=ax.transAxes,
+            )
+            ax.set_axis_off()
+            continue
+
+        four_panel_psd_records.extend((
+            (f"{axis_label} experiment", exp_freqs, exp_psd, "tab:blue"),
+            (f"{axis_label} simulation", sim_freqs, sim_psd, "tab:orange"),
+        ))
+
+        if fit_experimental_psd_parameters:
+            for trace_name, fit_freqs, fit_psd in (
+                ("experiment", exp_freqs, exp_psd),
+                ("simulation", sim_freqs, sim_psd),
+            ):
+                try:
+                    fit_result = fit_damped_harmonic_psd_parameters(
+                        fit_freqs,
+                        fit_psd,
+                    )
+                    psd_fit_rows.append({
+                        "axis": axis_label,
+                        "trace": trace_name,
+                        "fit": fit_result,
+                    })
+                except ValueError as exc:
+                    psd_fit_rows.append({
+                        "axis": axis_label,
+                        "trace": trace_name,
+                        "fit": None,
+                        "error": str(exc),
+                    })
+
+        ax.loglog(
+            exp_freqs,
+            exp_psd,
+            linewidth=0.9,
+            label=f"{experiment_label} PSD",
+        )
+        ax.loglog(
+            sim_freqs,
+            sim_psd,
+            linewidth=0.9,
+            label=f"{simulation_label} PSD",
+        )
+        ax.set_ylabel("PSD / micrometre^2 Hz^-1")
+        ax.set_title(f"{axis_label} PSD comparison")
+        ax.legend()
+        ax.grid(True, which="both", alpha=0.3)
+
+        if experimental_psd_min_value is not None:
+            ax.set_ylim(bottom=experimental_psd_min_value)
+
+    if experimental_psd_min_frequency is not None:
+        psd_axes[-1].set_xlim(left=experimental_psd_min_frequency)
+
+    if experimental_psd_max_frequency is not None:
+        psd_axes[-1].set_xlim(right=experimental_psd_max_frequency)
+
+    if fit_experimental_psd_parameters:
+        print_psd_fit_parameter_table(psd_fit_rows)
+
+    psd_axes[-1].set_xlabel("Frequency / Hz")
+    fig_psd.suptitle("Experimental PSD compared with BAOAB simulation PSD")
+    plt.tight_layout()
+    finish_plot()
+
+    if plot_experimental_psd_four_panel and four_panel_psd_records:
+        fig_psd_four, four_axes = plt.subplots(
+            2,
+            2,
+            figsize=experimental_psd_four_panel_figsize,
+            sharex=True,
+            sharey=True,
+        )
+
+        for ax, (title, frequencies_hz, psd_values, colour) in zip(
+            four_axes.ravel(),
+            four_panel_psd_records,
+        ):
+            ax.loglog(
+                frequencies_hz,
+                psd_values,
+                linewidth=0.9,
+                color=colour,
+            )
+            ax.set_title(f"{title} PSD")
+            ax.grid(True, which="both", alpha=0.3)
+
+            if experimental_psd_min_value is not None:
+                ax.set_ylim(bottom=experimental_psd_min_value)
+
+            if experimental_psd_min_frequency is not None:
+                ax.set_xlim(left=experimental_psd_min_frequency)
+
+            if experimental_psd_max_frequency is not None:
+                ax.set_xlim(right=experimental_psd_max_frequency)
+
+        for ax in four_axes[:, 0]:
+            ax.set_ylabel("PSD / micrometre^2 Hz^-1")
+
+        for ax in four_axes[-1, :]:
+            ax.set_xlabel("Frequency / Hz")
+
+        fig_psd_four.suptitle("Individual experimental and simulation PSDs")
+        plt.tight_layout()
+        finish_plot()
+
+
+# ****************************************************************************************************************************************************
+# Derived quantities
+# ****************************************************************************************************************************************************
+volume = (4/3) * np.pi * radius**3
+m = density * volume
+
+rho_g = p * M_air / (R * T)
+lambda_mfp = kB * T / (np.sqrt(2) * np.pi * d_air**2 * p)
+Kn = lambda_mfp / radius
+
+zR_m2 = np.pi * w0**2 / (M2 * wavelength)
+zR = zR_m2 if use_m2_rayleigh_range else zR_manual
+
+I0 = 2 * P_laser / (np.pi * w0**2)   # Gaussian peak intensity, W/m^2
+
+# print("Particle mass =", m, "kg")
+# print("Weight mg =", m*g, "N")
+# print("Gas density =", rho_g, "kg/m^3")
+# print("Mean free path =", lambda_mfp, "m")
+# print("Knudsen number =", Kn)
+# print("Laser power =", P_laser, "W")
+# print("Wavelength =", wavelength, "m")
+# print("Beam quality M2 =", M2)
+# print("Using M2-derived Rayleigh range =", use_m2_rayleigh_range)
+# print("Manual Rayleigh range zR_manual =", zR_manual, "m")
+# print("M2-derived Rayleigh range zR_m2 =", zR_m2, "m")
+# print("Rayleigh range used zR =", zR, "m")
+# print("Peak intensity I0 =", I0, "W/m^2")
+# print("Paraxial divergence half-angle w0/zR =", w0 / zR, "rad")
+
+
+def beam_width(z):
+   
+    return w0 * np.sqrt(1 + (z / zR)**2)
+
+
+def intensity(x, z):
+   
+    s = 1 + (z / zR)**2
+    return (1 / s) * np.exp(-2 * x**2 / (w0**2 * s))
+
+
+def transverse_intensity(x, y, z):
+    """Normalized cylindrically symmetric Gaussian intensity."""
+    s = 1 + (z / zR)**2
+    r_squared = x**2 + y**2
+    return (1 / s) * np.exp(-2 * r_squared / (w0**2 * s))
+
+
+def physical_intensity(x, z, power_factor=1.0):
+    return power_factor * I0 * intensity(x, z)
+
+
+def physical_transverse_intensity(x, y, z, power_factor=1.0):
+    return power_factor * I0 * transverse_intensity(x, y, z)
+
+
+def wavefront_radius(z):
+    """
+    Gaussian beam wavefront radius of curvature.
+
+    R(z) is negative before the focus, positive after the focus, and infinite
+    at the focus. The local paraxial ray direction is approximately:
+
+        s_hat proportional to (x / R(z), 1)
+    """
+    if abs(z) < focus_zero_tolerance:
+        return np.inf
+
+    return z * (1 + (zR / z)**2)
+
+
+# ****************************************************************************************************************************************************
+# Ashkin ray-optics force model
+# ****************************************************************************************************************************************************
+# This replaces the old phenomenological gradient and scattering forces.
+# The sphere's projected disk is sampled by many ray bundles. Each ray
+# contributes:
+#
+#     dF = (n_medium / c) dP (-Q_g e_perp + Q_s s_hat)
+#
+# where Q_s and Q_g are Ashkin ray-optics force efficiencies, s_hat is the
+# local focused-ray direction, and e_perp is perpendicular to s_hat in the
+# x-z plane. This gives the gradient-like part an axial component when the
+# beam rays are converging or diverging.
+
+u_values = np.linspace(-radius, radius, ray_grid_points)
+v_values = np.linspace(-radius, radius, ray_grid_points)
+du = u_values[1] - u_values[0]
+dv = v_values[1] - v_values[0]
+dA = du * dv
+
+U, V = np.meshgrid(u_values, v_values, indexing="ij")
+rho = np.sqrt(U**2 + V**2)
+ray_mask = rho < radius
+
+U_hit = U[ray_mask]
+V_hit = V[ray_mask]
+rho_hit = rho[ray_mask]
+
+sin_theta_i = rho_hit / radius
+theta_i = np.arcsin(np.clip(sin_theta_i, 0.0, 1.0))
+sin_theta_r = (n_medium / n_particle) * sin_theta_i
+theta_r = np.arcsin(np.clip(sin_theta_r, 0.0, 1.0))
+
+cos_i = np.cos(theta_i)
+cos_r = np.cos(theta_r)
+
+Rs = ((n_medium * cos_i - n_particle * cos_r) / (n_medium * cos_i + n_particle * cos_r))**2
+Rp = ((n_medium * cos_r - n_particle * cos_i) / (n_medium * cos_r + n_particle * cos_i))**2
+
+
+def ashkin_efficiencies_from_reflectance(fresnel_R):
+    """Ashkin scattering-like and gradient-like efficiencies for one polarization."""
+    fresnel_T = 1 - fresnel_R
+    denom = 1 + fresnel_R**2 + 2 * fresnel_R * np.cos(2 * theta_r)
+
+    Q_scat = (
+        1
+        + fresnel_R * np.cos(2 * theta_i)
+        - (
+            fresnel_T**2
+            * (np.cos(2 * theta_i - 2 * theta_r) + fresnel_R * np.cos(2 * theta_i))
+            / denom
+        )
+    )
+
+    Q_grad = (
+        fresnel_R * np.sin(2 * theta_i)
+        - (
+            fresnel_T**2
+            * (np.sin(2 * theta_i - 2 * theta_r) + fresnel_R * np.sin(2 * theta_i))
+            / denom
+        )
+    )
+    return Q_scat, Q_grad
+
+
+Q_s_s_pol, Q_g_s_pol = ashkin_efficiencies_from_reflectance(Rs)
+Q_s_p_pol, Q_g_p_pol = ashkin_efficiencies_from_reflectance(Rp)
+
+# Unpolarised light is a 50/50 mixture of s and p polarisations.  Average the
+# final force efficiencies, rather than averaging Fresnel R before applying the
+# nonlinear multiple-reflection expression.
+Q_s = 0.5 * (Q_s_s_pol + Q_s_p_pol)
+Q_g = 0.5 * (Q_g_s_pol + Q_g_p_pol)
+
+rho_safe = np.where(rho_hit > 0, rho_hit, 1.0)
+u_hat = U_hit / rho_safe
+
+
+def F_ray_optics_2d_scalar(x, z, power_factor=1.0):
+    """
+    Ashkin-style ray-optics force for the x-z model.
+
+    The full projected disk is integrated, but only Fx and Fz are returned.
+    """
+    Fx_scat, Fz_scat, Fx_grad, Fz_grad = F_ray_optics_2d_components_scalar(
+        x,
+        z,
+        power_factor
+    )
+    return Fx_scat + Fx_grad, Fz_scat + Fz_grad
+
+
+def F_ray_optics_2d_components_scalar(x, z, power_factor=1.0):
+    """
+    Ray-optics force split into scattering-like and gradient-like parts.
+
+    Returns:
+        Fx_scat, Fz_scat, Fx_grad, Fz_grad
+
+    In this Ashkin ray model, Q_s is treated as the scattering-like component
+    along the local ray direction, while Q_g is treated as the gradient-like
+    component perpendicular to the local ray direction.
+    """
+    ray_x = x + U_hit
+    ray_y = V_hit
+    dP = physical_transverse_intensity(ray_x, ray_y, z, power_factor) * dA
+    prefactor = n_medium / c_light
+
+    R_wavefront = wavefront_radius(z)
+    if np.isinf(R_wavefront):
+        s_x = np.zeros_like(ray_x)
+    else:
+        s_x = ray_x / R_wavefront
+
+    s_z = np.ones_like(ray_x)
+    s_norm = np.sqrt(s_x**2 + s_z**2)
+    s_x = s_x / s_norm
+    s_z = s_z / s_norm
+
+    # Unit vector perpendicular to the local ray direction in the x-z plane.
+    # For a parallel ray, this becomes e_perp = +x_hat.
+    e_perp_x = s_z
+    e_perp_z = -s_x
+
+    Fx_scat = prefactor * np.sum(dP * Q_s * s_x)
+    Fz_scat = prefactor * np.sum(dP * Q_s * s_z)
+
+    # The transverse gradient-like force points toward higher intensity.
+    # With u_hat defined radially outward from the particle centre, the
+    # restoring direction is -u_hat for a particle displaced to +x.
+    Fx_grad = prefactor * np.sum(dP * (-Q_g * u_hat * e_perp_x))
+    Fz_grad = prefactor * np.sum(dP * (-Q_g * u_hat * e_perp_z))
+
+    return Fx_scat, Fz_scat, Fx_grad, Fz_grad
+
+
+def F_ray_optics_2d(x, z, power_factor=1.0):
+    """
+    Vectorized wrapper around the scalar ray-optics force.
+    """
+    x_arr, z_arr, power_factor_arr = np.broadcast_arrays(x, z, power_factor)
+
+    if x_arr.shape == ():
+        return F_ray_optics_2d_scalar(
+            float(x_arr),
+            float(z_arr),
+            float(power_factor_arr)
+        )
+
+    Fx = np.zeros_like(x_arr, dtype=float)
+    Fz = np.zeros_like(z_arr, dtype=float)
+
+    for index in np.ndindex(x_arr.shape):
+        Fx[index], Fz[index] = F_ray_optics_2d_scalar(
+            x_arr[index],
+            z_arr[index],
+            power_factor_arr[index]
+        )
+
+    return Fx, Fz
+
+
+Fx_focus, Fz_focus = F_ray_optics_2d(0.0, 0.0)
+# print("Ray-optics force at focus Fx =", Fx_focus, "N")
+# print("Ray-optics force at focus Fz =", Fz_focus, "N")
+# print("Ray-optics Fz at focus / mg =", Fz_focus / (m*g))
+
+
+# ****************************************************************************************************************************************************
+# Mie radiation-pressure force model
+# ****************************************************************************************************************************************************
+# This mode uses exact Mie plane-wave scattering coefficients to calculate the
+# radiation-pressure efficiency Q_pr. Q_pr is then applied locally to each
+# Gaussian ray bundle. This is useful for comparing the scattering/radiation
+# pressure scale against ray optics, but it is not full GLMT for a tightly
+# focused Gaussian beam and does not include a complete Mie gradient force.
+
+def _riccati_psi(n, value):
+    return value * spherical_jn(n, value)
+
+
+def _riccati_psi_derivative(n, value):
+    return spherical_jn(n, value) + value * spherical_jn(n, value, derivative=True)
+
+
+def _riccati_xi(n, value):
+    return value * (
+        spherical_jn(n, value)
+        + 1j * spherical_yn(n, value)
+    )
+
+
+def _riccati_xi_derivative(n, value):
+    h_n = spherical_jn(n, value) + 1j * spherical_yn(n, value)
+    h_n_derivative = (
+        spherical_jn(n, value, derivative=True)
+        + 1j * spherical_yn(n, value, derivative=True)
+    )
+    return h_n + value * h_n_derivative
+
+
+def mie_coefficients(relative_refractive_index, size_parameter):
+    """
+    Return Mie coefficients a_n and b_n for a homogeneous sphere.
+    """
+    if size_parameter <= 0:
+        raise ValueError("Mie size_parameter must be positive.")
+
+    n_max = int(np.ceil(size_parameter + 4 * size_parameter**(1 / 3) + 2))
+    n = np.arange(1, n_max + 1)
+    mx = relative_refractive_index * size_parameter
+
+    psi_x = _riccati_psi(n, size_parameter)
+    psi_mx = _riccati_psi(n, mx)
+    psi_x_derivative = _riccati_psi_derivative(n, size_parameter)
+    psi_mx_derivative = _riccati_psi_derivative(n, mx)
+    xi_x = _riccati_xi(n, size_parameter)
+    xi_x_derivative = _riccati_xi_derivative(n, size_parameter)
+
+    a_n = (
+        relative_refractive_index * psi_mx * psi_x_derivative
+        - psi_x * psi_mx_derivative
+    ) / (
+        relative_refractive_index * psi_mx * xi_x_derivative
+        - xi_x * psi_mx_derivative
+    )
+
+    b_n = (
+        psi_mx * psi_x_derivative
+        - relative_refractive_index * psi_x * psi_mx_derivative
+    ) / (
+        psi_mx * xi_x_derivative
+        - relative_refractive_index * xi_x * psi_mx_derivative
+    )
+
+    return n, a_n, b_n
+
+
+def mie_radiation_pressure_efficiency(relative_refractive_index, size_parameter):
+    """
+    Return Mie radiation-pressure efficiency Q_pr = Q_ext - g Q_sca.
+    """
+    n, a_n, b_n = mie_coefficients(relative_refractive_index, size_parameter)
+
+    q_ext = (
+        2
+        / size_parameter**2
+        * np.sum((2 * n + 1) * np.real(a_n + b_n))
+    )
+    q_sca = (
+        2
+        / size_parameter**2
+        * np.sum((2 * n + 1) * (np.abs(a_n)**2 + np.abs(b_n)**2))
+    )
+
+    if q_sca <= 0:
+        return q_ext
+
+    n_pair = n[:-1]
+    asymmetry_sum_adjacent = np.sum(
+        n_pair
+        * (n_pair + 2)
+        / (n_pair + 1)
+        * np.real(
+            a_n[:-1] * np.conj(a_n[1:])
+            + b_n[:-1] * np.conj(b_n[1:])
+        )
+    )
+    asymmetry_sum_cross = np.sum(
+        (2 * n + 1)
+        / (n * (n + 1))
+        * np.real(a_n * np.conj(b_n))
+    )
+    asymmetry_parameter = (
+        4
+        / (size_parameter**2 * q_sca)
+        * (asymmetry_sum_adjacent + asymmetry_sum_cross)
+    )
+
+    return q_ext - asymmetry_parameter * q_sca
+
+
+mie_relative_refractive_index = n_particle / n_medium
+mie_size_parameter = 2 * np.pi * n_medium * radius / wavelength
+mie_q_pr = mie_radiation_pressure_efficiency(
+    mie_relative_refractive_index,
+    mie_size_parameter
+)
+
+external_optical_force_ready = False
+external_optical_force_r_values = None
+external_optical_force_z_values = None
+external_optical_force_Fr_interpolator = None
+external_optical_force_Fz_interpolator = None
+
+
+def load_external_optical_force_table(table_path):
+    """
+    Load an external cylindrical optical force table.
+
+    Expected .npz arrays:
+        r_values: radial grid in metres
+        z_values: axial grid in metres
+        Fr_table: radial optical force in newtons, shape (nr, nz)
+        Fz_table: axial optical force in newtons, shape (nr, nz)
+
+    The table should contain optical force only. The photophoretic force is
+    still added by F_optical_2d_direct.
+    """
+    global external_optical_force_ready
+    global external_optical_force_r_values
+    global external_optical_force_z_values
+    global external_optical_force_Fr_interpolator
+    global external_optical_force_Fz_interpolator
+
+    table_path = Path(table_path).expanduser()
+    if not table_path.is_absolute():
+        table_path = Path(__file__).resolve().parent / table_path
+
+    if not table_path.exists():
+        raise FileNotFoundError(
+            "External optical force table was not found: "
+            f"{table_path}"
+        )
+
+    data = np.load(table_path)
+    required_arrays = ("r_values", "z_values", "Fr_table", "Fz_table")
+    missing = [name for name in required_arrays if name not in data]
+    if missing:
+        raise ValueError(
+            "External optical force table is missing arrays: "
+            + ", ".join(missing)
+        )
+
+    r_values = np.asarray(data["r_values"], dtype=float)
+    z_values = np.asarray(data["z_values"], dtype=float)
+    Fr_table = np.asarray(data["Fr_table"], dtype=float)
+    Fz_table = np.asarray(data["Fz_table"], dtype=float)
+
+    expected_shape = (len(r_values), len(z_values))
+    if Fr_table.shape != expected_shape or Fz_table.shape != expected_shape:
+        raise ValueError(
+            "External force table shape mismatch. Expected Fr_table and "
+            f"Fz_table to have shape {expected_shape}, got "
+            f"{Fr_table.shape} and {Fz_table.shape}."
+        )
+
+    external_optical_force_r_values = r_values
+    external_optical_force_z_values = z_values
+    external_optical_force_Fr_interpolator = RegularGridInterpolator(
+        (r_values, z_values),
+        Fr_table,
+        bounds_error=True
+    )
+    external_optical_force_Fz_interpolator = RegularGridInterpolator(
+        (r_values, z_values),
+        Fz_table,
+        bounds_error=True
+    )
+    external_optical_force_ready = True
+
+    print("External optical force table loaded =", table_path)
+    print(
+        "External optical force table r range =",
+        r_values[0] * 1e6,
+        "to",
+        r_values[-1] * 1e6,
+        "micrometres"
+    )
+    print(
+        "External optical force table z range =",
+        z_values[0] * 1e6,
+        "to",
+        z_values[-1] * 1e6,
+        "micrometres"
+    )
+
+
+def F_external_lookup_2d(x, z, power_factor=1.0):
+    """
+    Optical force from an externally generated cylindrical force table.
+    """
+    if not external_optical_force_ready:
+        raise RuntimeError(
+            "External optical force table has not been loaded. Check "
+            "external_optical_force_table_path."
+        )
+
+    x_arr, z_arr, power_factor_arr = np.broadcast_arrays(x, z, power_factor)
+    points = np.column_stack((np.abs(x_arr).ravel(), z_arr.ravel()))
+
+    Fr_nominal = external_optical_force_Fr_interpolator(points).reshape(x_arr.shape)
+    Fz_nominal = external_optical_force_Fz_interpolator(points).reshape(z_arr.shape)
+
+    Fx = power_factor_arr * Fr_nominal * np.sign(x_arr)
+    Fz = power_factor_arr * Fz_nominal
+
+    if Fx.shape == ():
+        return float(Fx), float(Fz)
+
+    return Fx, Fz
+
+
+def F_mie_scattering_2d_scalar(x, z, power_factor=1.0):
+    """
+    Mie plane-wave radiation-pressure force applied to local Gaussian rays.
+    """
+    ray_x = x + U_hit
+    ray_y = V_hit
+    dP = physical_transverse_intensity(ray_x, ray_y, z, power_factor) * dA
+    prefactor = n_medium / c_light
+
+    R_wavefront = wavefront_radius(z)
+    if np.isinf(R_wavefront):
+        s_x = np.zeros_like(ray_x)
+    else:
+        s_x = ray_x / R_wavefront
+
+    s_z = np.ones_like(ray_x)
+    s_norm = np.sqrt(s_x**2 + s_z**2)
+    s_x = s_x / s_norm
+    s_z = s_z / s_norm
+
+    Fx = prefactor * mie_q_pr * np.sum(dP * s_x)
+    Fz = prefactor * mie_q_pr * np.sum(dP * s_z)
+
+    return Fx, Fz
+
+
+def F_mie_scattering_2d(x, z, power_factor=1.0):
+    """
+    Vectorized wrapper around the scalar Mie scattering force.
+    """
+    x_arr, z_arr, power_factor_arr = np.broadcast_arrays(x, z, power_factor)
+
+    if x_arr.shape == ():
+        return F_mie_scattering_2d_scalar(
+            float(x_arr),
+            float(z_arr),
+            float(power_factor_arr)
+        )
+
+    Fx = np.zeros_like(x_arr, dtype=float)
+    Fz = np.zeros_like(z_arr, dtype=float)
+
+    for index in np.ndindex(x_arr.shape):
+        Fx[index], Fz[index] = F_mie_scattering_2d_scalar(
+            x_arr[index],
+            z_arr[index],
+            power_factor_arr[index]
+        )
+
+    return Fx, Fz
+
+
+def F_mie_hybrid_2d_scalar(x, z, power_factor=1.0):
+    """
+    Mie radiation pressure plus ray-optics gradient-like force.
+
+    This lets the code compare Mie and ray-optics radiation-pressure scales
+    while keeping the transverse restoring mechanism used by the current trap
+    model. It should not be interpreted as full GLMT.
+    """
+    Fx_mie, Fz_mie = F_mie_scattering_2d_scalar(x, z, power_factor)
+    _, _, Fx_grad, Fz_grad = F_ray_optics_2d_components_scalar(
+        x,
+        z,
+        power_factor
+    )
+    return Fx_mie + Fx_grad, Fz_mie + Fz_grad
+
+
+def F_mie_hybrid_2d(x, z, power_factor=1.0):
+    """
+    Vectorized wrapper around the hybrid Mie/ray-gradient force.
+    """
+    x_arr, z_arr, power_factor_arr = np.broadcast_arrays(x, z, power_factor)
+
+    if x_arr.shape == ():
+        return F_mie_hybrid_2d_scalar(
+            float(x_arr),
+            float(z_arr),
+            float(power_factor_arr)
+        )
+
+    Fx = np.zeros_like(x_arr, dtype=float)
+    Fz = np.zeros_like(z_arr, dtype=float)
+
+    for index in np.ndindex(x_arr.shape):
+        Fx[index], Fz[index] = F_mie_hybrid_2d_scalar(
+            x_arr[index],
+            z_arr[index],
+            power_factor_arr[index]
+        )
+
+    return Fx, Fz
+
+
+def F_beam_2d(x, z, power_factor=1.0):
+    if optical_force_model == "ray_optics":
+        return F_ray_optics_2d(x, z, power_factor)
+    if optical_force_model == "mie":
+        return F_mie_hybrid_2d(x, z, power_factor)
+    if optical_force_model == "mie_scattering":
+        return F_mie_scattering_2d(x, z, power_factor)
+    if optical_force_model == "external_lookup":
+        return F_external_lookup_2d(x, z, power_factor)
+
+    raise ValueError(
+        "Unknown optical_force_model. Use 'ray_optics', 'mie', or "
+        "'mie_scattering', or 'external_lookup'."
+    )
+
+
+# ****************************************************************************************************************************************************
+# Photophoretic force model
+# ****************************************************************************************************************************************************
+
+def mean_thermal_speed():
+    return np.sqrt(8 * R * T / (np.pi * M_air))
+
+
+def photophoretic_D():
+    c_bar = mean_thermal_speed()
+    return (np.pi * c_bar * eta / (2 * T)) * np.sqrt(np.pi * kappa_t / 3)
+
+
+def photophoretic_p_max():
+    D = photophoretic_D()
+    return (3 * T / (np.pi * radius)) * D * np.sqrt(2 / alpha_acc)
+
+
+def absorbed_intensity(x, z, power_factor=1.0):
+    return absorption_fraction * physical_intensity(x, z, power_factor)
+
+
+def photophoretic_force_magnitude(x, z, power_factor=1.0):
+    D = photophoretic_D()
+    p_max_ph = photophoretic_p_max()
+
+    I_abs = absorbed_intensity(x, z, power_factor)
+
+    F_max = (
+        0.5
+        * radius**2
+        * D
+        * np.sqrt(alpha_acc / 2)
+        * I_abs
+        / k_particle
+    )
+
+    return 2 * F_max / ((p / p_max_ph) + (p_max_ph / p))
+
+
+def F_photo_2d(x, z, power_factor=1.0):
+    """
+    Improved photophoretic force.
+    Positive sign means force points upward, in +z.
+    """
+    return 0.0, photophoretic_force_magnitude(x, z, power_factor)
+
+
+def F_optical_2d_direct(x, z, power_factor=1.0):
+    
+    Fx_ray, Fz_ray = F_beam_2d(x, z, power_factor)
+    Fx_photo, Fz_photo = F_photo_2d(x, z, power_factor)
+
+    Fx = Fx_ray + Fx_photo
+    Fz = Fz_ray + Fz_photo
+
+    return Fx, Fz
+
+
+force_lookup_ready = False
+force_lookup_r_values = None
+force_lookup_z_values = None
+force_lookup_Fr_interpolator = None
+force_lookup_Fz_interpolator = None
+force_lookup_Fr_table = None
+force_lookup_Fz_table = None
+
+
+def build_force_lookup_table(r_min, r_max, z_min, z_max):
+    """
+    Precompute the optical + photophoretic force on a cylindrical r-z grid.
+
+    The expensive ray-optics calculation is only performed for y = 0 and
+    x = r. Cylindrical symmetry is then used during the 3D simulation:
+
+        Fx = Fr x/r
+        Fy = Fr y/r
+        Fz = Fz(r,z)
+
+    The table is built at nominal laser power. This is valid because both the
+    ray-optics force and the current photophoretic force scale linearly with
+    laser power in this model, so laser noise is applied by multiplying the
+    interpolated nominal force by power_factor.
+    """
+    global force_lookup_ready
+    global force_lookup_r_values
+    global force_lookup_z_values
+    global force_lookup_Fr_interpolator
+    global force_lookup_Fz_interpolator
+    global force_lookup_Fr_table
+    global force_lookup_Fz_table
+
+    force_lookup_start_time = perf_counter()
+    print("Building cylindrical force lookup table...", flush=True)
+
+    force_lookup_r_values = np.linspace(
+        r_min,
+        r_max,
+        force_lookup_grid_points_r
+    )
+    force_lookup_z_values = np.linspace(
+        z_min,
+        z_max,
+        force_lookup_grid_points_z
+    )
+
+    Fr_table = np.zeros(
+        (force_lookup_grid_points_r, force_lookup_grid_points_z)
+    )
+    Fz_table = np.zeros_like(Fr_table)
+
+    for ir, r_value in enumerate(force_lookup_r_values):
+        for iz, z_value in enumerate(force_lookup_z_values):
+            Fr_table[ir, iz], Fz_table[ir, iz] = F_optical_2d_direct(
+                r_value,
+                z_value,
+                power_factor=1.0
+            )
+
+    force_lookup_Fr_interpolator = RegularGridInterpolator(
+        (force_lookup_r_values, force_lookup_z_values),
+        Fr_table,
+        bounds_error=True
+    )
+    force_lookup_Fz_interpolator = RegularGridInterpolator(
+        (force_lookup_r_values, force_lookup_z_values),
+        Fz_table,
+        bounds_error=True
+    )
+    force_lookup_Fr_table = np.ascontiguousarray(Fr_table, dtype=np.float64)
+    force_lookup_Fz_table = np.ascontiguousarray(Fz_table, dtype=np.float64)
+
+    force_lookup_ready = True
+    print("Finished force lookup table in", perf_counter() - force_lookup_start_time, "s", flush=True)
+
+    # print("Cylindrical force lookup table enabled =", use_force_lookup_table)
+    # print("Force lookup grid r points =", force_lookup_grid_points_r)
+    # print("Force lookup grid z points =", force_lookup_grid_points_z)
+    # print(
+        # "Force lookup r range =",
+        # force_lookup_r_values[0] * 1e6,
+        # "to",
+        # force_lookup_r_values[-1] * 1e6,
+        # "micrometres"
+    # )
+    # print(
+        # "Force lookup z range =",
+        # force_lookup_z_values[0] * 1e6,
+        # "to",
+        # force_lookup_z_values[-1] * 1e6,
+        # "micrometres"
+    # )
+    # print(
+        # "Force lookup table build runtime =",
+        # perf_counter() - force_lookup_start_time,
+        # "s"
+    # )
+
+
+def F_optical_3d_direct(x, y, z, power_factor=1.0):
+    x_arr, y_arr, z_arr, power_factor_arr = np.broadcast_arrays(
+        x,
+        y,
+        z,
+        power_factor
+    )
+
+    r_arr = np.sqrt(x_arr**2 + y_arr**2)
+
+    if x_arr.shape == ():
+        Fr, Fz = F_optical_2d_direct(
+            float(r_arr),
+            float(z_arr),
+            float(power_factor_arr)
+        )
+
+        if r_arr < radial_zero_tolerance:
+            return 0.0, 0.0, Fz
+
+        Fx = Fr * float(x_arr) / float(r_arr)
+        Fy = Fr * float(y_arr) / float(r_arr)
+        return Fx, Fy, Fz
+
+    Fx = np.zeros_like(x_arr, dtype=float)
+    Fy = np.zeros_like(y_arr, dtype=float)
+    Fz = np.zeros_like(z_arr, dtype=float)
+
+    for index in np.ndindex(x_arr.shape):
+        r_value = r_arr[index]
+        Fr_value, Fz_value = F_optical_2d_direct(
+            r_value,
+            z_arr[index],
+            power_factor_arr[index]
+        )
+
+        if r_value > radial_zero_tolerance:
+            Fx[index] = Fr_value * x_arr[index] / r_value
+            Fy[index] = Fr_value * y_arr[index] / r_value
+
+        Fz[index] = Fz_value
+
+    return Fx, Fy, Fz
+
+
+def F_optical_3d_lookup(x, y, z, power_factor=1.0):
+    x_arr, y_arr, z_arr, power_factor_arr = np.broadcast_arrays(
+        x,
+        y,
+        z,
+        power_factor
+    )
+
+    r_arr = np.sqrt(x_arr**2 + y_arr**2)
+
+    r_inside = (
+        np.min(r_arr) >= force_lookup_r_values[0]
+        and np.max(r_arr) <= force_lookup_r_values[-1]
+    )
+    z_inside = (
+        np.min(z_arr) >= force_lookup_z_values[0]
+        and np.max(z_arr) <= force_lookup_z_values[-1]
+    )
+
+    if not (r_inside and z_inside):
+        return F_optical_3d_direct(x, y, z, power_factor)
+
+    points = np.column_stack((r_arr.ravel(), z_arr.ravel()))
+
+    Fr_nominal = force_lookup_Fr_interpolator(points).reshape(r_arr.shape)
+    Fz_nominal = force_lookup_Fz_interpolator(points).reshape(z_arr.shape)
+
+    Fr = power_factor_arr * Fr_nominal
+    Fz = power_factor_arr * Fz_nominal
+
+    Fx = np.zeros_like(r_arr, dtype=float)
+    Fy = np.zeros_like(r_arr, dtype=float)
+    nonzero_r = r_arr > radial_zero_tolerance
+
+    Fx[nonzero_r] = Fr[nonzero_r] * x_arr[nonzero_r] / r_arr[nonzero_r]
+    Fy[nonzero_r] = Fr[nonzero_r] * y_arr[nonzero_r] / r_arr[nonzero_r]
+
+    if Fx.shape == ():
+        return float(Fx), float(Fy), float(Fz)
+
+    return Fx, Fy, Fz
+
+
+def F_optical_3d_lookup_scalar_clamped(x, y, z, power_factor=1.0):
+    """
+    Fast scalar force lookup for time-stepping loops.
+
+    This avoids the per-step overhead of RegularGridInterpolator for closed-loop
+    feedback. Positions outside the lookup table are clamped to the table edge,
+    matching the fast Cython loop's behaviour.
+    """
+    r = np.sqrt(x**2 + y**2)
+
+    r_min = force_lookup_r_values[0]
+    r_max = force_lookup_r_values[-1]
+    z_min = force_lookup_z_values[0]
+    z_max = force_lookup_z_values[-1]
+
+    r_lookup = min(max(r, r_min), r_max)
+    z_lookup = min(max(z, z_min), z_max)
+    out_of_bounds = r_lookup != r or z_lookup != z
+
+    n_r = len(force_lookup_r_values)
+    n_z = len(force_lookup_z_values)
+
+    if n_r < 2 or n_z < 2:
+        raise ValueError("Force lookup table needs at least two grid points per axis.")
+
+    dr = (r_max - r_min) / (n_r - 1)
+    dz = (z_max - z_min) / (n_z - 1)
+
+    r_grid_position = (r_lookup - r_min) / dr
+    z_grid_position = (z_lookup - z_min) / dz
+
+    ir = int(r_grid_position)
+    iz = int(z_grid_position)
+
+    if ir >= n_r - 1:
+        ir = n_r - 2
+        r_weight = 1.0
+    else:
+        r_weight = r_grid_position - ir
+
+    if iz >= n_z - 1:
+        iz = n_z - 2
+        z_weight = 1.0
+    else:
+        z_weight = z_grid_position - iz
+
+    Fr00 = force_lookup_Fr_table[ir, iz]
+    Fr10 = force_lookup_Fr_table[ir + 1, iz]
+    Fr01 = force_lookup_Fr_table[ir, iz + 1]
+    Fr11 = force_lookup_Fr_table[ir + 1, iz + 1]
+
+    Fz00 = force_lookup_Fz_table[ir, iz]
+    Fz10 = force_lookup_Fz_table[ir + 1, iz]
+    Fz01 = force_lookup_Fz_table[ir, iz + 1]
+    Fz11 = force_lookup_Fz_table[ir + 1, iz + 1]
+
+    Fr_nominal = (
+        (1 - r_weight) * (1 - z_weight) * Fr00
+        + r_weight * (1 - z_weight) * Fr10
+        + (1 - r_weight) * z_weight * Fr01
+        + r_weight * z_weight * Fr11
+    )
+    Fz_nominal = (
+        (1 - r_weight) * (1 - z_weight) * Fz00
+        + r_weight * (1 - z_weight) * Fz10
+        + (1 - r_weight) * z_weight * Fz01
+        + r_weight * z_weight * Fz11
+    )
+
+    Fr = power_factor * Fr_nominal
+    Fz = power_factor * Fz_nominal
+
+    if r > radial_zero_tolerance:
+        Fx = Fr * x / r
+        Fy = Fr * y / r
+    else:
+        Fx = 0.0
+        Fy = 0.0
+
+    return Fx, Fy, Fz, out_of_bounds
+
+
+def F_optical_3d(x, y, z, power_factor=1.0):
+    if use_force_lookup_table and force_lookup_ready:
+        return F_optical_3d_lookup(x, y, z, power_factor)
+
+    return F_optical_3d_direct(x, y, z, power_factor)
+
+
+def F_optical_2d(x, z, power_factor=1.0):
+    Fx, _, Fz = F_optical_3d(x, 0.0, z, power_factor)
+    return Fx, Fz
+
+
+def Fz_net_on_axis(z):
+    
+    _, Fz = F_optical_2d(0.0, z)
+    return Fz - m*g
+
+
+if optical_force_model == "external_lookup":
+    load_external_optical_force_table(external_optical_force_table_path)
+    equilibrium_z_min = max(equilibrium_z_min, external_optical_force_z_values[0])
+    equilibrium_z_max = min(equilibrium_z_max, external_optical_force_z_values[-1])
+    if equilibrium_z_min >= equilibrium_z_max:
+        raise ValueError(
+            "The external optical force table z range does not overlap the "
+            "requested equilibrium search range."
+        )
+
+
+# ****************************************************************************************************************************************************
+# Find on-axis equilibrium
+# ****************************************************************************************************************************************************
+z_scan = np.linspace(equilibrium_z_min, equilibrium_z_max, equilibrium_scan_points)
+F_scan = Fz_net_on_axis(z_scan)
+
+roots = []
+
+for i in range(len(z_scan) - 1):
+    if F_scan[i] * F_scan[i + 1] < 0:
+        root = brentq(
+            Fz_net_on_axis,
+            z_scan[i],
+            z_scan[i + 1],
+            xtol=root_finding_xtol,
+            rtol=root_finding_rtol
+        )
+        roots.append(root)
+
+# print("On-axis equilibrium positions / micrometres:")
+for root in roots:
+    pass
+    # print(root * 1e6)
+
+
+def numerical_derivative_1d(func, z, h=numerical_derivative_step):
+    return (func(z + h) - func(z - h)) / (2*h)
+
+
+stable_roots = []
+
+for root in roots:
+    slope = numerical_derivative_1d(Fz_net_on_axis, root)
+    if slope < 0:
+        stable_roots.append(root)
+
+stable_equilibrium_found = len(stable_roots) > 0
+no_stable_equilibrium_mode = False
+falling_trajectory_post_truncation = False
+equilibrium_reference_source = "selected stable equilibrium"
+z_falling_start_reference = None
+z_falling_stop_reference = None
+
+if len(stable_roots) == 0:
+    print("No stable on-axis equilibrium found.")
+    print(
+        "On-axis net force scan range / mg =",
+        np.min(F_scan) / (m * g),
+        "to",
+        np.max(F_scan) / (m * g)
+    )
+    if optical_force_model == "external_lookup":
+        print(
+            "External lookup note: if this range is entirely below zero, "
+            "the imported optical force table is too weak over the scanned "
+            "z range. Try regenerating it with a higher lmax and/or wider "
+            "z range."
+        )
+    if not allow_no_stable_equilibrium_trajectory:
+        raise ValueError("No stable on-axis equilibrium found.")
+
+    no_stable_equilibrium_mode = True
+    falling_trajectory_post_truncation = True
+    terminate_on_trap_loss = False
+    if len(roots) > 0:
+        z_falling_start_reference = max(roots)
+        z_falling_stop_reference = min(roots)
+        equilibrium_reference_source = "highest on-axis equilibrium"
+        print(
+            "Starting the trajectory at the highest on-axis equilibrium:",
+            z_falling_start_reference * 1e6,
+            "micrometres."
+        )
+        print(
+            "Using the lowest on-axis equilibrium as the lower stop reference:",
+            z_falling_stop_reference * 1e6,
+            "micrometres."
+        )
+    else:
+        min_force_index = int(np.argmin(np.abs(F_scan)))
+        z_falling_start_reference = z_scan[min_force_index]
+        z_falling_stop_reference = z_falling_start_reference
+        equilibrium_reference_source = "minimum-|net force| scan point"
+        print(
+            "No on-axis equilibrium roots were found. Using the minimum-|net force| "
+            "scan point as the trajectory reference:",
+            z_falling_start_reference * 1e6,
+            "micrometres."
+        )
+    print(
+        "The trajectory will be truncated once z is",
+        no_stable_stop_below_lowest_equilibrium * 1e6,
+        "micrometres below the lower stop reference."
+    )
+    print(
+        "Using a short fast diagnostic run; the trajectory will be truncated "
+        "afterwards if the stop condition is reached."
+    )
+
+if stable_equilibrium_found and not -len(stable_roots) <= equilibrium_root_index < len(stable_roots):
+    raise IndexError(
+        "equilibrium_root_index is outside the stable root list. "
+        f"Found {len(stable_roots)} stable root(s)."
+    )
+
+x_eq = x_equilibrium
+y_eq = y_equilibrium
+if stable_equilibrium_found:
+    z_eq = stable_roots[equilibrium_root_index]
+else:
+    z_eq = z_falling_start_reference
+
+print("Chosen equilibrium x =", x_eq * 1e6, "micrometres")
+# print("Chosen equilibrium y =", y_eq * 1e6, "micrometres")
+print("Chosen equilibrium z =", z_eq * 1e6, "micrometres")
+print("Fz_net_on_axis(z_eq) =", Fz_net_on_axis(z_eq), "N")
+
+# ****************************************************************************************************************************************************
+# Local spring constants
+# ****************************************************************************************************************************************************
+
+
+def Fx_at_x(x):
+    Fx, _ = F_optical_2d(x, z_eq)
+    return Fx
+
+
+def Fz_net_at_z(z):
+    _, Fz = F_optical_2d(x_eq, z)
+    return Fz - m*g
+
+
+kx = -numerical_derivative_1d(Fx_at_x, x_eq)
+ky = kx
+kz = -numerical_derivative_1d(Fz_net_at_z, z_eq)
+
+if stable_equilibrium_found and (kx <= 0 or kz <= 0):
+    if not allow_no_stable_equilibrium_trajectory:
+        raise ValueError(
+            "The selected equilibrium is not stable. "
+            f"kx={kx:.3e} N/m, kz={kz:.3e} N/m. "
+            "Check the ray-optics force signs, laser power, search range, or chosen root."
+        )
+
+    print(
+        "The selected on-axis equilibrium is not a stable 3D trap "
+        f"(kx={kx:.3e} N/m, kz={kz:.3e} N/m)."
+    )
+    no_stable_equilibrium_mode = True
+    falling_trajectory_post_truncation = True
+    terminate_on_trap_loss = False
+    stable_equilibrium_found = False
+
+    if len(roots) > 0:
+        z_falling_start_reference = max(roots)
+        z_falling_stop_reference = min(roots)
+        z_eq = z_falling_start_reference
+        equilibrium_reference_source = "highest on-axis equilibrium"
+        print(
+            "Starting the trajectory at the highest on-axis equilibrium:",
+            z_eq * 1e6,
+            "micrometres."
+        )
+        print(
+            "Using the lowest on-axis equilibrium as the lower stop reference:",
+            z_falling_stop_reference * 1e6,
+            "micrometres."
+        )
+    else:
+        min_force_index = int(np.argmin(np.abs(F_scan)))
+        z_falling_start_reference = z_scan[min_force_index]
+        z_falling_stop_reference = z_falling_start_reference
+        z_eq = z_falling_start_reference
+        equilibrium_reference_source = "minimum-|net force| scan point"
+        print(
+            "No on-axis equilibrium roots were found. Using the minimum-|net force| "
+            "scan point as the trajectory reference:",
+            z_eq * 1e6,
+            "micrometres."
+        )
+
+    kx = -numerical_derivative_1d(Fx_at_x, x_eq)
+    ky = kx
+    kz = -numerical_derivative_1d(Fz_net_at_z, z_eq)
+    print(
+        "The trajectory will be truncated once z is",
+        no_stable_stop_below_lowest_equilibrium * 1e6,
+        "micrometres below the lower stop reference."
+    )
+    print(
+        "Using a short fast diagnostic run; the trajectory will be truncated "
+        "afterwards if the stop condition is reached."
+    )
+
+harmonic_validation_available = stable_equilibrium_found and kx > 0 and ky > 0 and kz > 0
+
+if not harmonic_validation_available:
+    print(
+        "Stable harmonic validation is disabled for this run "
+        f"({equilibrium_reference_source}; kx={kx:.3e} N/m, kz={kz:.3e} N/m)."
+    )
+
+omega_x = np.sqrt(kx / m) if kx > 0 else np.nan
+omega_y = np.sqrt(ky / m) if ky > 0 else np.nan
+omega_z = np.sqrt(kz / m) if kz > 0 else np.nan
+
+print("kx =", kx, "N/m")
+# print("ky =", ky, "N/m")
+print("kz =", kz, "N/m")
+# print("fx =", omega_x / (2*np.pi), "Hz")
+# print("fy =", omega_y / (2*np.pi), "Hz")
+# print("fz =", omega_z / (2*np.pi), "Hz")
+
+if no_stable_equilibrium_mode and use_pd_feedback:
+    print("Disabling PD feedback because no stable equilibrium was found.")
+    use_pd_feedback = False
+
+x_rms_thermal = np.sqrt(kB * brownian_temperature / kx) if kx > 0 else np.nan
+y_rms_thermal = np.sqrt(kB * brownian_temperature / ky) if ky > 0 else np.nan
+z_rms_thermal = np.sqrt(kB * brownian_temperature / kz) if kz > 0 else np.nan
+
+# print("Expected x thermal RMS =", x_rms_thermal * 1e6, "micrometres")
+# print("Expected y thermal RMS =", y_rms_thermal * 1e6, "micrometres")
+# print("Expected z thermal RMS =", z_rms_thermal * 1e6, "micrometres")
+
+# ****************************************************************************************************************************************************
+# Damping
+# ****************************************************************************************************************************************************
+def gas_density(pressure):
+    return pressure * M_air / (R * T)
+
+
+def mean_free_path(pressure):
+    return kB * T / (np.sqrt(2) * np.pi * d_air**2 * pressure)
+
+
+def knudsen_number(pressure):
+    return mean_free_path(pressure) / radius
+
+
+def cunningham_correction(Kn):
+    if Kn <= 0:
+        return 1.0
+
+    return 1 + Kn * (
+        cunningham_A
+        + cunningham_B * np.exp(-cunningham_C / Kn)
+    )
+
+
+def damping_coefficient_stokes():
+    """
+    Continuum Stokes drag:
+
+        F_drag = -b v
+        b = 6 pi eta a
+
+    This is appropriate when Kn << 1.
+    """
+    return 6 * np.pi * eta * radius
+
+
+def damping_coefficient_stokes_cunningham(pressure):
+    """
+    Stokes drag with Cunningham slip correction:
+
+        b = 6 pi eta a / Cc
+
+    This is useful in the slip/transition regime.
+    """
+    Kn = knudsen_number(pressure)
+    Cc = cunningham_correction(Kn)
+    return damping_coefficient_stokes() / Cc
+
+
+def damping_coefficient_epstein(pressure):
+    """
+    Epstein drag in the free-molecular regime:
+
+        b = (4/3) pi a^2 rho_g c_bar (1 + pi alpha_E / 8)
+
+    alpha_E is an accommodation factor. alpha_E = 1 is a common simple
+    diffuse-reflection estimate.
+    """
+    rho = gas_density(pressure)
+    c_bar = mean_thermal_speed()
+    accommodation_factor = 1 + np.pi * epstein_accommodation_alpha / 8
+
+    return (4 / 3) * np.pi * radius**2 * rho * c_bar * accommodation_factor
+
+
+def choose_drag_model(pressure):
+    """
+    Pick a drag model from Knudsen number.
+    """
+    Kn = knudsen_number(pressure)
+
+    if Kn < 0.1:
+        return "stokes"
+    if Kn < 10:
+        return "cunningham"
+    return "epstein"
+
+
+def damping_coefficient(pressure, model="auto"):
+    """
+    Return damping coefficient b for the chosen drag model.
+    """
+    if model == "auto":
+        model = choose_drag_model(pressure)
+
+    if model == "stokes":
+        return damping_coefficient_stokes(), model
+    if model == "cunningham":
+        return damping_coefficient_stokes_cunningham(pressure), model
+    if model == "epstein":
+        return damping_coefficient_epstein(pressure), model
+
+    raise ValueError(
+        "Unknown drag_model. Use 'stokes', 'cunningham', 'epstein', or 'auto'."
+    )
+
+
+b_stokes = damping_coefficient_stokes()
+b_cunningham = damping_coefficient_stokes_cunningham(p)
+b_epstein = damping_coefficient_epstein(p)
+
+b_cold, drag_model_used = damping_coefficient(p, drag_model)
+b = b_cold
+
+if use_hot_brownian_model:
+    eta_eff = sutherland_viscosity(hot_brownian_emerging_temperature)
+    lambda_eff = effective_mean_free_path(hot_brownian_emerging_temperature, p)
+    cunningham_eff = 1 + (lambda_eff / radius) * (
+        cunningham_A
+        + cunningham_B * np.exp(-cunningham_C * radius / lambda_eff)
+    )
+    b_transport_eff = 6 * np.pi * eta_eff * radius / cunningham_eff
+    gamma_transport_eff = b_transport_eff / m
+    gamma_cm_factor = hot_brownian_cm_damping_factor(
+        T,
+        hot_brownian_emerging_temperature,
+    )
+    gamma_cm_eff = gamma_transport_eff * gamma_cm_factor
+    b = m * gamma_cm_eff
+    drag_model_used = f"{drag_model_used}+hot_brownian"
+
+    print("Hot Brownian model enabled")
+    print("  Impinging gas temperature T_imp =", T, "K")
+    print("  Particle surface temperature T_sur =", input_surface_temperature, "K")
+    print("  Emerging gas temperature T_em =", hot_brownian_emerging_temperature, "K")
+    print("  Brownian centre-of-mass temperature T_CM =", brownian_temperature, "K")
+    print("  Effective gas viscosity eta_eff =", eta_eff, "Pa s")
+    print("  Effective mean free path lambda_eff =", lambda_eff, "m")
+    print("  Effective Cunningham correction Cc_eff =", cunningham_eff)
+    print("  Cold damping coefficient b_cold =", b_cold, "kg/s")
+    print("  Transport-corrected damping coefficient b_transport_eff =", b_transport_eff, "kg/s")
+    print("  Heated centre-of-mass damping coefficient b_eff =", b, "kg/s")
+else:
+    print("Hot Brownian model disabled")
+
+print("damping coef = ", b)
+
+#b=b/40
+# print("Drag model requested =", drag_model)
+# print("Drag model used =", drag_model_used)
+# print("Stokes damping b =", b_stokes, "kg/s")
+# print("Cunningham-corrected Stokes damping b =", b_cunningham, "kg/s")
+# print("Epstein damping b =", b_epstein, "kg/s")
+# print("Selected pressure-dependent damping b =", b, "kg/s")
+# print("Damping ratio x =", b / (2 * np.sqrt(m * kx)))
+# print("Damping ratio y =", b / (2 * np.sqrt(m * ky)))
+# print("Damping ratio z =", b / (2 * np.sqrt(m * kz)))
+
+
+def brownian_force_rms_baoab(damping_b):
+    """
+    Equivalent per-axis Brownian force RMS implied by the BAOAB velocity kick.
+
+    The BAOAB Ornstein-Uhlenbeck step uses:
+
+        dv_B = sqrt(kB T / m * (1 - exp(-2 gamma dt))) * N(0, 1)
+
+    with gamma = b / m. Dividing the impulse m dv_B by dt gives an
+    equivalent discrete force sample. For small gamma dt this approaches the
+    continuous Langevin white-force result sqrt(2 b kB T / dt).
+    """
+    damping_rate = damping_b / m
+    damping_factor = np.exp(-damping_rate * dt_baoab)
+    velocity_kick_rms = np.sqrt(
+        (kB * brownian_temperature / m)
+        * (1 - damping_factor**2)
+    )
+    return m * velocity_kick_rms / dt_baoab
+
+
+def brownian_force_rms_fdt(damping_b):
+    """Continuous-time fluctuation-dissipation prediction per axis."""
+    return np.sqrt(2 * damping_b * kB * brownian_temperature / dt_baoab)
+
+
+def pressure_at_knudsen_number(kn_value):
+    return kB * T / (np.sqrt(2) * np.pi * d_air**2 * radius * kn_value)
+
+
+if (
+    run_brownian_force_scaling_validation
+    and not psd_normalisation_only
+    and not welch_averaging_only
+    and not thermal_distribution_only
+    and not multiple_seeds_only
+):
+    brownian_pressure = np.logspace(
+        np.log10(brownian_force_pressure_min),
+        np.log10(brownian_force_pressure_max),
+        brownian_force_pressure_points,
+    )
+
+    brownian_damping = np.empty_like(brownian_pressure)
+    brownian_drag_models = []
+
+    for pressure_index, pressure_value in enumerate(brownian_pressure):
+        damping_value, damping_model = damping_coefficient(pressure_value, drag_model)
+        brownian_damping[pressure_index] = damping_value
+        brownian_drag_models.append(damping_model)
+
+    brownian_force_theory = brownian_force_rms_fdt(brownian_damping)
+    brownian_force_baoab = brownian_force_rms_baoab(brownian_damping)
+
+    brownian_sample_indices = np.unique(
+        np.linspace(
+            0,
+            len(brownian_pressure) - 1,
+            min(32, len(brownian_pressure)),
+            dtype=int,
+        )
+    )
+    # The simulation multiplies this deterministic scale by standard normal
+    # samples. Independent samples at selected pressures check that the sampled
+    # RMS is the expected BAOAB scale.
+    brownian_validation_rng = np.random.default_rng(brownian_seed)
+    sampled_normal_rms = np.array(
+        [
+            np.sqrt(
+                np.mean(
+                    brownian_validation_rng.normal(
+                        size=brownian_force_scaling_sample_count
+                    )**2
+                )
+            )
+            for _ in brownian_sample_indices
+        ]
+    )
+    brownian_force_sampled = (
+        brownian_force_baoab[brownian_sample_indices]
+        * sampled_normal_rms
+    )
+
+    fig, axes = plt.subplots(
+        2,
+        1,
+        figsize=(8, 6),
+        sharex=True,
+        gridspec_kw={"height_ratios": [3, 1]},
+    )
+    ax_force, ax_ratio = axes
+
+    ax_force.loglog(
+        brownian_pressure,
+        brownian_force_theory,
+        color="black",
+        linewidth=2,
+        label=r"FDT prediction $\sqrt{2 b k_B T / \Delta t}$",
+    )
+    ax_force.loglog(
+        brownian_pressure,
+        brownian_force_baoab,
+        linestyle="--",
+        color="tab:blue",
+        linewidth=1.8,
+        label="BAOAB discrete update",
+    )
+    ax_force.scatter(
+        brownian_pressure[brownian_sample_indices],
+        brownian_force_sampled,
+        s=28,
+        color="tab:orange",
+        edgecolor="black",
+        linewidth=0.4,
+        label="sampled Brownian kicks",
+        zorder=3,
+    )
+
+    for kn_value, label in ((10.0, "Kn = 10"), (0.1, "Kn = 0.1")):
+        transition_pressure = pressure_at_knudsen_number(kn_value)
+        if brownian_pressure[0] < transition_pressure < brownian_pressure[-1]:
+            ax_force.axvline(
+                transition_pressure,
+                color="0.45",
+                linestyle=":",
+                linewidth=1,
+            )
+            ax_force.text(
+                transition_pressure,
+                0.98,
+                label,
+                transform=ax_force.get_xaxis_transform(),
+                ha="center",
+                va="top",
+                fontsize=8,
+                color="0.25",
+                rotation=90,
+            )
+
+    brownian_sample_ratio = (
+        brownian_force_sampled
+        / brownian_force_baoab[brownian_sample_indices]
+    )
+    ax_ratio.scatter(
+        brownian_pressure[brownian_sample_indices],
+        brownian_sample_ratio,
+        s=22,
+        color="tab:orange",
+        edgecolor="black",
+        linewidth=0.4,
+    )
+    ax_ratio.axhline(1.0, color="black", linestyle="--", linewidth=1)
+
+    ax_force.set_ylabel("per-axis Brownian force RMS / N")
+    ax_ratio.set_xlabel("pressure / Pa")
+    ax_ratio.set_ylabel("sampled Brownian RMS /\nexpected BAOAB RMS")
+    ax_force.set_title("Brownian force RMS scaling with pressure")
+    ax_force.legend(fontsize=8)
+    for axis in axes:
+        axis.grid(True, which="major", color="0.75", linewidth=0.8)
+        axis.grid(True, which="minor", color="0.88", linewidth=0.5)
+
+    ratio_padding = max(0.002, 1.3 * np.max(np.abs(brownian_sample_ratio - 1.0)))
+    ax_ratio.set_ylim(1.0 - ratio_padding, 1.0 + ratio_padding)
+    fig.tight_layout()
+    save_validation_plot("brownian_force_rms_vs_pressure.png")
+    finish_plot()
+
+    max_sampling_error = np.max(
+        np.abs(brownian_sample_ratio - 1)
+    )
+    max_discrete_fdt_difference = np.max(
+        np.abs(brownian_force_baoab / brownian_force_theory - 1)
+    )
+    print(
+        "Brownian force RMS validation: sampled/BAOAB max relative error =",
+        max_sampling_error,
+    )
+    print(
+        "Brownian force RMS validation: BAOAB/FDT max relative difference =",
+        max_discrete_fdt_difference,
+    )
+
+    if brownian_force_scaling_only:
+        sys.exit(0)
+
+# ****************************************************************************************************************************************************
+# Initial conditions
+# ****************************************************************************************************************************************************
+x0 = x_eq + x_displacement
+y0 = y_eq + y_displacement
+z0 = z_eq + z_displacement
+
+Fx_initial, Fy_initial, Fz_initial = F_optical_3d(x0, y0, z0)
+ax_initial = Fx_initial / m
+ay_initial = Fy_initial / m
+az_initial = (Fz_initial - m*g) / m
+
+# print("Initial x displacement =", x_displacement * 1e6, "micrometres")
+# print("Initial y displacement =", y_displacement * 1e6, "micrometres")
+# print("Initial z displacement =", z_displacement * 1e6, "micrometres")
+# print("Initial Fx / mg =", Fx_initial / (m*g))
+# print("Initial Fy / mg =", Fy_initial / (m*g))
+# print("Initial Fz_net / mg =", (Fz_initial - m*g) / (m*g))
+# print("Initial ax =", ax_initial, "m/s^2")
+# print("Initial ay =", ay_initial, "m/s^2")
+# print("Initial az =", az_initial, "m/s^2")
+
+if use_force_lookup_table:
+    # Keep the lookup region local to the trap. If the particle leaves this
+    # region, F_optical_3d automatically falls back to the direct ray sum.
+    x_lookup_thermal_extent = x_rms_thermal if np.isfinite(x_rms_thermal) else 0.0
+    z_lookup_thermal_extent = z_rms_thermal if np.isfinite(z_rms_thermal) else 0.0
+    if no_stable_equilibrium_mode and z_falling_stop_reference is not None:
+        z_lookup_falling_extent = (
+            abs(z_eq - z_falling_stop_reference)
+            + no_stable_stop_below_lowest_equilibrium
+        )
+    else:
+        z_lookup_falling_extent = 0.0
+    force_lookup_r_max = max(
+        force_lookup_r_base_max,
+        force_lookup_r_displacement_factor
+        * np.sqrt(x_displacement**2 + y_displacement**2),
+        force_lookup_r_thermal_factor * x_lookup_thermal_extent
+    )
+    force_lookup_z_half_width = max(
+        force_lookup_z_base_half_width,
+        force_lookup_z_displacement_factor * abs(z_displacement),
+        force_lookup_z_thermal_factor * z_lookup_thermal_extent,
+        z_lookup_falling_extent
+    )
+    force_lookup_z_min = z_eq - force_lookup_z_half_width
+    force_lookup_z_max = z_eq + force_lookup_z_half_width
+
+    if optical_force_model == "external_lookup":
+        external_r_min = external_optical_force_r_values[0]
+        external_r_max = external_optical_force_r_values[-1]
+        external_z_min = external_optical_force_z_values[0]
+        external_z_max = external_optical_force_z_values[-1]
+
+        if force_lookup_r_min < external_r_min or force_lookup_r_max > external_r_max:
+            print(
+                "Clipping local force lookup r range to external table bounds."
+            )
+        if force_lookup_z_min < external_z_min or force_lookup_z_max > external_z_max:
+            print(
+                "Clipping local force lookup z range to external table bounds."
+            )
+
+        force_lookup_r_min = max(force_lookup_r_min, external_r_min)
+        force_lookup_r_max = min(force_lookup_r_max, external_r_max)
+        force_lookup_z_min = max(force_lookup_z_min, external_z_min)
+        force_lookup_z_max = min(force_lookup_z_max, external_z_max)
+        force_lookup_z_half_width = min(
+            z_eq - force_lookup_z_min,
+            force_lookup_z_max - z_eq
+        )
+
+        if force_lookup_r_min >= force_lookup_r_max:
+            raise ValueError(
+                "The requested local force lookup r range does not overlap "
+                "the external optical force table."
+            )
+        if force_lookup_z_min >= force_lookup_z_max:
+            raise ValueError(
+                "The requested local force lookup z range does not overlap "
+                "the external optical force table."
+            )
+
+    build_force_lookup_table(
+        force_lookup_r_min,
+        force_lookup_r_max,
+        force_lookup_z_min,
+        force_lookup_z_max
+    )
+
+    Fx_initial_direct, Fy_initial_direct, Fz_initial_direct = F_optical_3d_direct(x0, y0, z0)
+    Fx_initial_lookup, Fy_initial_lookup, Fz_initial_lookup = F_optical_3d_lookup(x0, y0, z0)
+
+    def Fx_lookup_at_x(x):
+        Fx, _, _ = F_optical_3d_lookup(x, y_eq, z_eq)
+        return Fx
+
+    def Fy_lookup_at_y(y):
+        _, Fy, _ = F_optical_3d_lookup(x_eq, y, z_eq)
+        return Fy
+
+    def Fz_lookup_net_at_z(z):
+        _, _, Fz = F_optical_3d_lookup(x_eq, y_eq, z)
+        return Fz - m*g
+
+    kx = -numerical_derivative_1d(Fx_lookup_at_x, x_eq)
+    ky = -numerical_derivative_1d(Fy_lookup_at_y, y_eq)
+    kz = -numerical_derivative_1d(Fz_lookup_net_at_z, z_eq)
+    harmonic_validation_available = stable_equilibrium_found and kx > 0 and ky > 0 and kz > 0
+
+    omega_x = np.sqrt(kx / m) if kx > 0 else np.nan
+    omega_y = np.sqrt(ky / m) if ky > 0 else np.nan
+    omega_z = np.sqrt(kz / m) if kz > 0 else np.nan
+
+    x_rms_thermal = np.sqrt(kB * brownian_temperature / kx) if kx > 0 else np.nan
+    y_rms_thermal = np.sqrt(kB * brownian_temperature / ky) if ky > 0 else np.nan
+    z_rms_thermal = np.sqrt(kB * brownian_temperature / kz) if kz > 0 else np.nan
+
+    print("Lookup-effective kx =", kx, "N/m")
+    print("Lookup-effective ky =", ky, "N/m")
+    print("Lookup-effective kz =", kz, "N/m")
+
+    print("Spring-constant predicted trap frequencies:")
+    print("  fx =", omega_x / (2 * np.pi), "Hz")
+    print("  fy =", omega_y / (2 * np.pi), "Hz")
+    print("  fz =", omega_z / (2 * np.pi), "Hz")
+
+    # print(
+        # "Lookup check at initial position: |Fx error| / mg =",
+        # abs(Fx_initial_lookup - Fx_initial_direct) / (m*g)
+    # )
+    # print(
+        # "Lookup check at initial position: |Fy error| / mg =",
+        # abs(Fy_initial_lookup - Fy_initial_direct) / (m*g)
+    # )
+    # print(
+        # "Lookup check at initial position: |Fz error| / mg =",
+        # abs(Fz_initial_lookup - Fz_initial_direct) / (m*g)
+    # )
+else:
+    pass
+    # print("Force lookup table enabled = False")
+
+# ****************************************************************************************************************************************************
+# Time range
+# ****************************************************************************************************************************************************
+if no_stable_equilibrium_mode:
+    requested_t_end = t_end
+    t_end = min(t_end, t_start + no_stable_diagnostic_max_time)
+    if t_end < requested_t_end:
+        print(
+            "No-stable-equilibrium diagnostic t_end shortened from",
+            requested_t_end,
+            "s to",
+            t_end,
+            "s."
+        )
+
+t_baoab = np.arange(t_start, t_end + 0.5 * dt_baoab, dt_baoab)
+
+trap_loss_check_interval_steps = max(1, int(trap_loss_check_interval_steps))
+
+trap_loss_radial_limit_auto = trap_loss_radial_beam_waists * w0
+trap_loss_axial_limit_auto = trap_loss_axial_rayleigh_ranges * zR
+
+if use_force_lookup_table:
+    trap_loss_radial_limit_auto = max(
+        trap_loss_radial_limit_auto,
+        force_lookup_r_max
+    )
+    trap_loss_axial_limit_auto = max(
+        trap_loss_axial_limit_auto,
+        force_lookup_z_half_width
+    )
+
+trap_loss_radial_limit = (
+    trap_loss_radial_limit_auto
+    if trap_loss_radial_limit_manual is None
+    else trap_loss_radial_limit_manual
+)
+trap_loss_axial_limit = (
+    trap_loss_axial_limit_auto
+    if trap_loss_axial_limit_manual is None
+    else trap_loss_axial_limit_manual
+)
+
+if trap_loss_radial_limit <= 0:
+    raise ValueError("trap_loss_radial_limit must be positive.")
+
+if trap_loss_axial_limit <= 0:
+    raise ValueError("trap_loss_axial_limit must be positive.")
+
+trap_loss_events = {}
+
+
+def trap_loss_reason(x, y, z):
+    if not terminate_on_trap_loss:
+        return None
+
+    if not np.all(np.isfinite([x, y, z])):
+        return "position became non-finite"
+
+    if no_stable_equilibrium_mode:
+        fall_distance = z_falling_stop_reference - z
+        if fall_distance > no_stable_stop_below_lowest_equilibrium:
+            return (
+                "z position fell "
+                f"{fall_distance * 1e6:.3g} micrometres below "
+                "the lower stop reference"
+            )
+        return None
+
+    radial_displacement = np.sqrt((x - x_eq)**2 + (y - y_eq)**2)
+    axial_displacement = abs(z - z_eq)
+
+    if radial_displacement > trap_loss_radial_limit:
+        return (
+            "radial displacement "
+            f"{radial_displacement * 1e6:.3g} micrometres exceeded "
+            f"{trap_loss_radial_limit * 1e6:.3g} micrometres"
+        )
+
+    if axial_displacement > trap_loss_axial_limit:
+        return (
+            "axial displacement "
+            f"{axial_displacement * 1e6:.3g} micrometres exceeded "
+            f"{trap_loss_axial_limit * 1e6:.3g} micrometres"
+        )
+
+    return None
+
+
+def should_check_trap_loss(sample_index):
+    return (
+        terminate_on_trap_loss
+        and (
+            sample_index % trap_loss_check_interval_steps == 0
+            or sample_index == len(t_baoab) - 1
+        )
+    )
+
+
+def record_trap_loss(run_label, sample_index, x, y, z, reason):
+    trap_loss_events[run_label] = {
+        "sample_index": sample_index,
+        "time": t_baoab[sample_index],
+        "x": x,
+        "y": y,
+        "z": z,
+        "reason": reason,
+    }
+    print(
+        f"{run_label}: particle lost from trap at t = "
+        f"{t_baoab[sample_index]:.6g} s; {reason}."
+    )
+
+
+def truncate_outputs(stop_index, *arrays):
+    return tuple(array[:stop_index + 1] for array in arrays)
+
+
+if terminate_on_trap_loss:
+    print("Trap-loss termination enabled = True")
+    print(
+        "Trap-loss check interval =",
+        trap_loss_check_interval_steps,
+        "steps =",
+        trap_loss_check_interval_steps * dt_baoab,
+        "s"
+    )
+    if no_stable_equilibrium_mode:
+        print(
+            "No-stable-equilibrium lower-z stop =",
+            (z_falling_stop_reference - no_stable_stop_below_lowest_equilibrium) * 1e6,
+            "micrometres"
+        )
+    else:
+        print(
+            "Trap-loss radial displacement limit =",
+            trap_loss_radial_limit * 1e6,
+            "micrometres"
+        )
+        print(
+            "Trap-loss axial displacement limit =",
+            trap_loss_axial_limit * 1e6,
+            "micrometres"
+        )
+
+# print("BAOAB requested timestep =", dt_baoab, "s")
+# print("BAOAB sampling frequency =", 1 / dt_baoab, "Hz")
+# print("BAOAB number of samples =", len(t_baoab))
+
+# ****************************************************************************************************************************************************
+# BAOAB solution with Brownian motion and optional laser-power noise
+# ****************************************************************************************************************************************************
+rng = np.random.default_rng(seed=brownian_seed)
+laser_rng = np.random.default_rng(seed=laser_noise_seed)
+
+laser_noise_model_normalised = laser_noise_model.strip().lower()
+
+if use_laser_power_noise and laser_noise_model_normalised in {
+    "synthetic",
+    "synthetic_step",
+    "step"
+}:
+    laser_noise_model_normalised = "synthetic_step"
+    laser_noise_plot_style = "step"
+    laser_noise_description = "synthetic step laser noise"
+    laser_noise_plot_title = "Synthetic stepwise laser-power noise"
+    laser_step_samples = max(1, int(round(laser_noise_step_duration / dt_baoab)))
+    laser_step_duration_actual = laser_step_samples * dt_baoab
+    laser_allowed_power_factors = np.array(
+        [1 - laser_noise_fraction, 1.0, 1 + laser_noise_fraction]
+    )
+    n_laser_steps = int(np.ceil(len(t_baoab) / laser_step_samples))
+
+    laser_step_power_factors = np.zeros(n_laser_steps)
+    laser_step_power_factors[0] = laser_rng.choice(laser_allowed_power_factors)
+
+    for j in range(1, n_laser_steps):
+        previous_factor = laser_step_power_factors[j - 1]
+
+        if np.isclose(previous_factor, 1 + laser_noise_fraction):
+            possible_factors = np.array([1.0, 1 + laser_noise_fraction])
+        elif np.isclose(previous_factor, 1 - laser_noise_fraction):
+            possible_factors = np.array([1 - laser_noise_fraction, 1.0])
+        else:
+            possible_factors = laser_allowed_power_factors
+
+        laser_step_power_factors[j] = laser_rng.choice(possible_factors)
+
+    laser_power_factor = np.repeat(laser_step_power_factors, laser_step_samples)[:len(t_baoab)]
+    laser_equilibrium_power_factors = laser_allowed_power_factors
+elif use_laser_power_noise and laser_noise_model_normalised in {
+    "measured",
+    "measured_csv",
+    "real",
+    "real_csv"
+}:
+    laser_noise_model_normalised = "measured_csv"
+    laser_noise_plot_style = "line"
+    laser_noise_description = "measured CSV laser noise"
+    laser_noise_plot_title = "Measured laser-power noise scaled to input power"
+    (
+        laser_power_factor,
+        measured_laser_noise_time_s,
+        measured_laser_noise_power_w,
+    ) = measured_laser_power_factor_from_trace(
+        t_baoab,
+        measured_laser_noise_csv,
+        loop_trace=measured_laser_noise_loop,
+        match_input_mean=measured_laser_noise_match_input_mean
+    )
+    measured_laser_noise_dt_s = np.median(np.diff(measured_laser_noise_time_s))
+    laser_step_samples = max(1, int(round(measured_laser_noise_dt_s / dt_baoab)))
+    laser_step_duration_actual = laser_step_samples * dt_baoab
+    laser_step_power_factors = measured_laser_noise_power_w / np.mean(
+        measured_laser_noise_power_w
+    )
+    laser_allowed_power_factors = np.array(
+        [
+            np.min(laser_power_factor),
+            np.mean(laser_power_factor),
+            np.max(laser_power_factor)
+        ]
+    )
+    laser_factor_span = laser_allowed_power_factors[-1] - laser_allowed_power_factors[0]
+
+    if np.isclose(laser_factor_span, 0.0):
+        laser_equilibrium_power_factors = np.array([laser_allowed_power_factors[1]])
+    else:
+        laser_equilibrium_power_factors = np.linspace(
+            laser_allowed_power_factors[0],
+            laser_allowed_power_factors[-1],
+            max(2, int(measured_laser_noise_equilibrium_points))
+        )
+elif use_laser_power_noise:
+    raise ValueError(
+        "laser_noise_model must be 'synthetic_step' or 'measured_csv', got "
+        f"{laser_noise_model!r}."
+    )
+else:
+    laser_noise_plot_style = "line"
+    laser_noise_description = "constant laser power"
+    laser_noise_plot_title = "Laser power"
+    laser_step_samples = len(t_baoab)
+    laser_step_duration_actual = t_baoab[-1] - t_baoab[0]
+    laser_allowed_power_factors = np.array([1.0])
+    laser_step_power_factors = np.array([1.0])
+    laser_power_factor = np.ones_like(t_baoab)
+    laser_equilibrium_power_factors = laser_allowed_power_factors
+
+laser_power_time = P_laser * laser_power_factor
+
+print("Laser noise model =", laser_noise_description)
+if use_laser_power_noise and laser_noise_model_normalised == "measured_csv":
+    print("Measured laser-noise CSV =", measured_laser_noise_csv)
+print("Laser power mean =", np.mean(laser_power_time), "W")
+print("Laser power fractional RMS =", np.std(laser_power_factor), "relative to mean")
+print(
+    "Laser power min/max =",
+    np.min(laser_power_time),
+    np.max(laser_power_time),
+    "W"
+)
+
+
+def stable_z_equilibrium_at_power_factor(power_factor_value):
+    def Fz_net_on_axis_at_power(z):
+        _, Fz = F_optical_2d_direct(0.0, z, power_factor_value)
+        return Fz - m*g
+
+    F_scan_power = Fz_net_on_axis_at_power(z_scan)
+    roots_power = []
+
+    for i in range(len(z_scan) - 1):
+        if F_scan_power[i] * F_scan_power[i + 1] < 0:
+            root = brentq(
+                Fz_net_on_axis_at_power,
+                z_scan[i],
+                z_scan[i + 1],
+                xtol=root_finding_xtol,
+                rtol=root_finding_rtol
+            )
+            roots_power.append(root)
+
+    stable_roots_power = []
+
+    for root in roots_power:
+        slope = numerical_derivative_1d(Fz_net_on_axis_at_power, root)
+        if slope < 0:
+            stable_roots_power.append(root)
+
+    if len(stable_roots_power) == 0:
+        if no_stable_equilibrium_mode:
+            if len(roots_power) > 0:
+                return min(roots_power)
+
+            min_force_index = int(np.argmin(np.abs(F_scan_power)))
+            return z_scan[min_force_index]
+
+        raise ValueError(
+            "No stable on-axis equilibrium found for "
+            f"laser power factor {power_factor_value:.5f}."
+        )
+
+    if not -len(stable_roots_power) <= equilibrium_root_index < len(stable_roots_power):
+        raise IndexError(
+            "equilibrium_root_index is outside the stable root list for "
+            f"laser power factor {power_factor_value:.5f}. "
+            f"Found {len(stable_roots_power)} stable root(s)."
+        )
+
+    return stable_roots_power[equilibrium_root_index]
+
+
+laser_equilibrium_power_factors = np.asarray(
+    laser_equilibrium_power_factors,
+    dtype=float
+)
+instantaneous_z_equilibrium_by_power_factor = {
+    float(power_factor_value): stable_z_equilibrium_at_power_factor(power_factor_value)
+    for power_factor_value in laser_equilibrium_power_factors
+}
+laser_equilibrium_z_values = np.array(
+    [
+        instantaneous_z_equilibrium_by_power_factor[float(power_factor_value)]
+        for power_factor_value in laser_equilibrium_power_factors
+    ]
+)
+
+if len(laser_equilibrium_power_factors) == 1:
+    z_eq_laser_noise_time = np.full_like(
+        laser_power_factor,
+        laser_equilibrium_z_values[0]
+    )
+else:
+    z_eq_laser_noise_time = np.interp(
+        laser_power_factor,
+        laser_equilibrium_power_factors,
+        laser_equilibrium_z_values
+    )
+
+gamma_baoab = b / m
+baoab_damping_factor = np.exp(-gamma_baoab * dt_baoab)
+baoab_thermal_velocity_scale = np.sqrt(
+    (kB * brownian_temperature / m)
+    * (1 - baoab_damping_factor**2)
+)
+
+print("Brownian centre-of-mass bath temperature =", brownian_temperature, "K")
+print("Trajectory damping rate gamma =", gamma_baoab, "s^-1")
+
+# print("BAOAB timestep =", dt_baoab, "s")
+# print("BAOAB damping factor =", baoab_damping_factor)
+# print("BAOAB thermal velocity kick scale =", baoab_thermal_velocity_scale, "m/s")
+# print("Laser noise fraction =", laser_noise_fraction)
+# print("Requested laser noise step duration =", laser_noise_step_duration, "s")
+# print("Actual laser noise step duration =", laser_step_duration_actual, "s")
+
+# print("Instantaneous stable z equilibria from laser noise:")
+for power_factor_value, z_eq_power in instantaneous_z_equilibrium_by_power_factor.items():
+    pass
+    # print(
+        # "  power factor =",
+        # power_factor_value,
+        # ", z_eq =",
+        # z_eq_power * 1e6,
+        # "micrometres"
+    # )
+
+
+def deterministic_force_no_drag_3d(x, y, z, power_factor=1.0):
+    Fx, Fy, Fz = F_optical_3d(x, y, z, power_factor)
+    return Fx, Fy, Fz - m*g
+
+
+def solve_baoab_3d_with_power(
+    power_factor_time,
+    brownian_normals_x,
+    brownian_normals_y,
+    brownian_normals_z,
+    run_label="BAOAB"
+):
+    x_out = np.zeros_like(t_baoab)
+    y_out = np.zeros_like(t_baoab)
+    z_out = np.zeros_like(t_baoab)
+    vx_out = np.zeros_like(t_baoab)
+    vy_out = np.zeros_like(t_baoab)
+    vz_out = np.zeros_like(t_baoab)
+
+    x_out[0] = x0
+    y_out[0] = y0
+    z_out[0] = z0
+    vx_out[0] = vx0
+    vy_out[0] = vy0
+    vz_out[0] = vz0
+
+    for i in range(len(t_baoab) - 1):
+        x_i = x_out[i]
+        y_i = y_out[i]
+        z_i = z_out[i]
+        vx_i = vx_out[i]
+        vy_i = vy_out[i]
+        vz_i = vz_out[i]
+        power_factor_i = power_factor_time[i]
+
+        Fx_i, Fy_i, Fz_i = deterministic_force_no_drag_3d(
+            x_i,
+            y_i,
+            z_i,
+            power_factor_i
+        )
+        vx_i += 0.5 * dt_baoab * Fx_i / m
+        vy_i += 0.5 * dt_baoab * Fy_i / m
+        vz_i += 0.5 * dt_baoab * Fz_i / m
+
+        x_i += 0.5 * dt_baoab * vx_i
+        y_i += 0.5 * dt_baoab * vy_i
+        z_i += 0.5 * dt_baoab * vz_i
+
+        vx_i = (
+            baoab_damping_factor * vx_i
+            + baoab_thermal_velocity_scale * brownian_normals_x[i]
+        )
+        vy_i = (
+            baoab_damping_factor * vy_i
+            + baoab_thermal_velocity_scale * brownian_normals_y[i]
+        )
+        vz_i = (
+            baoab_damping_factor * vz_i
+            + baoab_thermal_velocity_scale * brownian_normals_z[i]
+        )
+
+        x_i += 0.5 * dt_baoab * vx_i
+        y_i += 0.5 * dt_baoab * vy_i
+        z_i += 0.5 * dt_baoab * vz_i
+
+        Fx_i, Fy_i, Fz_i = deterministic_force_no_drag_3d(
+            x_i,
+            y_i,
+            z_i,
+            power_factor_i
+        )
+        vx_i += 0.5 * dt_baoab * Fx_i / m
+        vy_i += 0.5 * dt_baoab * Fy_i / m
+        vz_i += 0.5 * dt_baoab * Fz_i / m
+
+        x_out[i + 1] = x_i
+        y_out[i + 1] = y_i
+        z_out[i + 1] = z_i
+        vx_out[i + 1] = vx_i
+        vy_out[i + 1] = vy_i
+        vz_out[i + 1] = vz_i
+
+        sample_index = i + 1
+        if should_check_trap_loss(sample_index):
+            reason = trap_loss_reason(x_i, y_i, z_i)
+            if reason is not None:
+                record_trap_loss(run_label, sample_index, x_i, y_i, z_i, reason)
+                return truncate_outputs(
+                    sample_index,
+                    x_out,
+                    y_out,
+                    z_out,
+                    vx_out,
+                    vy_out,
+                    vz_out
+                )
+
+    return x_out, y_out, z_out, vx_out, vy_out, vz_out
+
+
+def solve_baoab_3d_fast_with_power(
+    power_factor_time,
+    brownian_normals_x,
+    brownian_normals_y,
+    brownian_normals_z,
+    run_label="BAOAB"
+):
+    """
+    Use the compiled Cython BAOAB loop when available.
+
+    If the Cython extension has not been built yet, this falls back to the
+    original Python implementation so the script remains runnable.
+    """
+    if (
+        not terminate_on_trap_loss
+        and cython_baoab_available
+        and use_force_lookup_table
+        and force_lookup_ready
+    ):
+        result = solve_baoab_3d_lookup_cython(
+            np.ascontiguousarray(force_lookup_r_values, dtype=np.float64),
+            np.ascontiguousarray(force_lookup_z_values, dtype=np.float64),
+            np.ascontiguousarray(force_lookup_Fr_table, dtype=np.float64),
+            np.ascontiguousarray(force_lookup_Fz_table, dtype=np.float64),
+            np.ascontiguousarray(power_factor_time, dtype=np.float64),
+            np.ascontiguousarray(brownian_normals_x, dtype=np.float64),
+            np.ascontiguousarray(brownian_normals_y, dtype=np.float64),
+            np.ascontiguousarray(brownian_normals_z, dtype=np.float64),
+            dt_baoab,
+            m,
+            m * g,
+            baoab_damping_factor,
+            baoab_thermal_velocity_scale,
+            x0,
+            y0,
+            z0,
+            vx0,
+            vy0,
+            vz0,
+            radial_zero_tolerance,
+        )
+
+        (
+            x_out,
+            y_out,
+            z_out,
+            vx_out,
+            vy_out,
+            vz_out,
+            out_of_bounds_count,
+        ) = result
+
+        if out_of_bounds_count > 0:
+            pass
+            # print(
+                # "Warning: Cython BAOAB clamped",
+                # out_of_bounds_count,
+                # "force lookups to the edge of the lookup table.",
+            # )
+            # print(
+                # "Consider increasing force_lookup_r_max or "
+                # "force_lookup_z_half_width."
+            # )
+
+        return x_out, y_out, z_out, vx_out, vy_out, vz_out
+
+    # print("Cython BAOAB unavailable; using slower Python BAOAB loop.")
+    return solve_baoab_3d_with_power(
+        power_factor_time,
+        brownian_normals_x,
+        brownian_normals_y,
+        brownian_normals_z,
+        run_label
+    )
+
+
+def measure_z_position_for_feedback(z_actual, feedback_rng):
+    """
+    Synthetic z-position measurement used by the feedback loop.
+
+    The controller sees the delayed true z position plus optional calibrated
+    readout noise. The delay is applied in the controller loop.
+    """
+    z_measured = z_actual
+
+    if use_feedback_position_noise and feedback_position_noise_rms > 0:
+        z_measured += feedback_rng.normal(0.0, feedback_position_noise_rms)
+
+    return z_measured
+
+
+def solve_baoab_3d_with_pd_feedback(
+    disturbance_power_factor_time,
+    brownian_normals_x,
+    brownian_normals_y,
+    brownian_normals_z,
+    run_label="BAOAB with PD feedback"
+):
+    """
+    Run BAOAB with a delayed PD feedback loop controlling laser power.
+
+    The feedback loop reads z, estimates z velocity, asks for a force
+    correction, converts that correction to a laser-power change, and then
+    applies the requested power after clipping to the allowed power range.
+    """
+    if not (use_force_lookup_table and force_lookup_ready):
+        raise ValueError(
+            "PD feedback requires use_force_lookup_table=True so the closed-loop "
+            "solver can use the fast scalar force lookup."
+        )
+
+    feedback_rng = np.random.default_rng(seed=feedback_noise_seed)
+    baoab_sampling_frequency = 1 / dt_baoab
+    control_decimation = int(round(baoab_sampling_frequency / feedback_update_frequency))
+
+    if control_decimation < 1:
+        raise ValueError("feedback_update_frequency cannot exceed the BAOAB sampling frequency.")
+
+    if not np.isclose(baoab_sampling_frequency / feedback_update_frequency, control_decimation):
+        raise ValueError("Choose feedback_update_frequency so it divides the BAOAB sampling frequency.")
+
+    if not 0 <= feedback_velocity_filter_alpha <= 1:
+        raise ValueError("feedback_velocity_filter_alpha must be between 0 and 1.")
+
+    dt_control = control_decimation * dt_baoab
+
+    if feedback_total_loop_delay <= 0:
+        loop_delay_control_steps = 0
+    else:
+        loop_delay_control_steps = int(np.ceil(feedback_total_loop_delay / dt_control))
+
+    loop_delay_baoab_steps = loop_delay_control_steps * control_decimation
+    actual_loop_delay = loop_delay_control_steps * dt_control
+
+    if P_laser <= 0:
+        raise ValueError("P_laser must be positive for laser-power feedback.")
+
+    _, _, Fz_per_nominal_power, _ = F_optical_3d_lookup_scalar_clamped(
+        x_eq,
+        y_eq,
+        z_eq,
+        power_factor=1.0
+    )
+    force_per_watt = Fz_per_nominal_power / P_laser
+
+    if abs(force_per_watt) < radial_zero_tolerance:
+        raise ValueError("Force per watt is too close to zero for laser-power feedback.")
+
+    feedback_kp = feedback_kp_multiplier * kz
+    feedback_kd = feedback_kd_multiplier * b
+    feedback_power_min = feedback_power_min_factor * P_laser
+    feedback_power_max = feedback_power_max_factor * P_laser
+
+    x_out = np.zeros_like(t_baoab)
+    y_out = np.zeros_like(t_baoab)
+    z_out = np.zeros_like(t_baoab)
+    vx_out = np.zeros_like(t_baoab)
+    vy_out = np.zeros_like(t_baoab)
+    vz_out = np.zeros_like(t_baoab)
+    command_power_time = np.zeros_like(t_baoab)
+    actual_power_time = np.zeros_like(t_baoab)
+
+    control_times = []
+    measurement_times = []
+    measured_positions = []
+    filtered_positions = []
+    requested_powers = []
+
+    x_out[0] = x0
+    y_out[0] = y0
+    z_out[0] = z0
+    vx_out[0] = vx0
+    vy_out[0] = vy0
+    vz_out[0] = vz0
+
+    command_power = P_laser
+    filtered_z_previous = None
+    out_of_bounds_count = 0
+
+    def build_feedback_result(stop_index):
+        result_slice = slice(None, stop_index + 1)
+        return {
+            "t": t_baoab[result_slice],
+            "x": x_out[result_slice],
+            "y": y_out[result_slice],
+            "z": z_out[result_slice],
+            "vx": vx_out[result_slice],
+            "vy": vy_out[result_slice],
+            "vz": vz_out[result_slice],
+            "command_power": command_power_time[result_slice],
+            "actual_power": actual_power_time[result_slice],
+            "control_t": np.array(control_times),
+            "measurement_t": np.array(measurement_times),
+            "z_measured": np.array(measured_positions),
+            "z_filtered": np.array(filtered_positions),
+            "requested_power": np.array(requested_powers),
+            "dt_control": dt_control,
+            "loop_delay_control_steps": loop_delay_control_steps,
+            "actual_loop_delay": actual_loop_delay,
+            "force_per_watt": force_per_watt,
+            "out_of_bounds_count": out_of_bounds_count,
+            "feedback_kp": feedback_kp,
+            "feedback_kd": feedback_kd,
+            "feedback_power_min": feedback_power_min,
+            "feedback_power_max": feedback_power_max,
+        }
+
+    for i in range(len(t_baoab) - 1):
+        if i % control_decimation == 0:
+            delayed_i = max(0, i - loop_delay_baoab_steps)
+            z_measured = measure_z_position_for_feedback(z_out[delayed_i], feedback_rng)
+
+            if filtered_z_previous is None:
+                z_filtered = z_measured
+                measured_vz = 0.0
+            else:
+                z_filtered = (
+                    feedback_velocity_filter_alpha * z_measured
+                    + (1 - feedback_velocity_filter_alpha) * filtered_z_previous
+                )
+                measured_vz = (z_filtered - filtered_z_previous) / dt_control
+
+            z_error = z_filtered - z_eq
+            feedback_force = -feedback_kp * z_error - feedback_kd * measured_vz
+            power_change = feedback_force / force_per_watt
+            command_power = np.clip(
+                P_laser + power_change,
+                feedback_power_min,
+                feedback_power_max
+            )
+
+            control_times.append(t_baoab[i])
+            measurement_times.append(t_baoab[delayed_i])
+            measured_positions.append(z_measured)
+            filtered_positions.append(z_filtered)
+            requested_powers.append(command_power)
+
+            filtered_z_previous = z_filtered
+
+        command_factor = command_power / P_laser
+        actual_power_factor = command_factor * disturbance_power_factor_time[i]
+        actual_power_factor = np.clip(
+            actual_power_factor,
+            feedback_power_min_factor,
+            feedback_power_max_factor
+        )
+
+        x_i = x_out[i]
+        y_i = y_out[i]
+        z_i = z_out[i]
+        vx_i = vx_out[i]
+        vy_i = vy_out[i]
+        vz_i = vz_out[i]
+
+        Fx_i, Fy_i, Fz_i, force_was_clamped = F_optical_3d_lookup_scalar_clamped(
+            x_i,
+            y_i,
+            z_i,
+            actual_power_factor
+        )
+        out_of_bounds_count += int(force_was_clamped)
+        Fz_i -= m * g
+        vx_i += 0.5 * dt_baoab * Fx_i / m
+        vy_i += 0.5 * dt_baoab * Fy_i / m
+        vz_i += 0.5 * dt_baoab * Fz_i / m
+
+        x_i += 0.5 * dt_baoab * vx_i
+        y_i += 0.5 * dt_baoab * vy_i
+        z_i += 0.5 * dt_baoab * vz_i
+
+        vx_i = (
+            baoab_damping_factor * vx_i
+            + baoab_thermal_velocity_scale * brownian_normals_x[i]
+        )
+        vy_i = (
+            baoab_damping_factor * vy_i
+            + baoab_thermal_velocity_scale * brownian_normals_y[i]
+        )
+        vz_i = (
+            baoab_damping_factor * vz_i
+            + baoab_thermal_velocity_scale * brownian_normals_z[i]
+        )
+
+        x_i += 0.5 * dt_baoab * vx_i
+        y_i += 0.5 * dt_baoab * vy_i
+        z_i += 0.5 * dt_baoab * vz_i
+
+        Fx_i, Fy_i, Fz_i, force_was_clamped = F_optical_3d_lookup_scalar_clamped(
+            x_i,
+            y_i,
+            z_i,
+            actual_power_factor
+        )
+        out_of_bounds_count += int(force_was_clamped)
+        Fz_i -= m * g
+        vx_i += 0.5 * dt_baoab * Fx_i / m
+        vy_i += 0.5 * dt_baoab * Fy_i / m
+        vz_i += 0.5 * dt_baoab * Fz_i / m
+
+        x_out[i + 1] = x_i
+        y_out[i + 1] = y_i
+        z_out[i + 1] = z_i
+        vx_out[i + 1] = vx_i
+        vy_out[i + 1] = vy_i
+        vz_out[i + 1] = vz_i
+        command_power_time[i] = command_power
+        actual_power_time[i] = P_laser * actual_power_factor
+        command_power_time[i + 1] = command_power
+        actual_power_time[i + 1] = P_laser * actual_power_factor
+
+        sample_index = i + 1
+        if should_check_trap_loss(sample_index):
+            reason = trap_loss_reason(x_i, y_i, z_i)
+            if reason is not None:
+                record_trap_loss(run_label, sample_index, x_i, y_i, z_i, reason)
+                return build_feedback_result(sample_index)
+
+    command_power_time[-1] = command_power
+    actual_power_time[-1] = actual_power_time[-2]
+
+    return build_feedback_result(len(t_baoab) - 1)
+
+def solve_baoab_3d_fast_with_pd_feedback(
+    disturbance_power_factor_time,
+    brownian_normals_x,
+    brownian_normals_y,
+    brownian_normals_z,
+    run_label="BAOAB with PD feedback"
+):
+    """
+    Use the compiled Cython feedback loop when available.
+
+    The pure-Python implementation remains as a fallback so the script still
+    runs before the extension has been built.
+    """
+    if (
+        not terminate_on_trap_loss
+        and cython_feedback_baoab_available
+        and use_force_lookup_table
+        and force_lookup_ready
+    ):
+        feedback_rng = np.random.default_rng(seed=feedback_noise_seed)
+        baoab_sampling_frequency = 1 / dt_baoab
+        control_decimation = int(round(baoab_sampling_frequency / feedback_update_frequency))
+
+        if control_decimation < 1:
+            raise ValueError("feedback_update_frequency cannot exceed the BAOAB sampling frequency.")
+
+        if not np.isclose(baoab_sampling_frequency / feedback_update_frequency, control_decimation):
+            raise ValueError("Choose feedback_update_frequency so it divides the BAOAB sampling frequency.")
+
+        if not 0 <= feedback_velocity_filter_alpha <= 1:
+            raise ValueError("feedback_velocity_filter_alpha must be between 0 and 1.")
+
+        dt_control = control_decimation * dt_baoab
+
+        if feedback_total_loop_delay <= 0:
+            loop_delay_control_steps = 0
+        else:
+            loop_delay_control_steps = int(np.ceil(feedback_total_loop_delay / dt_control))
+
+        loop_delay_baoab_steps = loop_delay_control_steps * control_decimation
+        actual_loop_delay = loop_delay_control_steps * dt_control
+
+        if P_laser <= 0:
+            raise ValueError("P_laser must be positive for laser-power feedback.")
+
+        _, _, Fz_per_nominal_power, _ = F_optical_3d_lookup_scalar_clamped(
+            x_eq,
+            y_eq,
+            z_eq,
+            power_factor=1.0
+        )
+        force_per_watt = Fz_per_nominal_power / P_laser
+
+        if abs(force_per_watt) < radial_zero_tolerance:
+            raise ValueError("Force per watt is too close to zero for laser-power feedback.")
+
+        feedback_kp = feedback_kp_multiplier * kz
+        feedback_kd = feedback_kd_multiplier * b
+        feedback_power_min = feedback_power_min_factor * P_laser
+        feedback_power_max = feedback_power_max_factor * P_laser
+
+        if len(t_baoab) >= 2:
+            n_control_updates = ((len(t_baoab) - 2) // control_decimation) + 1
+        else:
+            n_control_updates = 0
+
+        if use_feedback_position_noise and feedback_position_noise_rms > 0:
+            feedback_position_noise = feedback_rng.normal(
+                0.0,
+                feedback_position_noise_rms,
+                size=n_control_updates
+            )
+        else:
+            feedback_position_noise = np.zeros(n_control_updates)
+
+        result = solve_baoab_3d_feedback_lookup_cython(
+            np.ascontiguousarray(force_lookup_r_values, dtype=np.float64),
+            np.ascontiguousarray(force_lookup_z_values, dtype=np.float64),
+            np.ascontiguousarray(force_lookup_Fr_table, dtype=np.float64),
+            np.ascontiguousarray(force_lookup_Fz_table, dtype=np.float64),
+            np.ascontiguousarray(disturbance_power_factor_time, dtype=np.float64),
+            np.ascontiguousarray(brownian_normals_x, dtype=np.float64),
+            np.ascontiguousarray(brownian_normals_y, dtype=np.float64),
+            np.ascontiguousarray(brownian_normals_z, dtype=np.float64),
+            np.ascontiguousarray(feedback_position_noise, dtype=np.float64),
+            dt_baoab,
+            m,
+            m * g,
+            baoab_damping_factor,
+            baoab_thermal_velocity_scale,
+            x0,
+            y0,
+            z0,
+            vx0,
+            vy0,
+            vz0,
+            z_eq,
+            P_laser,
+            feedback_kp,
+            feedback_kd,
+            force_per_watt,
+            feedback_power_min_factor,
+            feedback_power_max_factor,
+            feedback_velocity_filter_alpha,
+            control_decimation,
+            loop_delay_baoab_steps,
+            dt_control,
+            radial_zero_tolerance,
+        )
+
+        (
+            x_out,
+            y_out,
+            z_out,
+            vx_out,
+            vy_out,
+            vz_out,
+            command_power_time,
+            actual_power_time,
+            control_times,
+            measurement_times,
+            measured_positions,
+            filtered_positions,
+            requested_powers,
+            out_of_bounds_count,
+        ) = result
+
+        return {
+            "t": t_baoab,
+            "x": x_out,
+            "y": y_out,
+            "z": z_out,
+            "vx": vx_out,
+            "vy": vy_out,
+            "vz": vz_out,
+            "command_power": command_power_time,
+            "actual_power": actual_power_time,
+            "control_t": control_times,
+            "measurement_t": measurement_times,
+            "z_measured": measured_positions,
+            "z_filtered": filtered_positions,
+            "requested_power": requested_powers,
+            "dt_control": dt_control,
+            "loop_delay_control_steps": loop_delay_control_steps,
+            "actual_loop_delay": actual_loop_delay,
+            "force_per_watt": force_per_watt,
+            "out_of_bounds_count": out_of_bounds_count,
+            "feedback_kp": feedback_kp,
+            "feedback_kd": feedback_kd,
+            "feedback_power_min": feedback_power_min,
+            "feedback_power_max": feedback_power_max,
+        }
+
+    return solve_baoab_3d_with_pd_feedback(
+        disturbance_power_factor_time,
+        brownian_normals_x,
+        brownian_normals_y,
+        brownian_normals_z,
+        run_label
+    )
+
+
+def analytic_damped_harmonic_displacement(
+    time_values,
+    displacement0,
+    velocity0,
+    omega_0,
+    damping_rate
+):
+    time_values = np.asarray(time_values, dtype=float)
+    time_values = time_values - time_values[0]
+
+    if not np.isfinite(omega_0) or omega_0 <= 0:
+        return np.full_like(time_values, np.nan, dtype=float)
+
+    half_damping_rate = 0.5 * damping_rate
+    discriminant = omega_0**2 - half_damping_rate**2
+    critical_tolerance = 1e-12 * max(omega_0**2, half_damping_rate**2, 1.0)
+
+    if discriminant > critical_tolerance:
+        omega_damped = np.sqrt(discriminant)
+        sine_weight = (velocity0 + half_damping_rate * displacement0) / omega_damped
+        return np.exp(-half_damping_rate * time_values) * (
+            displacement0 * np.cos(omega_damped * time_values)
+            + sine_weight * np.sin(omega_damped * time_values)
+        )
+
+    if abs(discriminant) <= critical_tolerance:
+        return np.exp(-half_damping_rate * time_values) * (
+            displacement0
+            + (velocity0 + half_damping_rate * displacement0) * time_values
+        )
+
+    alpha = np.sqrt(-discriminant)
+    decay_rate_slow = -half_damping_rate + alpha
+    decay_rate_fast = -half_damping_rate - alpha
+    coefficient_slow = (velocity0 - decay_rate_fast * displacement0) / (
+        decay_rate_slow - decay_rate_fast
+    )
+    coefficient_fast = displacement0 - coefficient_slow
+
+    return (
+        coefficient_slow * np.exp(decay_rate_slow * time_values)
+        + coefficient_fast * np.exp(decay_rate_fast * time_values)
+    )
+
+
+def deterministic_force_no_drag_3d_for_scalar_step(x, y, z, power_factor=1.0):
+    if use_force_lookup_table and force_lookup_ready:
+        Fx, Fy, Fz, _ = F_optical_3d_lookup_scalar_clamped(
+            x,
+            y,
+            z,
+            power_factor
+        )
+    else:
+        Fx, Fy, Fz = F_optical_3d(x, y, z, power_factor)
+
+    return Fx, Fy, Fz - m*g
+
+
+def solve_small_perturbation_nonlinear_response(
+    time_values,
+    initial_displacements,
+    initial_velocities,
+    power_factor_time=None,
+    brownian_normals=None
+):
+    time_values = np.asarray(time_values, dtype=float)
+    dt_response = time_values[1] - time_values[0]
+    damping_factor_response = np.exp(-gamma_baoab * dt_response)
+    thermal_velocity_scale_response = np.sqrt(
+        (kB * brownian_temperature / m)
+        * (1 - damping_factor_response**2)
+    )
+
+    if power_factor_time is None:
+        power_factor_time = np.ones_like(time_values)
+    else:
+        power_factor_time = np.asarray(power_factor_time, dtype=float)
+
+        if len(power_factor_time) != len(time_values):
+            raise ValueError("power_factor_time must have the same length as time_values.")
+
+    if brownian_normals is None:
+        brownian_normals = np.zeros((3, len(time_values) - 1))
+    else:
+        brownian_normals = np.asarray(brownian_normals, dtype=float)
+
+        if brownian_normals.shape != (3, len(time_values) - 1):
+            raise ValueError(
+                "brownian_normals must have shape (3, len(time_values) - 1)."
+            )
+
+    x_out = np.zeros_like(time_values)
+    y_out = np.zeros_like(time_values)
+    z_out = np.zeros_like(time_values)
+    vx_out = np.zeros_like(time_values)
+    vy_out = np.zeros_like(time_values)
+    vz_out = np.zeros_like(time_values)
+
+    x_out[0] = x_eq + initial_displacements[0]
+    y_out[0] = y_eq + initial_displacements[1]
+    z_out[0] = z_eq + initial_displacements[2]
+    vx_out[0] = initial_velocities[0]
+    vy_out[0] = initial_velocities[1]
+    vz_out[0] = initial_velocities[2]
+
+    for i in range(len(time_values) - 1):
+        x_i = x_out[i]
+        y_i = y_out[i]
+        z_i = z_out[i]
+        vx_i = vx_out[i]
+        vy_i = vy_out[i]
+        vz_i = vz_out[i]
+        power_factor_i = power_factor_time[i]
+
+        Fx_i, Fy_i, Fz_i = deterministic_force_no_drag_3d_for_scalar_step(
+            x_i,
+            y_i,
+            z_i,
+            power_factor_i
+        )
+        vx_i += 0.5 * dt_response * Fx_i / m
+        vy_i += 0.5 * dt_response * Fy_i / m
+        vz_i += 0.5 * dt_response * Fz_i / m
+
+        x_i += 0.5 * dt_response * vx_i
+        y_i += 0.5 * dt_response * vy_i
+        z_i += 0.5 * dt_response * vz_i
+
+        vx_i = (
+            damping_factor_response * vx_i
+            + thermal_velocity_scale_response * brownian_normals[0, i]
+        )
+        vy_i = (
+            damping_factor_response * vy_i
+            + thermal_velocity_scale_response * brownian_normals[1, i]
+        )
+        vz_i = (
+            damping_factor_response * vz_i
+            + thermal_velocity_scale_response * brownian_normals[2, i]
+        )
+
+        x_i += 0.5 * dt_response * vx_i
+        y_i += 0.5 * dt_response * vy_i
+        z_i += 0.5 * dt_response * vz_i
+
+        Fx_i, Fy_i, Fz_i = deterministic_force_no_drag_3d_for_scalar_step(
+            x_i,
+            y_i,
+            z_i,
+            power_factor_i
+        )
+        vx_i += 0.5 * dt_response * Fx_i / m
+        vy_i += 0.5 * dt_response * Fy_i / m
+        vz_i += 0.5 * dt_response * Fz_i / m
+
+        x_out[i + 1] = x_i
+        y_out[i + 1] = y_i
+        z_out[i + 1] = z_i
+        vx_out[i + 1] = vx_i
+        vy_out[i + 1] = vy_i
+        vz_out[i + 1] = vz_i
+
+    return x_out, y_out, z_out, vx_out, vy_out, vz_out
+
+
+def laser_power_factor_for_comparison_time(comparison_time):
+    simulation_time = t_baoab - t_baoab[0]
+
+    if len(laser_power_factor) != len(t_baoab):
+        raise ValueError("laser_power_factor must have the same length as t_baoab.")
+
+    return np.interp(
+        comparison_time,
+        simulation_time,
+        laser_power_factor
+    )
+
+
+def plot_damped_harmonic_small_perturbation_comparison():
+    if not harmonic_validation_available:
+        print("Skipping damped-harmonic comparison because the local trap is not stable.")
+        return
+
+    available_duration = max(dt_baoab, t_baoab[-1] - t_baoab[0])
+
+    if damped_harmonic_comparison_duration is None:
+        comparison_duration = available_duration
+    else:
+        comparison_duration = float(damped_harmonic_comparison_duration)
+
+    comparison_duration = min(comparison_duration, available_duration)
+
+    if damped_harmonic_comparison_max_duration is not None:
+        comparison_duration = min(
+            comparison_duration,
+            float(damped_harmonic_comparison_max_duration)
+        )
+
+    full_sample_count = max(2, int(round(comparison_duration / dt_baoab)) + 1)
+    sample_count = min(full_sample_count, int(damped_harmonic_comparison_max_points))
+    comparison_time = np.linspace(0.0, comparison_duration, sample_count)
+
+    if sample_count < full_sample_count:
+        print(
+            "Damped-harmonic comparison downsampled from",
+            full_sample_count,
+            "to",
+            sample_count,
+            "points for plotting speed."
+        )
+
+    initial_displacements = np.array(
+        [x_displacement, y_displacement, z_displacement],
+        dtype=float
+    )
+    initial_velocities = np.array([vx0, vy0, vz0], dtype=float)
+    equilibrium_positions = np.array([x_eq, y_eq, z_eq], dtype=float)
+    angular_frequencies = np.array([omega_x, omega_y, omega_z], dtype=float)
+    axis_labels = ["x", "y", "z"]
+    axis_colours = ["tab:blue", "tab:green", "tab:orange"]
+
+    no_noise_positions = solve_small_perturbation_nonlinear_response(
+        comparison_time,
+        initial_displacements,
+        initial_velocities,
+        power_factor_time=np.ones_like(comparison_time),
+        brownian_normals=np.zeros((3, len(comparison_time) - 1))
+    )[:3]
+
+    noise_positions = None
+    comparison_power_factor = None
+    comparison_brownian_normals = None
+    enabled_noise_labels = []
+
+    if damped_harmonic_plot_current_laser_noise and use_laser_power_noise:
+        comparison_power_factor = laser_power_factor_for_comparison_time(comparison_time)
+        enabled_noise_labels.append(laser_noise_description)
+    else:
+        comparison_power_factor = np.ones_like(comparison_time)
+
+    if damped_harmonic_plot_current_brownian_noise and use_brownian_noise:
+        comparison_brownian_rng = np.random.default_rng(seed=brownian_seed)
+        comparison_brownian_normals = comparison_brownian_rng.normal(
+            size=(3, len(comparison_time) - 1)
+        )
+        enabled_noise_labels.append("Brownian noise")
+    else:
+        comparison_brownian_normals = np.zeros((3, len(comparison_time) - 1))
+
+    if enabled_noise_labels:
+        noise_positions = solve_small_perturbation_nonlinear_response(
+            comparison_time,
+            initial_displacements,
+            initial_velocities,
+            power_factor_time=comparison_power_factor,
+            brownian_normals=comparison_brownian_normals
+        )[:3]
+
+    # print(
+    #     "Damped-harmonic comparison initial displacement =",
+    #     initial_displacements * 1e6,
+    #     "micrometres"
+    # )
+    # print(
+    #     "Damped-harmonic comparison initial velocity =",
+    #     initial_velocities,
+    #     "m/s"
+    # )
+    # print("Damped-harmonic comparison duration =", comparison_duration, "s")
+
+    if enabled_noise_labels:
+        print("Damped-harmonic comparison noise overlay =", ", ".join(enabled_noise_labels))
+
+    if use_laser_power_noise and comparison_power_factor is not None:
+        print(
+            "Damped-harmonic comparison laser factor min/mean/max =",
+            np.min(comparison_power_factor),
+            np.mean(comparison_power_factor),
+            np.max(comparison_power_factor)
+        )
+
+    fig, axes = plt.subplots(3, 1, figsize=time_trace_figsize, sharex=True)
+
+    for axis_index, ax in enumerate(axes):
+        axis_label = axis_labels[axis_index]
+        omega_0 = angular_frequencies[axis_index]
+        equilibrium_position = equilibrium_positions[axis_index]
+        analytic_displacement = analytic_damped_harmonic_displacement(
+            comparison_time,
+            initial_displacements[axis_index],
+            initial_velocities[axis_index],
+            omega_0,
+            gamma_baoab
+        )
+        no_noise_displacement = no_noise_positions[axis_index] - equilibrium_position
+        no_noise_residual = no_noise_displacement - analytic_displacement
+        no_noise_max_residual_nm = np.nanmax(np.abs(no_noise_residual)) * 1e9
+        frequency_hz = omega_0 / (2 * np.pi)
+        damping_ratio = gamma_baoab / (2 * omega_0)
+
+        title_parts = [
+            f"{axis_label}: f0 = {frequency_hz:.3g} Hz",
+            f"damping ratio = {damping_ratio:.3g}",
+            f"no-noise diff = {no_noise_max_residual_nm:.3g} nm"
+        ]
+
+        ax.plot(
+            comparison_time,
+            analytic_displacement * 1e6,
+            color="black",
+            linewidth=1.6,
+            label="analytic small-displacement solution"
+        )
+        ax.plot(
+            comparison_time,
+            no_noise_displacement * 1e6,
+            color=axis_colours[axis_index],
+            linestyle="--",
+            linewidth=1.2,
+            label="simulation, no noise"
+        )
+
+        if noise_positions is not None:
+            noise_displacement = noise_positions[axis_index] - equilibrium_position
+            noise_residual = noise_displacement - analytic_displacement
+            noise_max_residual_nm = np.nanmax(np.abs(noise_residual)) * 1e9
+            title_parts.append(f"noise diff = {noise_max_residual_nm:.3g} nm")
+            ax.plot(
+                comparison_time,
+                noise_displacement * 1e6,
+                color="tab:red",
+                linestyle=":",
+                linewidth=1.3,
+                label="simulation with " + " + ".join(enabled_noise_labels)
+            )
+            print(
+                f"Damped-harmonic {axis_label} noise-overlay max difference = "
+                f"{noise_max_residual_nm:.6g} nm"
+            )
+
+        ax.axhline(0.0, color="0.35", linestyle=":", linewidth=0.8)
+        ax.set_ylabel(f"{axis_label} / micrometres")
+        ax.set_title(", ".join(title_parts))
+        ax.legend(fontsize=8)
+        ax.grid(True)
+
+        print(
+            f"Damped-harmonic {axis_label} no-noise max difference = "
+            f"{no_noise_max_residual_nm:.6g} nm"
+        )
+
+    axes[-1].set_xlabel("Time / s")
+    fig.suptitle("Current-parameter damped harmonic oscillator comparison")
+    plt.tight_layout()
+
+    if save_damped_harmonic_comparison_plot:
+        save_validation_plot("damped_harmonic_current_parameter_comparison.png")
+
+    finish_plot()
+
+
+if plot_damped_harmonic_comparison:
+    plot_damped_harmonic_small_perturbation_comparison()
+
+if stop_after_damped_harmonic_comparison:
+    print("Stopping after damped-harmonic comparison plot.")
+    raise SystemExit(0)
+
+zero_brownian_normals = np.zeros(len(t_baoab) - 1)
+
+if use_brownian_noise:
+    brownian_normals_x = rng.normal(size=len(t_baoab) - 1)
+    brownian_normals_y = rng.normal(size=len(t_baoab) - 1)
+    brownian_normals_z = rng.normal(size=len(t_baoab) - 1)
+else:
+    brownian_normals_x = zero_brownian_normals
+    brownian_normals_y = zero_brownian_normals
+    brownian_normals_z = zero_brownian_normals
+    print("Brownian noise disabled for the main BAOAB trajectories.")
+
+constant_power_trajectory_label = (
+    "BAOAB Brownian, constant laser power"
+    if use_brownian_noise
+    else "BAOAB no Brownian, constant laser power"
+)
+laser_power_trajectory_label = (
+    "BAOAB Brownian + laser noise"
+    if use_brownian_noise
+    else "BAOAB laser noise only"
+)
+
+constant_power_factor = np.ones_like(t_baoab)
+
+if run_multiple_seed_validation:
+    if not harmonic_validation_available or not use_brownian_noise:
+        print(
+            "Skipping multiple-seed validation because either no stable harmonic "
+            "trap is available or Brownian noise is disabled."
+        )
+        raise SystemExit(0)
+
+    theory_rms = np.array([x_rms_thermal, y_rms_thermal, z_rms_thermal])
+    seed_rms_ratios = []
+    seed_rms_um = []
+    seed_analysis_start_index = int(multiple_seed_burn_in_fraction * len(t_baoab))
+    seed_analysis_start_index = min(seed_analysis_start_index, len(t_baoab) - 1)
+    seed_analysis_slice = slice(seed_analysis_start_index, None)
+
+    print()
+    print("Multiple random seed RMS validation")
+    print(
+        "  Burn-in removed =",
+        multiple_seed_burn_in_fraction * 100,
+        "%; analysis starts at t =",
+        t_baoab[seed_analysis_start_index],
+        "s"
+    )
+    print(
+        f"{'seed':>8} "
+        f"{'x RMS/theory':>14} "
+        f"{'y RMS/theory':>14} "
+        f"{'z RMS/theory':>14}"
+    )
+
+    for seed_value in multiple_seed_validation_seeds:
+        seed_rng = np.random.default_rng(seed=int(seed_value))
+        seed_brownian_x = seed_rng.normal(size=len(t_baoab) - 1)
+        seed_brownian_y = seed_rng.normal(size=len(t_baoab) - 1)
+        seed_brownian_z = seed_rng.normal(size=len(t_baoab) - 1)
+
+        (
+            x_seed,
+            y_seed,
+            z_seed,
+            _vx_seed,
+            _vy_seed,
+            _vz_seed,
+        ) = solve_baoab_3d_fast_with_power(
+            constant_power_factor,
+            seed_brownian_x,
+            seed_brownian_y,
+            seed_brownian_z,
+            f"BAOAB constant power seed {seed_value}",
+        )
+
+        seed_rms = np.array(
+            [
+                np.std(x_seed[seed_analysis_slice] - x_eq),
+                np.std(y_seed[seed_analysis_slice] - y_eq),
+                np.std(z_seed[seed_analysis_slice] - z_eq),
+            ]
+        )
+        seed_ratio = seed_rms / theory_rms
+        seed_rms_um.append(seed_rms * 1e6)
+        seed_rms_ratios.append(seed_ratio)
+
+        print(
+            f"{int(seed_value):>8} "
+            f"{seed_ratio[0]:>14.5f} "
+            f"{seed_ratio[1]:>14.5f} "
+            f"{seed_ratio[2]:>14.5f}"
+        )
+
+    seed_rms_um = np.asarray(seed_rms_um)
+    seed_rms_ratios = np.asarray(seed_rms_ratios)
+    mean_ratios = np.mean(seed_rms_ratios, axis=0)
+    std_ratios = np.std(seed_rms_ratios, axis=0, ddof=1)
+    coordinate_labels = np.array(["x", "y", "z"])
+    coordinate_colours = ["tab:blue", "tab:green", "tab:orange"]
+    x_positions = np.arange(len(coordinate_labels))
+
+    print("Multiple-seed mean RMS/theory ratios:")
+    for coordinate_label, mean_ratio, std_ratio in zip(
+        coordinate_labels,
+        mean_ratios,
+        std_ratios,
+    ):
+        print(
+            f"  {coordinate_label}: mean = {mean_ratio:.5f}, "
+            f"std = {std_ratio:.5f}"
+        )
+
+    fig, ax = plt.subplots(figsize=(8, 4.8))
+    for coordinate_index, (coordinate_label, colour) in enumerate(
+        zip(coordinate_labels, coordinate_colours)
+    ):
+        jitter = np.linspace(-0.12, 0.12, len(multiple_seed_validation_seeds))
+        ax.scatter(
+            np.full(len(multiple_seed_validation_seeds), x_positions[coordinate_index])
+            + jitter,
+            seed_rms_ratios[:, coordinate_index],
+            s=36,
+            color=colour,
+            alpha=0.75,
+            edgecolor="black",
+            linewidth=0.4,
+            label=f"{coordinate_label} individual seeds",
+            zorder=3,
+        )
+        ax.errorbar(
+            x_positions[coordinate_index],
+            mean_ratios[coordinate_index],
+            yerr=std_ratios[coordinate_index],
+            fmt="D",
+            color="black",
+            ecolor="black",
+            elinewidth=1.4,
+            capsize=5,
+            markersize=6,
+            zorder=4,
+        )
+        ax.text(
+            x_positions[coordinate_index],
+            mean_ratios[coordinate_index] + std_ratios[coordinate_index] + 0.015,
+            f"{mean_ratios[coordinate_index]:.3f} +/- {std_ratios[coordinate_index]:.3f}",
+            ha="center",
+            va="bottom",
+            fontsize=8,
+        )
+
+    all_ratios = seed_rms_ratios.ravel()
+    ratio_padding = max(0.08, 1.25 * np.max(np.abs(all_ratios - 1.0)))
+    ax.axhline(1.0, color="black", linestyle="--", linewidth=1.2, label="theory = 1")
+    ax.set_ylim(1.0 - ratio_padding, 1.0 + ratio_padding)
+    ax.set_xticks(x_positions)
+    ax.set_xticklabels(coordinate_labels)
+    ax.set_xlabel("coordinate")
+    ax.set_ylabel(r"simulated RMS / $\sqrt{k_B T_\mathrm{CM} / k}$")
+    ax.set_title("Multiple random seeds: RMS displacement consistency")
+    ax.grid(True, axis="y", alpha=0.35)
+    ax.legend(fontsize=8, ncol=2)
+    fig.tight_layout()
+    save_validation_plot("multiple_seed_rms_validation.png")
+    finish_plot()
+    raise SystemExit(0)
+
+print("Starting BAOAB constant-power trajectory...", flush=True)
+baoab_constant_power_start_time = perf_counter()
+(
+    x_baoab_constant_power,
+    y_baoab_constant_power,
+    z_baoab_constant_power,
+    vx_baoab_constant_power,
+    vy_baoab_constant_power,
+    vz_baoab_constant_power,
+) = solve_baoab_3d_fast_with_power(
+    constant_power_factor,
+    brownian_normals_x,
+    brownian_normals_y,
+    brownian_normals_z,
+    "BAOAB constant power",
+)
+baoab_constant_power_runtime = perf_counter() - baoab_constant_power_start_time
+print("Finished BAOAB constant-power trajectory in", baoab_constant_power_runtime, "s", flush=True)
+
+if no_stable_equilibrium_mode:
+    def truncate_falling_trajectory(run_label, *arrays):
+        z_values = arrays[2]
+        fall_mask = (
+            z_falling_stop_reference - z_values
+        ) > no_stable_stop_below_lowest_equilibrium
+        nonfinite_mask = ~np.isfinite(z_values)
+        stop_candidates = np.flatnonzero(fall_mask | nonfinite_mask)
+
+        if len(stop_candidates) == 0:
+            print(
+                f"{run_label}: trajectory did not reach "
+                f"{no_stable_stop_below_lowest_equilibrium * 1e6:.3g} "
+                "micrometres below the lower stop reference within t_end."
+            )
+            stop_index = len(z_values) - 1
+        else:
+            stop_index = max(1, int(stop_candidates[0]))
+            fall_distance = z_falling_stop_reference - z_values[stop_index]
+            print(
+                f"{run_label}: plotting until t = {t_baoab[stop_index]:.6g} s, "
+                f"where z is {fall_distance * 1e6:.3g} micrometres below "
+                "the lower stop reference."
+            )
+
+        return tuple(array[:stop_index + 1] for array in arrays)
+
+    (
+        x_baoab_constant_power,
+        y_baoab_constant_power,
+        z_baoab_constant_power,
+        vx_baoab_constant_power,
+        vy_baoab_constant_power,
+        vz_baoab_constant_power,
+    ) = truncate_falling_trajectory(
+        "No-stable-equilibrium diagnostic",
+        x_baoab_constant_power,
+        y_baoab_constant_power,
+        z_baoab_constant_power,
+        vx_baoab_constant_power,
+        vy_baoab_constant_power,
+        vz_baoab_constant_power,
+    )
+
+    t_falling = t_baoab[:len(x_baoab_constant_power)]
+    falling_plot_stride = max(1, len(t_falling) // max_plot_points)
+    falling_plot_slice = slice(None, None, falling_plot_stride)
+
+    plot_experimental_simulation_comparison(
+        t_falling,
+        x_baoab_constant_power,
+        z_baoab_constant_power,
+        "simulation x",
+        "simulation z",
+    )
+
+    fig, axes = plt.subplots(3, 1, figsize=time_trace_figsize, sharex=True)
+    axes[0].plot(
+        t_falling[falling_plot_slice],
+        x_baoab_constant_power[falling_plot_slice] * 1e6,
+        label="x trajectory"
+    )
+    axes[0].axhline(x_eq * 1e6, linestyle=":", color="black", label="reference")
+    axes[0].set_ylabel("x / micrometres")
+    axes[0].legend()
+    axes[0].grid()
+
+    axes[1].plot(
+        t_falling[falling_plot_slice],
+        y_baoab_constant_power[falling_plot_slice] * 1e6,
+        label="y trajectory"
+    )
+    axes[1].axhline(y_eq * 1e6, linestyle=":", color="black", label="reference")
+    axes[1].set_ylabel("y / micrometres")
+    axes[1].legend()
+    axes[1].grid()
+
+    axes[2].plot(
+        t_falling[falling_plot_slice],
+        z_baoab_constant_power[falling_plot_slice] * 1e6,
+        label="z trajectory"
+    )
+    # axes[2].axhline(
+    #     z_eq * 1e6,
+    #     linestyle=":",
+    #     color="black",
+    #     label="start: highest equilibrium"
+    # )
+    # if z_falling_stop_reference is not None and not np.isclose(
+    #     z_falling_stop_reference,
+    #     z_eq
+    # ):
+    #     axes[2].axhline(
+    #         z_falling_stop_reference * 1e6,
+    #         linestyle="-.",
+    #         color="tab:purple",
+    #         label="lowest equilibrium"
+    #     )
+    # axes[2].axhline(
+    #     (z_falling_stop_reference - no_stable_stop_below_lowest_equilibrium) * 1e6,
+    #     linestyle="--",
+    #     color="tab:red",
+    #     label=(
+    #         f"{no_stable_stop_below_lowest_equilibrium * 1e6:.3g} "
+    #         "micrometres below lowest equilibrium"
+    #     )
+    # )
+    axes[2].set_xlabel("Time / s")
+    axes[2].set_ylabel("z / micrometres")
+    axes[2].legend()
+    axes[2].grid()
+
+    fig.suptitle("No-stable-equilibrium falling trajectory diagnostic")
+    plt.tight_layout()
+    finish_plot()
+
+    fig = plt.figure(figsize=trajectory_3d_figsize)
+    ax = fig.add_subplot(111, projection="3d")
+    ax.plot(
+        x_baoab_constant_power[falling_plot_slice] * 1e6,
+        y_baoab_constant_power[falling_plot_slice] * 1e6,
+        z_baoab_constant_power[falling_plot_slice] * 1e6,
+        label="falling trajectory"
+    )
+    ax.scatter(
+        [x_eq * 1e6],
+        [y_eq * 1e6],
+        [z_eq * 1e6],
+        color="black",
+        s=25,
+        label="start: highest equilibrium"
+    )
+    ax.set_xlabel("x / micrometres")
+    ax.set_ylabel("y / micrometres")
+    ax.set_zlabel("z / micrometres")
+    ax.set_title("No-stable-equilibrium 3D trajectory")
+    ax.legend()
+    plt.tight_layout()
+    finish_plot()
+
+    print(
+        "No stable equilibrium diagnostic plotted; stopping before stable-trap "
+        "PSD and validation analysis."
+    )
+    raise SystemExit(0)
+
+print("Starting BAOAB laser-noise trajectory...", flush=True)
+baoab_laser_noise_start_time = perf_counter()
+(
+    x_baoab,
+    y_baoab,
+    z_baoab,
+    vx_baoab,
+    vy_baoab,
+    vz_baoab,
+) = solve_baoab_3d_fast_with_power(
+    laser_power_factor,
+    brownian_normals_x,
+    brownian_normals_y,
+    brownian_normals_z,
+    "BAOAB laser noise",
+)
+baoab_laser_noise_runtime = perf_counter() - baoab_laser_noise_start_time
+print("Finished BAOAB laser-noise trajectory in", baoab_laser_noise_runtime, "s", flush=True)
+
+print("Starting BAOAB laser-noise-only trajectory...", flush=True)
+baoab_laser_noise_without_brownian_start_time = perf_counter()
+(
+    x_baoab_no_brownian,
+    y_baoab_no_brownian,
+    z_baoab_no_brownian,
+    vx_baoab_no_brownian,
+    vy_baoab_no_brownian,
+    vz_baoab_no_brownian,
+) = solve_baoab_3d_fast_with_power(
+    laser_power_factor,
+    zero_brownian_normals,
+    zero_brownian_normals,
+    zero_brownian_normals,
+    "BAOAB laser noise without Brownian motion",
+)
+baoab_laser_noise_without_brownian_runtime = (
+    perf_counter() - baoab_laser_noise_without_brownian_start_time
+)
+print("Finished BAOAB laser-noise-only trajectory in", baoab_laser_noise_without_brownian_runtime, "s", flush=True)
+
+feedback_result = None
+baoab_feedback_runtime = 0.0
+
+if use_pd_feedback:
+    baoab_feedback_start_time = perf_counter()
+    feedback_result = solve_baoab_3d_fast_with_pd_feedback(
+        laser_power_factor,
+        brownian_normals_x,
+        brownian_normals_y,
+        brownian_normals_z,
+        "BAOAB with PD feedback",
+    )
+    baoab_feedback_runtime = perf_counter() - baoab_feedback_start_time
+
+    x_baoab_feedback = feedback_result["x"]
+    y_baoab_feedback = feedback_result["y"]
+    z_baoab_feedback = feedback_result["z"]
+    vx_baoab_feedback = feedback_result["vx"]
+    vy_baoab_feedback = feedback_result["vy"]
+    vz_baoab_feedback = feedback_result["vz"]
+else:
+    x_baoab_feedback = None
+    y_baoab_feedback = None
+    z_baoab_feedback = None
+    vx_baoab_feedback = None
+    vy_baoab_feedback = None
+    vz_baoab_feedback = None
+
+analysis_lengths = [
+    len(x_baoab_constant_power),
+    len(x_baoab),
+    len(x_baoab_no_brownian),
+]
+
+if use_pd_feedback:
+    analysis_lengths.append(len(x_baoab_feedback))
+
+analysis_sample_count = min(analysis_lengths)
+
+if analysis_sample_count < 2:
+    raise RuntimeError("Trap loss occurred before enough samples were available for analysis.")
+
+if analysis_sample_count < len(t_baoab):
+    print(
+        "Analysis truncated at t =",
+        t_baoab[analysis_sample_count - 1],
+        "s so all compared trajectories use the same time range."
+    )
+
+
+def trim_analysis_array(array):
+    return array[:analysis_sample_count]
+
+
+t_baoab = trim_analysis_array(t_baoab)
+constant_power_factor = trim_analysis_array(constant_power_factor)
+laser_power_factor = trim_analysis_array(laser_power_factor)
+laser_power_time = trim_analysis_array(laser_power_time)
+z_eq_laser_noise_time = trim_analysis_array(z_eq_laser_noise_time)
+
+x_baoab_constant_power = trim_analysis_array(x_baoab_constant_power)
+y_baoab_constant_power = trim_analysis_array(y_baoab_constant_power)
+z_baoab_constant_power = trim_analysis_array(z_baoab_constant_power)
+vx_baoab_constant_power = trim_analysis_array(vx_baoab_constant_power)
+vy_baoab_constant_power = trim_analysis_array(vy_baoab_constant_power)
+vz_baoab_constant_power = trim_analysis_array(vz_baoab_constant_power)
+
+x_baoab = trim_analysis_array(x_baoab)
+y_baoab = trim_analysis_array(y_baoab)
+z_baoab = trim_analysis_array(z_baoab)
+vx_baoab = trim_analysis_array(vx_baoab)
+vy_baoab = trim_analysis_array(vy_baoab)
+vz_baoab = trim_analysis_array(vz_baoab)
+
+x_baoab_no_brownian = trim_analysis_array(x_baoab_no_brownian)
+y_baoab_no_brownian = trim_analysis_array(y_baoab_no_brownian)
+z_baoab_no_brownian = trim_analysis_array(z_baoab_no_brownian)
+vx_baoab_no_brownian = trim_analysis_array(vx_baoab_no_brownian)
+vy_baoab_no_brownian = trim_analysis_array(vy_baoab_no_brownian)
+vz_baoab_no_brownian = trim_analysis_array(vz_baoab_no_brownian)
+
+if use_pd_feedback:
+    x_baoab_feedback = trim_analysis_array(x_baoab_feedback)
+    y_baoab_feedback = trim_analysis_array(y_baoab_feedback)
+    z_baoab_feedback = trim_analysis_array(z_baoab_feedback)
+    vx_baoab_feedback = trim_analysis_array(vx_baoab_feedback)
+    vy_baoab_feedback = trim_analysis_array(vy_baoab_feedback)
+    vz_baoab_feedback = trim_analysis_array(vz_baoab_feedback)
+
+    for feedback_key in (
+        "t",
+        "x",
+        "y",
+        "z",
+        "vx",
+        "vy",
+        "vz",
+        "command_power",
+        "actual_power",
+    ):
+        feedback_result[feedback_key] = trim_analysis_array(feedback_result[feedback_key])
+
+    feedback_time_limit = t_baoab[-1]
+    feedback_control_mask = feedback_result["control_t"] <= feedback_time_limit
+    for feedback_key in (
+        "control_t",
+        "measurement_t",
+        "z_measured",
+        "z_filtered",
+        "requested_power",
+    ):
+        feedback_result[feedback_key] = feedback_result[feedback_key][feedback_control_mask]
+
+baoab_total_runtime = (
+    baoab_constant_power_runtime
+    + baoab_laser_noise_runtime
+    + baoab_laser_noise_without_brownian_runtime
+    + baoab_feedback_runtime
+)
+
+x_laser_noise_difference = x_baoab - x_baoab_constant_power
+y_laser_noise_difference = y_baoab - y_baoab_constant_power
+z_laser_noise_difference = z_baoab - z_baoab_constant_power
+
+x_brownian_difference = x_baoab - x_baoab_no_brownian
+y_brownian_difference = y_baoab - y_baoab_no_brownian
+z_brownian_difference = z_baoab - z_baoab_no_brownian
+
+# print("BAOAB constant-power runtime =", baoab_constant_power_runtime, "s")
+# print("BAOAB laser-noise runtime =", baoab_laser_noise_runtime, "s")
+# print("BAOAB laser-noise without-Brownian runtime =", baoab_laser_noise_without_brownian_runtime, "s")
+# print("BAOAB feedback runtime =", baoab_feedback_runtime, "s")
+# print("BAOAB total runtime =", baoab_total_runtime, "s")
+print("Total calculation runtime, excluding graph-viewing time =", perf_counter() - script_start_time, "s")
+
+plot_experimental_simulation_comparison(
+    t_baoab,
+    x_baoab,
+    z_baoab,
+    "simulation x",
+    "simulation z",
+)
+
+equipartition_burn_in_fraction = 0.10
+equipartition_start_index = int(equipartition_burn_in_fraction * len(t_baoab))
+equipartition_start_index = min(equipartition_start_index, len(t_baoab) - 1)
+equipartition_slice = slice(equipartition_start_index, None)
+
+if harmonic_validation_available and use_brownian_noise:
+    simulated_x_rms_equipartition = np.std(
+        x_baoab_constant_power[equipartition_slice] - x_eq
+    )
+    simulated_y_rms_equipartition = np.std(
+        y_baoab_constant_power[equipartition_slice] - y_eq
+    )
+    simulated_z_rms_equipartition = np.std(
+        z_baoab_constant_power[equipartition_slice] - z_eq
+    )
+
+    print("Equipartition RMS check using constant-power Brownian trajectory:")
+    print(
+        "  Burn-in removed =",
+        equipartition_burn_in_fraction * 100,
+        "%; analysis starts at t =",
+        t_baoab[equipartition_start_index],
+        "s"
+    )
+    print(
+        "  x theoretical sqrt(kB T_CM/kx) =",
+        x_rms_thermal * 1e6,
+        "micrometres; simulated RMS =",
+        simulated_x_rms_equipartition * 1e6,
+        "micrometres; simulated/theory =",
+        simulated_x_rms_equipartition / x_rms_thermal
+    )
+    print(
+        "  y theoretical sqrt(kB T_CM/ky) =",
+        y_rms_thermal * 1e6,
+        "micrometres; simulated RMS =",
+        simulated_y_rms_equipartition * 1e6,
+        "micrometres; simulated/theory =",
+        simulated_y_rms_equipartition / y_rms_thermal
+    )
+    print(
+        "  z theoretical sqrt(kB T_CM/kz) =",
+        z_rms_thermal * 1e6,
+        "micrometres; simulated RMS =",
+        simulated_z_rms_equipartition * 1e6,
+        "micrometres; simulated/theory =",
+        simulated_z_rms_equipartition / z_rms_thermal
+    )
+    print(
+    "  z mean displacement =",
+    np.mean(z_baoab_constant_power[equipartition_slice] - z_eq) * 1e6,
+    "micrometres; z median displacement =",
+    np.median(z_baoab_constant_power[equipartition_slice] - z_eq) * 1e6,
+    "micrometres; z std displacement =",
+    np.std(z_baoab_constant_power[equipartition_slice] - z_eq) * 1e6,
+    "micrometres"
+)
+
+    if run_thermal_distribution_validation:
+        def boltzmann_pdf_from_force(displacement_grid_m, coordinate_label):
+            if coordinate_label == "x":
+                coordinate_values_m = x_eq + displacement_grid_m
+                force_values = np.array(
+                    [
+                        F_optical_3d(value, y_eq, z_eq)[0]
+                        for value in coordinate_values_m
+                    ]
+                )
+            elif coordinate_label == "y":
+                coordinate_values_m = y_eq + displacement_grid_m
+                force_values = np.array(
+                    [
+                        F_optical_3d(x_eq, value, z_eq)[1]
+                        for value in coordinate_values_m
+                    ]
+                )
+            elif coordinate_label == "z":
+                coordinate_values_m = z_eq + displacement_grid_m
+                force_values = np.array(
+                    [
+                        F_optical_3d(x_eq, y_eq, value)[2] - m*g
+                        for value in coordinate_values_m
+                    ]
+                )
+            else:
+                raise ValueError("coordinate_label must be 'x', 'y', or 'z'.")
+
+            potential_values = np.zeros_like(displacement_grid_m)
+            step_values = np.diff(displacement_grid_m)
+            average_force_values = 0.5 * (
+                force_values[1:] + force_values[:-1]
+            )
+            potential_values[1:] = np.cumsum(
+                -average_force_values * step_values
+            )
+            potential_values -= np.nanmin(potential_values)
+
+            probability_density_m = np.exp(
+                -potential_values / (kB * brownian_temperature)
+            )
+            normalisation = np.trapz(
+                probability_density_m,
+                displacement_grid_m,
+            )
+            probability_density_m /= normalisation
+
+            return probability_density_m * 1e-6
+
+        distribution_data = (
+            (
+                "x",
+                x_baoab_constant_power[equipartition_slice] - x_eq,
+                x_rms_thermal,
+                simulated_x_rms_equipartition,
+                "tab:blue",
+            ),
+            (
+                "y",
+                y_baoab_constant_power[equipartition_slice] - y_eq,
+                y_rms_thermal,
+                simulated_y_rms_equipartition,
+                "tab:green",
+            ),
+            (
+                "z",
+                (
+                    z_baoab_constant_power[equipartition_slice]
+                    - np.mean(z_baoab_constant_power[equipartition_slice])
+                ),
+                z_rms_thermal,
+                simulated_z_rms_equipartition,
+                "tab:orange",
+            ),
+            
+        )
+
+        fig, axes = plt.subplots(1, 3, figsize=(12, 3.8), sharey=True)
+
+        print()
+        print("Thermal displacement distribution check")
+        print(
+            f"{'coord':<6} "
+            f"{'theory RMS / um':>16} "
+            f"{'sim RMS / um':>14} "
+            f"{'sim/theory':>12}"
+        )
+
+        for ax, (
+            coordinate_label,
+            displacement_values,
+            theory_rms,
+            simulated_rms,
+            colour,
+        ) in zip(axes, distribution_data):
+            displacement_um = displacement_values * 1e6
+            theory_rms_um = theory_rms * 1e6
+            simulated_rms_um = simulated_rms * 1e6
+
+            histogram_limit_um = 4.5 * max(theory_rms_um, simulated_rms_um)
+            histogram_bins = np.linspace(
+                -histogram_limit_um,
+                histogram_limit_um,
+                70,
+            )
+            gaussian_x_um = np.linspace(
+                -histogram_limit_um,
+                histogram_limit_um,
+                500,
+            )
+            gaussian_pdf = (
+                1
+                / (np.sqrt(2 * np.pi) * theory_rms_um)
+                * np.exp(-0.5 * (gaussian_x_um / theory_rms_um)**2)
+            )
+            nonlinear_boltzmann_pdf = boltzmann_pdf_from_force(
+                gaussian_x_um * 1e-6,
+                coordinate_label,
+            )
+
+            ax.hist(
+                displacement_um,
+                bins=histogram_bins,
+                density=True,
+                color=colour,
+                alpha=0.45,
+                label="simulation",
+            )
+            ax.plot(
+                gaussian_x_um,
+                nonlinear_boltzmann_pdf,
+                color="black",
+                linestyle="-",
+                linewidth=1.8,
+                label="nonlinear Boltzmann",
+            )
+            ax.plot(
+                gaussian_x_um,
+                gaussian_pdf,
+                color="0.35",
+                linestyle="--",
+                linewidth=1.4,
+                label="harmonic Gaussian",
+            )
+            ax.axvline(0.0, color="black", linestyle=":", linewidth=1.0)
+            ax.set_title(f"{coordinate_label} displacement")
+            ax.set_xlabel("displacement / um")
+            ax.grid(True, alpha=0.3)
+            ax.text(
+                0.03,
+                0.97,
+                (
+                    f"theory RMS = {theory_rms_um:.3g} um\n"
+                    f"sim RMS = {simulated_rms_um:.3g} um\n"
+                    f"ratio = {simulated_rms / theory_rms:.3f}"
+                ),
+                transform=ax.transAxes,
+                ha="left",
+                va="top",
+                fontsize=8,
+                bbox={
+                    "boxstyle": "round,pad=0.3",
+                    "facecolor": "white",
+                    "edgecolor": "0.75",
+                    "alpha": 0.9,
+                },
+            )
+
+            print(
+                f"{coordinate_label:<6} "
+                f"{theory_rms_um:>16.5g} "
+                f"{simulated_rms_um:>14.5g} "
+                f"{simulated_rms / theory_rms:>12.5f}"
+            )
+
+        axes[0].set_ylabel("probability density / um^-1")
+        axes[-1].legend(fontsize=8)
+        fig.suptitle("Thermal displacement distribution")
+        fig.tight_layout()
+        save_validation_plot("thermal_displacement_distribution.png")
+        finish_plot()
+
+        if thermal_distribution_only:
+            sys.exit(0)
+else:
+    print(
+        "Skipping equipartition RMS check because either no stable harmonic "
+        "trap is available or Brownian noise is disabled."
+    )
+
+# print(
+    # "BAOAB constant-power RMS x from equilibrium =",
+    # np.std(x_baoab_constant_power - x_eq) * 1e6,
+    # "micrometres"
+# )
+# print(
+    # "BAOAB constant-power RMS y from equilibrium =",
+    # np.std(y_baoab_constant_power - y_eq) * 1e6,
+    # "micrometres"
+# )
+# print(
+    # "BAOAB constant-power RMS z from equilibrium =",
+    # np.std(z_baoab_constant_power - z_eq) * 1e6,
+    # "micrometres"
+# )
+# print(
+    # "RMS isolated laser-noise effect in x =",
+    # np.std(x_laser_noise_difference) * 1e9,
+    # "nm"
+# )
+# print(
+    # "RMS isolated laser-noise effect in y =",
+    # np.std(y_laser_noise_difference) * 1e9,
+    # "nm"
+# )
+# print(
+    # "RMS isolated laser-noise effect in z =",
+    # np.std(z_laser_noise_difference) * 1e9,
+    # "nm"
+# )
+# print(
+    # "Max isolated laser-noise effect in x =",
+    # np.max(np.abs(x_laser_noise_difference)) * 1e9,
+    # "nm"
+# )
+# print(
+    # "Max isolated laser-noise effect in y =",
+    # np.max(np.abs(y_laser_noise_difference)) * 1e9,
+    # "nm"
+# )
+# print(
+    # "Max isolated laser-noise effect in z =",
+    # np.max(np.abs(z_laser_noise_difference)) * 1e9,
+    # "nm"
+# )
+
+plot_stride = max(1, len(t_baoab) // max_plot_points)
+plot_slice = slice(None, None, plot_stride)
+t_plot = t_baoab[plot_slice]
+
+# print("Plot stride =", plot_stride)
+# print("Number of plotted time samples =", len(t_plot))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ****************************************************************************************************************************************************
+# Plot x(t), y(t), and z(t)
+# ****************************************************************************************************************************************************
+fig, axes = plt.subplots(3, 1, figsize=time_trace_figsize, sharex=True)
+
+axes[0].plot(
+    t_plot,
+    x_baoab[plot_slice] * 1e6,
+    linewidth=0.9,
+    alpha=0.75,
+    label=laser_power_trajectory_label
+)
+axes[0].axhline(x_eq * 1e6, linestyle=":", color="black", label="Equilibrium")
+axes[0].set_ylabel("x / micrometres")
+axes[0].legend()
+axes[0].grid()
+
+axes[1].plot(
+    t_plot,
+    y_baoab[plot_slice] * 1e6,
+    linewidth=0.9,
+    alpha=0.75,
+    label=laser_power_trajectory_label
+)
+axes[1].axhline(y_eq * 1e6, linestyle=":", color="black", label="Equilibrium")
+axes[1].set_ylabel("y / micrometres")
+axes[1].legend()
+axes[1].grid()
+
+axes[2].plot(
+    t_plot,
+    z_baoab[plot_slice] * 1e6,
+    linewidth=0.9,
+    alpha=0.75,
+    label=laser_power_trajectory_label
+)
+axes[2].axhline(z_eq * 1e6, linestyle=":", color="black", label="Equilibrium")
+axes[2].set_xlabel("Time / s")
+axes[2].set_ylabel("z / micrometres")
+axes[2].legend()
+axes[2].grid()
+
+fig.suptitle("3D BAOAB ray-optics motion")
+plt.tight_layout()
+finish_plot()
+
+# ****************************************************************************************************************************************************
+# Laser-power noise diagnostic
+# ****************************************************************************************************************************************************
+plt.figure(figsize=single_diagnostic_figsize)
+if laser_noise_plot_style == "step":
+    plt.step(t_plot, laser_power_time[plot_slice], where="post", label="laser power")
+else:
+    plt.plot(t_plot, laser_power_time[plot_slice], linewidth=0.9, label="laser power")
+plt.axhline(P_laser, linestyle="--", color="black", label="input mean power")
+
+if use_laser_power_noise and laser_noise_model_normalised == "synthetic_step":
+    plt.axhline(P_laser * (1 + laser_noise_fraction), linestyle=":", color="tab:red")
+    plt.axhline(P_laser * (1 - laser_noise_fraction), linestyle=":", color="tab:red")
+elif use_laser_power_noise:
+    plt.axhline(np.max(laser_power_time), linestyle=":", color="tab:red", label="trace range")
+    plt.axhline(np.min(laser_power_time), linestyle=":", color="tab:red")
+
+plt.xlabel("Time / s")
+plt.ylabel("Laser power / W")
+plt.title(laser_noise_plot_title)
+plt.legend()
+plt.grid()
+plt.tight_layout()
+finish_plot()
+
+
+# ****************************************************************************************************************************************************
+# Optional PD feedback laser-power diagnostic
+# ****************************************************************************************************************************************************
+if use_pd_feedback:
+    plt.figure(figsize=single_diagnostic_figsize)
+    plt.plot(
+        t_plot,
+        feedback_result["command_power"][plot_slice] * 1e3,
+        label="PD command power"
+    )
+    plt.plot(
+        t_plot,
+        feedback_result["actual_power"][plot_slice] * 1e3,
+        alpha=0.65,
+        label="actual power after laser noise"
+    )
+    plt.axhline(P_laser * 1e3, linestyle="--", color="black", label="nominal power")
+    plt.axhline(
+        feedback_result["feedback_power_min"] * 1e3,
+        linestyle=":",
+        color="tab:red",
+        label="feedback limits"
+    )
+    plt.axhline(feedback_result["feedback_power_max"] * 1e3, linestyle=":", color="tab:red")
+    plt.xlabel("Time / s")
+    plt.ylabel("Laser power / mW")
+    plt.title("PD feedback laser power")
+    plt.legend()
+    plt.grid()
+    plt.tight_layout()
+    finish_plot()
+
+    feedback_control_stride = max(
+        1,
+        len(feedback_result["control_t"]) // max_plot_points
+    )
+    feedback_control_slice = slice(None, None, feedback_control_stride)
+
+    plt.figure(figsize=force_check_figsize)
+    plt.plot(
+        feedback_result["control_t"][feedback_control_slice],
+        (feedback_result["z_measured"][feedback_control_slice] - z_eq) * 1e9,
+        alpha=0.45,
+        label="delayed measured z"
+    )
+    plt.plot(
+        feedback_result["control_t"][feedback_control_slice],
+        (feedback_result["z_filtered"][feedback_control_slice] - z_eq) * 1e9,
+        label="filtered z used by controller"
+    )
+    plt.axhline(0, color="black", linestyle=":", linewidth=0.8)
+    plt.xlabel("Time / s")
+    plt.ylabel("Measured z displacement / nm")
+    plt.title("PD feedback measurement signal")
+    plt.legend()
+    plt.grid()
+    plt.tight_layout()
+    finish_plot()
+
+# ****************************************************************************************************************************************************
+# Compare Brownian trajectories with and without laser-power noise
+# ****************************************************************************************************************************************************
+fig, axes = plt.subplots(3, 1, figsize=time_trace_figsize, sharex=True)
+
+axes[0].plot(
+    t_plot,
+    x_baoab_constant_power[plot_slice] * 1e6,
+    label=constant_power_trajectory_label
+)
+axes[0].plot(
+    t_plot,
+    x_baoab[plot_slice] * 1e6,
+    linewidth=0.9,
+    label=laser_power_trajectory_label
+)
+axes[0].axhline(x_eq * 1e6, linestyle=":", color="black", label="equilibrium")
+axes[0].set_ylabel("x / micrometres")
+axes[0].legend()
+axes[0].grid()
+
+axes[1].plot(
+    t_plot,
+    y_baoab_constant_power[plot_slice] * 1e6,
+    label=constant_power_trajectory_label
+)
+axes[1].plot(
+    t_plot,
+    y_baoab[plot_slice] * 1e6,
+    linewidth=0.9,
+    label=laser_power_trajectory_label
+)
+axes[1].axhline(y_eq * 1e6, linestyle=":", color="black", label="equilibrium")
+axes[1].set_ylabel("y / micrometres")
+axes[1].legend()
+axes[1].grid()
+
+axes[2].plot(
+    t_plot,
+    z_baoab_constant_power[plot_slice] * 1e6,
+    label=constant_power_trajectory_label
+)
+axes[2].plot(
+    t_plot,
+    z_baoab[plot_slice] * 1e6,
+    linewidth=0.9,
+    label=laser_power_trajectory_label
+)
+axes[2].axhline(z_eq * 1e6, linestyle=":", color="black", label="equilibrium")
+axes[2].set_xlabel("Time / s")
+axes[2].set_ylabel("z / micrometres")
+axes[2].legend()
+axes[2].grid()
+
+fig.suptitle("BAOAB motion with and without laser-power noise")
+plt.tight_layout()
+finish_plot()
+
+
+# ****************************************************************************************************************************************************
+# Optional PD feedback trajectory comparison
+# ****************************************************************************************************************************************************
+if use_pd_feedback:
+    fig, axes = plt.subplots(3, 1, figsize=time_trace_figsize, sharex=True)
+
+    axes[0].plot(
+        t_plot,
+        x_baoab[plot_slice] * 1e6,
+        label="without feedback"
+    )
+    axes[0].plot(
+        t_plot,
+        x_baoab_feedback[plot_slice] * 1e6,
+        linewidth=0.9,
+        label="with PD feedback"
+    )
+    axes[0].axhline(x_eq * 1e6, linestyle=":", color="black", label="equilibrium")
+    axes[0].set_ylabel("x / micrometres")
+    axes[0].legend()
+    axes[0].grid()
+
+    axes[1].plot(
+        t_plot,
+        y_baoab[plot_slice] * 1e6,
+        label="without feedback"
+    )
+    axes[1].plot(
+        t_plot,
+        y_baoab_feedback[plot_slice] * 1e6,
+        linewidth=0.9,
+        label="with PD feedback"
+    )
+    axes[1].axhline(y_eq * 1e6, linestyle=":", color="black", label="equilibrium")
+    axes[1].set_ylabel("y / micrometres")
+    axes[1].legend()
+    axes[1].grid()
+
+    axes[2].plot(
+        t_plot,
+        z_baoab[plot_slice] * 1e6,
+        label="without feedback"
+    )
+    axes[2].plot(
+        t_plot,
+        z_baoab_feedback[plot_slice] * 1e6,
+        linewidth=0.9,
+        label="with PD feedback"
+    )
+    axes[2].axhline(z_eq * 1e6, linestyle=":", color="black", label="equilibrium")
+    axes[2].set_xlabel("Time / s")
+    axes[2].set_ylabel("z / micrometres")
+    axes[2].legend()
+    axes[2].grid()
+
+    fig.suptitle("BAOAB motion with and without PD feedback")
+    plt.tight_layout()
+    finish_plot()
+
+# ****************************************************************************************************************************************************
+# Isolated laser-noise effect
+# ****************************************************************************************************************************************************
+fig, axes = plt.subplots(3, 1, figsize=time_trace_figsize, sharex=True)
+
+axes[0].plot(t_plot, x_laser_noise_difference[plot_slice] * 1e9)
+axes[0].axhline(0, linestyle=":", color="black")
+axes[0].set_ylabel("x difference / nm")
+axes[0].grid()
+
+axes[1].plot(t_plot, y_laser_noise_difference[plot_slice] * 1e9)
+axes[1].axhline(0, linestyle=":", color="black")
+axes[1].set_ylabel("y difference / nm")
+axes[1].grid()
+
+axes[2].plot(t_plot, z_laser_noise_difference[plot_slice] * 1e9)
+axes[2].axhline(0, linestyle=":", color="black")
+axes[2].set_xlabel("Time / s")
+axes[2].set_ylabel("z difference / nm")
+axes[2].grid()
+
+fig.suptitle("Isolated displacement effect from laser-power noise")
+plt.tight_layout()
+finish_plot()
+
+# ****************************************************************************************************************************************************
+# Isolated Brownian-motion effect
+# ****************************************************************************************************************************************************
+fig, axes = plt.subplots(3, 1, figsize=time_trace_figsize, sharex=True)
+
+axes[0].plot(t_plot, x_brownian_difference[plot_slice] * 1e9)
+axes[0].axhline(0, linestyle=":", color="black")
+axes[0].set_ylabel("x difference / nm")
+axes[0].grid()
+
+axes[1].plot(t_plot, y_brownian_difference[plot_slice] * 1e9)
+axes[1].axhline(0, linestyle=":", color="black")
+axes[1].set_ylabel("y difference / nm")
+axes[1].grid()
+
+axes[2].plot(t_plot, z_brownian_difference[plot_slice] * 1e9)
+axes[2].axhline(0, linestyle=":", color="black")
+axes[2].set_xlabel("Time / s")
+axes[2].set_ylabel("z difference / nm")
+axes[2].grid()
+
+fig.suptitle("Isolated displacement effect from Brownian motion")
+plt.tight_layout()
+finish_plot()
+
+#****************************************************************************************************************************************************
+# Power spectral density
+#****************************************************************************************************************************************************
+sampling_frequency = 1 / dt_baoab
+nyquist_frequency = sampling_frequency / 2
+frequency_bin_size = 1 / (len(t_baoab) * dt_baoab)
+psd_plot_max_frequency = (
+    nyquist_frequency
+    if psd_plot_max_frequency_override is None
+    else psd_plot_max_frequency_override
+)
+
+# print("PSD sampling frequency =", sampling_frequency, "Hz")
+# print("PSD Nyquist frequency =", nyquist_frequency, "Hz")
+# print("PSD full-record frequency bin size =", frequency_bin_size, "Hz")
+
+
+def positive_psd(signal, time_values):
+    dt = time_values[1] - time_values[0]
+    fs = 1 / dt
+    signal = signal - np.mean(signal)
+
+    if psd_segment_samples is not None:
+        nperseg = min(psd_segment_samples, len(signal))
+    elif psd_segment_duration_seconds is not None:
+        nperseg = min(
+            max(2, int(round(psd_segment_duration_seconds * fs))),
+            len(signal)
+        )
+    else:
+        nperseg = len(signal)
+
+    if nperseg < 2:
+        raise ValueError("PSD segment settings must leave at least two samples.")
+
+    if psd_overlap_samples is not None:
+        noverlap = min(psd_overlap_samples, nperseg - 1)
+    elif nperseg == len(signal):
+        noverlap = 0
+    else:
+        noverlap = min(int(round(psd_overlap_fraction * nperseg)), nperseg - 1)
+
+    frequencies, psd = welch(
+        signal,
+        fs=fs,
+        window="hann",
+        nperseg=nperseg,
+        noverlap=noverlap,
+        detrend=False,
+        scaling="density",
+        return_onesided=True
+    )
+
+    positive_mask = (frequencies > 0) & (psd > 0)
+    frequencies = frequencies[positive_mask]
+    psd = psd[positive_mask]
+
+    return frequencies, psd
+
+
+def positive_welch_averaged_psd(signal, time_values):
+    dt = time_values[1] - time_values[0]
+    fs = 1 / dt
+    signal = signal - np.mean(signal)
+
+    nperseg = min(
+        max(2, int(round(welch_average_segment_duration_seconds * fs))),
+        len(signal)
+    )
+
+    if nperseg < 2:
+        raise ValueError("Welch PSD settings must leave at least two samples.")
+
+    noverlap = min(int(round(psd_overlap_fraction * nperseg)), nperseg - 1)
+
+    frequencies, psd = welch(
+        signal,
+        fs=fs,
+        window="hann",
+        nperseg=nperseg,
+        noverlap=noverlap,
+        detrend=False,
+        scaling="density",
+        return_onesided=True
+    )
+
+    positive_mask = (frequencies > 0) & (psd > 0)
+    frequencies = frequencies[positive_mask]
+    psd = psd[positive_mask]
+
+    return frequencies, psd, nperseg, fs / nperseg
+
+
+def variance_preserving_one_sided_psd(signal, time_values):
+    """
+    Full-record one-sided PSD for the Parseval/variance normalisation check.
+
+    This uses a rectangular window and the whole trajectory so that integrating
+    the one-sided PSD directly tests the frequency-bin and factor-of-two
+    normalisation against the time-domain variance.
+    """
+    dt = time_values[1] - time_values[0]
+    fs = 1 / dt
+    signal = signal - np.mean(signal)
+
+    frequencies, psd = welch(
+        signal,
+        fs=fs,
+        window="boxcar",
+        nperseg=len(signal),
+        noverlap=0,
+        detrend=False,
+        scaling="density",
+        return_onesided=True,
+    )
+
+    positive_mask = (frequencies > 0) & (psd >= 0)
+    frequencies = frequencies[positive_mask]
+    psd = psd[positive_mask]
+
+    return frequencies, psd
+
+
+def analytic_langevin_displacement_psd(frequencies_hz, omega_0):
+    omega = 2 * np.pi * frequencies_hz
+    denominator = (omega_0**2 - omega**2)**2 + gamma_baoab**2 * omega**2
+    return 4 * kB * brownian_temperature * gamma_baoab / (m * denominator)
+
+
+def integrated_psd_variance(frequencies_hz, psd_density):
+    """
+    Recover variance from a one-sided PSD in m^2/Hz.
+
+    For uniformly spaced PSD bins from scipy.signal.welch with
+    scaling="density", the discrete integral is sum(Sxx) * df.
+    """
+    if len(frequencies_hz) < 2:
+        return np.nan
+
+    df = np.median(np.diff(frequencies_hz))
+    return np.sum(psd_density) * df
+
+
+def apply_psd_axes():
+    plt.axvline(nyquist_frequency, color="red", linestyle=":", label="Nyquist limit")
+    plt.xlim(minimum_plot_frequency, psd_plot_max_frequency)
+
+    if psd_max_value is None:
+        plt.ylim(bottom=psd_min_value)
+    else:
+        plt.ylim(psd_min_value, psd_max_value)
+
+    plt.xlabel("Frequency / Hz")
+    plt.ylabel("PSD / m^2 Hz^-1")
+
+
+def quantise_position_resolution(position_m, resolution_m):
+    if resolution_m <= 0.0:
+        return np.array(position_m, copy=True)
+    return np.round(position_m / resolution_m) * resolution_m
+
+
+baoab_x_freqs, baoab_x_psd = positive_psd(x_baoab - x_eq, t_baoab)
+baoab_y_freqs, baoab_y_psd = positive_psd(y_baoab - y_eq, t_baoab)
+baoab_z_freqs, baoab_z_psd = positive_psd(z_baoab - z_eq, t_baoab)
+
+minimum_resolvable_frequency = baoab_x_freqs[0]
+minimum_plot_frequency = psd_min_frequency_factor * minimum_resolvable_frequency
+
+# print("Minimum resolvable non-zero frequency =", minimum_resolvable_frequency, "Hz")
+# print("Lower frequency shown on plot =", minimum_plot_frequency, "Hz")
+
+plt.figure(figsize=spectrum_figsize)
+plt.loglog(baoab_x_freqs, baoab_x_psd, label="BAOAB x PSD")
+apply_psd_axes()
+plt.title("PSD of BAOAB x motion")
+plt.legend()
+plt.grid(True, which="both")
+finish_plot()
+
+plt.figure(figsize=spectrum_figsize)
+plt.loglog(baoab_y_freqs, baoab_y_psd, color="tab:green", label="BAOAB y PSD")
+apply_psd_axes()
+plt.title("PSD of BAOAB y motion")
+plt.legend()
+plt.grid(True, which="both")
+finish_plot()
+
+plt.figure(figsize=spectrum_figsize)
+plt.loglog(baoab_z_freqs, baoab_z_psd, color="tab:orange", label="BAOAB z PSD")
+apply_psd_axes()
+plt.title("PSD of BAOAB z motion")
+plt.legend()
+plt.grid(True, which="both")
+finish_plot()
+
+baoab_x_welch_freqs, baoab_x_welch_psd, welch_nperseg, welch_bin_size = (
+    positive_welch_averaged_psd(x_baoab - x_eq, t_baoab)
+)
+baoab_y_welch_freqs, baoab_y_welch_psd, _, _ = positive_welch_averaged_psd(
+    y_baoab - y_eq,
+    t_baoab
+)
+baoab_z_welch_freqs, baoab_z_welch_psd, _, _ = positive_welch_averaged_psd(
+    z_baoab - z_eq,
+    t_baoab
+)
+
+constant_x_welch_freqs, constant_x_welch_psd, _, _ = positive_welch_averaged_psd(
+    x_baoab_constant_power - x_eq,
+    t_baoab
+)
+constant_y_welch_freqs, constant_y_welch_psd, _, _ = positive_welch_averaged_psd(
+    y_baoab_constant_power - y_eq,
+    t_baoab
+)
+constant_z_welch_freqs, constant_z_welch_psd, _, _ = positive_welch_averaged_psd(
+    z_baoab_constant_power - z_eq,
+    t_baoab
+)
+
+if run_psd_normalisation_validation and not welch_averaging_only:
+    constant_x_norm_freqs, constant_x_norm_psd = variance_preserving_one_sided_psd(
+        x_baoab_constant_power - x_eq,
+        t_baoab
+    )
+    constant_y_norm_freqs, constant_y_norm_psd = variance_preserving_one_sided_psd(
+        y_baoab_constant_power - y_eq,
+        t_baoab
+    )
+    constant_z_norm_freqs, constant_z_norm_psd = variance_preserving_one_sided_psd(
+        z_baoab_constant_power - z_eq,
+        t_baoab
+    )
+
+    psd_normalisation_data = (
+        (
+            "x",
+            x_baoab_constant_power - x_eq,
+            constant_x_norm_freqs,
+            constant_x_norm_psd,
+            constant_x_welch_freqs,
+            constant_x_welch_psd,
+        ),
+        (
+            "y",
+            y_baoab_constant_power - y_eq,
+            constant_y_norm_freqs,
+            constant_y_norm_psd,
+            constant_y_welch_freqs,
+            constant_y_welch_psd,
+        ),
+        (
+            "z",
+            z_baoab_constant_power - z_eq,
+            constant_z_norm_freqs,
+            constant_z_norm_psd,
+            constant_z_welch_freqs,
+            constant_z_welch_psd,
+        ),
+    )
+
+    coordinate_labels = []
+    time_domain_variances = []
+    one_sided_psd_variances = []
+    welch_psd_variances = []
+
+    for (
+        coordinate_label,
+        displacement_signal,
+        one_sided_frequencies,
+        one_sided_psd,
+        welch_frequencies,
+        welch_psd,
+    ) in psd_normalisation_data:
+        coordinate_labels.append(coordinate_label)
+        displacement_signal = displacement_signal - np.mean(displacement_signal)
+        time_domain_variances.append(np.var(displacement_signal))
+        one_sided_psd_variances.append(
+            integrated_psd_variance(one_sided_frequencies, one_sided_psd)
+        )
+        welch_psd_variances.append(
+            integrated_psd_variance(welch_frequencies, welch_psd)
+        )
+
+    time_domain_variances = np.asarray(time_domain_variances)
+    one_sided_psd_variances = np.asarray(one_sided_psd_variances)
+    welch_psd_variances = np.asarray(welch_psd_variances)
+    one_sided_psd_ratios = one_sided_psd_variances / time_domain_variances
+    welch_psd_ratios = welch_psd_variances / time_domain_variances
+
+    print()
+    print("PSD normalisation check using constant-power Brownian trajectory")
+    print(
+        f"{'coord':<6} "
+        f"{'time variance / m^2':>22} "
+        f"{'one-sided PSD ratio':>21} "
+        f"{'Welch PSD ratio':>17}"
+    )
+    for coordinate_label, variance_value, one_sided_ratio, welch_ratio in zip(
+        coordinate_labels,
+        time_domain_variances,
+        one_sided_psd_ratios,
+        welch_psd_ratios,
+    ):
+        print(
+            f"{coordinate_label:<6} "
+            f"{variance_value:>22.5e} "
+            f"{one_sided_ratio:>21.5f} "
+            f"{welch_ratio:>17.5f}"
+        )
+
+    x_positions = np.arange(len(coordinate_labels))
+
+    fig, axes = plt.subplots(
+        1,
+        2,
+        figsize=(9, 4.2),
+        gridspec_kw={"width_ratios": [1.15, 1.0]},
+    )
+    ax_variance, ax_ratio = axes
+
+    colours = ["tab:blue", "tab:green", "tab:orange"]
+    variance_scale = 1.0e-13
+    for coordinate_label, time_variance, psd_variance, colour in zip(
+        coordinate_labels,
+        time_domain_variances,
+        one_sided_psd_variances,
+        colours,
+    ):
+        ax_variance.scatter(
+            time_variance / variance_scale,
+            psd_variance / variance_scale,
+            s=70,
+            color=colour,
+            edgecolor="black",
+            linewidth=0.5,
+            label=coordinate_label,
+            zorder=3,
+        )
+
+    variance_min = (
+        0.85 * min(
+            np.nanmin(time_domain_variances),
+            np.nanmin(one_sided_psd_variances),
+        )
+        / variance_scale
+    )
+    variance_max = (
+        1.15 * max(
+            np.nanmax(time_domain_variances),
+            np.nanmax(one_sided_psd_variances),
+        )
+        / variance_scale
+    )
+    ax_variance.plot(
+        [variance_min, variance_max],
+        [variance_min, variance_max],
+        color="black",
+        linestyle="--",
+        linewidth=1.2,
+        label="ideal equality",
+    )
+    ax_variance.set_xlim(variance_min, variance_max)
+    ax_variance.set_ylim(variance_min, variance_max)
+    ax_variance.set_xlabel(r"time-domain variance / $10^{-13}$ m$^2$")
+    ax_variance.set_ylabel(r"PSD-integrated variance / $10^{-13}$ m$^2$")
+    ax_variance.set_title("Variance from PSD integral")
+    ax_variance.legend(fontsize=8)
+    ax_variance.grid(True, alpha=0.35)
+
+    ax_ratio.scatter(
+        x_positions,
+        one_sided_psd_ratios,
+        s=80,
+        color=colours,
+        edgecolor="black",
+        linewidth=0.5,
+        zorder=3,
+    )
+    ax_ratio.axhline(
+        1.0,
+        color="black",
+        linestyle="--",
+        linewidth=1.2,
+        label="ideal = 1",
+    )
+
+    for x_position, ratio_value in zip(x_positions, one_sided_psd_ratios):
+        ax_ratio.text(
+            x_position,
+            ratio_value,
+            f"{ratio_value:.4f}",
+            ha="center",
+            va="bottom",
+            fontsize=8,
+        )
+
+    ratio_padding = max(0.001, 1.4 * np.nanmax(np.abs(one_sided_psd_ratios - 1.0)))
+    ax_ratio.set_ylim(1.0 - ratio_padding, 1.0 + ratio_padding)
+    ax_ratio.set_xticks(x_positions)
+    ax_ratio.set_xticklabels(coordinate_labels)
+    ax_ratio.set_xlabel("coordinate")
+    ax_ratio.set_ylabel("PSD variance /\ntime variance")
+    ax_ratio.set_title("Normalisation ratio")
+    ax_ratio.grid(True, axis="y", alpha=0.35)
+
+    fig.suptitle("PSD normalisation: integrated PSD recovers variance")
+    fig.tight_layout()
+    save_validation_plot("psd_integrated_variance_normalisation.png")
+    finish_plot()
+
+    if psd_normalisation_only:
+        sys.exit(0)
+
+print("Welch-averaged PSD segment duration =", welch_average_segment_duration_seconds, "s")
+print("Welch-averaged PSD nperseg =", welch_nperseg)
+print("Welch-averaged PSD frequency bin size =", welch_bin_size, "Hz")
+
+if run_welch_averaging_validation:
+    raw_z_freqs, raw_z_psd = positive_psd(
+        z_baoab_constant_power - z_eq,
+        t_baoab,
+    )
+    analytic_z_psd_for_raw = (
+        analytic_langevin_displacement_psd(raw_z_freqs, omega_z)
+        if harmonic_validation_available
+        else None
+    )
+    analytic_z_psd_for_welch = (
+        analytic_langevin_displacement_psd(constant_z_welch_freqs, omega_z)
+        if harmonic_validation_available
+        else None
+    )
+
+    fig, ax_psd = plt.subplots(figsize=(8, 5))
+
+    ax_psd.loglog(
+        raw_z_freqs,
+        raw_z_psd,
+        color="0.65",
+        linewidth=0.9,
+        alpha=0.8,
+        label="single-record PSD",
+    )
+    ax_psd.loglog(
+        constant_z_welch_freqs,
+        constant_z_welch_psd,
+        color="tab:orange",
+        linewidth=1.8,
+        label="Welch-averaged PSD",
+    )
+
+    if analytic_z_psd_for_raw is not None:
+        ax_psd.loglog(
+            raw_z_freqs,
+            analytic_z_psd_for_raw,
+            color="black",
+            linestyle="--",
+            linewidth=1.3,
+            label="analytic Langevin PSD",
+        )
+
+    welch_plot_max_frequency = min(psd_plot_max_frequency, 5.0e3)
+    ax_psd.set_xlim(minimum_plot_frequency, welch_plot_max_frequency)
+    if psd_max_value is None:
+        ax_psd.set_ylim(bottom=psd_min_value)
+    else:
+        ax_psd.set_ylim(psd_min_value, psd_max_value)
+
+    ax_psd.set_ylabel("PSD / m^2 Hz^-1")
+    ax_psd.set_xlabel("Frequency / Hz")
+    ax_psd.set_title(
+        "Welch averaging reduces PSD scatter while preserving the spectrum"
+    )
+    ax_psd.legend(fontsize=8)
+    ax_psd.grid(True, which="both", alpha=0.35)
+    fig.tight_layout()
+    save_validation_plot("welch_averaging_psd_comparison.png")
+    finish_plot()
+
+    if welch_averaging_only:
+        sys.exit(0)
+
+plt.figure(figsize=spectrum_figsize)
+plt.loglog(baoab_x_welch_freqs, baoab_x_welch_psd, label="BAOAB x Welch-averaged PSD")
+apply_psd_axes()
+plt.title("Welch-averaged PSD of BAOAB x motion")
+plt.legend()
+plt.grid(True, which="both")
+finish_plot()
+
+plt.figure(figsize=spectrum_figsize)
+plt.loglog(
+    baoab_y_welch_freqs,
+    baoab_y_welch_psd,
+    color="tab:green",
+    label="BAOAB y Welch-averaged PSD"
+)
+apply_psd_axes()
+plt.title("Welch-averaged PSD of BAOAB y motion")
+plt.legend()
+plt.grid(True, which="both")
+finish_plot()
+
+plt.figure(figsize=spectrum_figsize)
+plt.loglog(
+    baoab_z_welch_freqs,
+    baoab_z_welch_psd,
+    color="tab:orange",
+    label="BAOAB z Welch-averaged PSD"
+)
+apply_psd_axes()
+plt.title("Welch-averaged PSD of BAOAB z motion")
+plt.legend()
+plt.grid(True, which="both")
+finish_plot()
+
+if (
+    include_analytic_langevin_validation_psd
+    and harmonic_validation_available
+    and use_brownian_noise
+):
+    fig, axes = plt.subplots(3, 1, figsize=time_trace_figsize, sharex=True)
+    validation_psd_data = (
+        (
+            axes[0],
+            constant_x_welch_freqs,
+            constant_x_welch_psd,
+            omega_x,
+            "x",
+            "tab:blue",
+        ),
+        (
+            axes[1],
+            constant_y_welch_freqs,
+            constant_y_welch_psd,
+            omega_y,
+            "y",
+            "tab:green",
+        ),
+        (
+            axes[2],
+            constant_z_welch_freqs,
+            constant_z_welch_psd,
+            omega_z,
+            "z",
+            "tab:orange",
+        ),
+    )
+
+    for ax, frequencies, simulated_psd, omega_0, label, colour in validation_psd_data:
+        analytic_psd = analytic_langevin_displacement_psd(frequencies, omega_0)
+        ax.loglog(
+            frequencies,
+            simulated_psd,
+            color=colour,
+            linewidth=1.1,
+            label=f"simulated {label} PSD, constant power"
+        )
+        ax.loglog(
+            frequencies,
+            analytic_psd,
+            color="black",
+            linestyle="--",
+            linewidth=1.1,
+            label=f"analytic {label} harmonic Langevin PSD"
+        )
+        ax.axvline(nyquist_frequency, color="red", linestyle=":", label="Nyquist limit")
+        ax.set_xlim(minimum_plot_frequency, psd_plot_max_frequency)
+        if psd_max_value is None:
+            ax.set_ylim(bottom=psd_min_value)
+        else:
+            ax.set_ylim(psd_min_value, psd_max_value)
+        ax.set_ylabel("PSD / m^2 Hz^-1")
+        ax.legend()
+        ax.grid(True, which="both")
+
+    axes[-1].set_xlabel("Frequency / Hz")
+    fig.suptitle("Brownian PSD validation against analytic harmonic Langevin model")
+    plt.tight_layout()
+    finish_plot()
+
+if include_z_detector_resolution_psd:
+    detector_position_resolution_m = detector_position_resolution_nm * 1e-9
+    z_displacement = z_baoab - z_eq
+    z_displacement_measured = quantise_position_resolution(
+        z_displacement,
+        detector_position_resolution_m
+    )
+    measured_z_freqs, measured_z_psd = positive_psd(
+        z_displacement_measured,
+        t_baoab
+    )
+    measured_z_welch_freqs, measured_z_welch_psd, _, _ = (
+        positive_welch_averaged_psd(
+            z_displacement_measured,
+            t_baoab
+        )
+    )
+
+    fig, axes = plt.subplots(
+        2,
+        1,
+        figsize=(spectrum_figsize[0], 1.6 * spectrum_figsize[1]),
+        sharex=False
+    )
+
+    axes[0].plot(
+        t_plot,
+        z_displacement[plot_slice] * 1e9,
+        color="tab:orange",
+        alpha=0.45,
+        linewidth=0.9,
+        label="true z displacement"
+    )
+    axes[0].step(
+        t_plot,
+        z_displacement_measured[plot_slice] * 1e9,
+        where="post",
+        color="tab:green",
+        linewidth=1.0,
+        label=f"{detector_position_resolution_nm:g} nm resolution"
+    )
+    axes[0].axhline(0, linestyle=":", color="black")
+    axes[0].set_xlabel("Time / s")
+    axes[0].set_ylabel("z displacement / nm")
+    axes[0].set_title("z trajectory with detector resolution")
+    axes[0].legend()
+    axes[0].grid(True)
+
+    plt.sca(axes[1])
+    axes[1].loglog(
+        baoab_z_freqs,
+        baoab_z_psd,
+        color="tab:orange",
+        alpha=0.45,
+        label="true z PSD"
+    )
+    axes[1].loglog(
+        measured_z_freqs,
+        measured_z_psd,
+        color="tab:green",
+        alpha=0.45,
+        label=f"z PSD with {detector_position_resolution_nm:g} nm resolution"
+    )
+    apply_psd_axes()
+    axes[1].set_title("PSD of BAOAB z motion with detector resolution")
+    axes[1].legend()
+    axes[1].grid(True, which="both")
+
+    fig.tight_layout()
+    finish_plot()
+
+    plt.figure(figsize=spectrum_figsize)
+    plt.loglog(
+        baoab_z_welch_freqs,
+        baoab_z_welch_psd,
+        color="tab:orange",
+        alpha=0.45,
+        label="true z Welch-averaged PSD"
+    )
+    plt.loglog(
+        measured_z_welch_freqs,
+        measured_z_welch_psd,
+        color="tab:green",
+        alpha=0.45,
+        label=f"z Welch-averaged PSD with {detector_position_resolution_nm:g} nm resolution"
+    )
+    apply_psd_axes()
+    plt.title("Welch-averaged PSD of BAOAB z motion with detector resolution")
+    plt.legend()
+    plt.grid(True, which="both")
+    finish_plot()
+
+laser_effect_x_freqs, laser_effect_x_psd = positive_psd(
+    x_laser_noise_difference,
+    t_baoab
+)
+laser_effect_y_freqs, laser_effect_y_psd = positive_psd(
+    y_laser_noise_difference,
+    t_baoab
+)
+laser_effect_z_freqs, laser_effect_z_psd = positive_psd(
+    z_laser_noise_difference,
+    t_baoab
+)
+laser_effect_x_welch_freqs, laser_effect_x_welch_psd, _, _ = (
+    positive_welch_averaged_psd(
+        x_laser_noise_difference,
+        t_baoab
+    )
+)
+laser_effect_y_welch_freqs, laser_effect_y_welch_psd, _, _ = (
+    positive_welch_averaged_psd(
+        y_laser_noise_difference,
+        t_baoab
+    )
+)
+laser_effect_z_welch_freqs, laser_effect_z_welch_psd, _, _ = (
+    positive_welch_averaged_psd(
+        z_laser_noise_difference,
+        t_baoab
+    )
+)
+
+plt.figure(figsize=spectrum_figsize)
+plt.loglog(laser_effect_x_freqs, laser_effect_x_psd, label="x laser-noise effect")
+plt.loglog(
+    laser_effect_y_freqs,
+    laser_effect_y_psd,
+    color="tab:green",
+    label="y laser-noise effect"
+)
+plt.loglog(
+    laser_effect_z_freqs,
+    laser_effect_z_psd,
+    color="tab:orange",
+    label="z laser-noise effect"
+)
+apply_psd_axes()
+plt.title("PSD of isolated laser-noise displacement effect")
+plt.legend()
+plt.grid(True, which="both")
+finish_plot()
+
+plt.figure(figsize=spectrum_figsize)
+plt.loglog(
+    laser_effect_x_welch_freqs,
+    laser_effect_x_welch_psd,
+    label="x laser-noise effect"
+)
+plt.loglog(
+    laser_effect_y_welch_freqs,
+    laser_effect_y_welch_psd,
+    color="tab:green",
+    label="y laser-noise effect"
+)
+plt.loglog(
+    laser_effect_z_welch_freqs,
+    laser_effect_z_welch_psd,
+    color="tab:orange",
+    label="z laser-noise effect"
+)
+apply_psd_axes()
+plt.title("Welch-averaged PSD of isolated laser-noise displacement effect")
+plt.legend()
+plt.grid(True, which="both")
+finish_plot()
+
+
+# ****************************************************************************************************************************************************
+# Plot 3D trajectory and projections
+# ****************************************************************************************************************************************************
+fig = plt.figure(figsize=trajectory_3d_figsize)
+ax = fig.add_subplot(111, projection="3d")
+
+ax.plot(
+    x_baoab[plot_slice] * 1e6,
+    y_baoab[plot_slice] * 1e6,
+    z_baoab[plot_slice] * 1e6,
+    linewidth=0.8,
+    alpha=0.75,
+    label=laser_power_trajectory_label
+)
+
+if use_pd_feedback:
+    ax.plot(
+        x_baoab_feedback[plot_slice] * 1e6,
+        y_baoab_feedback[plot_slice] * 1e6,
+        z_baoab_feedback[plot_slice] * 1e6,
+        linewidth=0.9,
+        alpha=0.85,
+        label="BAOAB with PD feedback"
+    )
+
+ax.scatter(
+    [x_eq * 1e6],
+    [y_eq * 1e6],
+    [z_eq * 1e6],
+    color="black",
+    s=30,
+    label="equilibrium"
+)
+
+ax.set_xlabel("x / micrometres")
+ax.set_ylabel("y / micrometres")
+ax.set_zlabel("z / micrometres")
+ax.set_title("3D trajectory")
+ax.legend()
+plt.tight_layout()
+finish_plot()
+
+fig, axes = plt.subplots(1, 3, figsize=trajectory_projection_figsize)
+
+axes[0].plot(
+    x_baoab[plot_slice] * 1e6,
+    y_baoab[plot_slice] * 1e6,
+    linewidth=0.8
+)
+axes[0].scatter([x_eq * 1e6], [y_eq * 1e6], color="black", s=20)
+axes[0].set_xlabel("x / micrometres")
+axes[0].set_ylabel("y / micrometres")
+axes[0].set_title("x-y projection")
+axes[0].axis("equal")
+axes[0].grid()
+
+axes[1].plot(
+    x_baoab[plot_slice] * 1e6,
+    z_baoab[plot_slice] * 1e6,
+    linewidth=0.8
+)
+axes[1].scatter([x_eq * 1e6], [z_eq * 1e6], color="black", s=20)
+axes[1].set_xlabel("x / micrometres")
+axes[1].set_ylabel("z / micrometres")
+axes[1].set_title("x-z projection")
+axes[1].axis("equal")
+axes[1].grid()
+
+axes[2].plot(
+    y_baoab[plot_slice] * 1e6,
+    z_baoab[plot_slice] * 1e6,
+    linewidth=0.8
+)
+axes[2].scatter([y_eq * 1e6], [z_eq * 1e6], color="black", s=20)
+axes[2].set_xlabel("y / micrometres")
+axes[2].set_ylabel("z / micrometres")
+axes[2].set_title("y-z projection")
+axes[2].axis("equal")
+axes[2].grid()
+
+fig.suptitle("3D trajectory projections")
+plt.tight_layout()
+finish_plot()
+
+# ****************************************************************************************************************************************************
+# Transverse restoring-force check
+# ****************************************************************************************************************************************************
+# x_scan = np.linspace(
+#     transverse_force_x_min,
+#     transverse_force_x_max,
+#     transverse_force_points
+# )
+# Fx_scan = np.array([F_optical_2d(x_i, z_eq)[0] for x_i in x_scan])
+
+# restoring = Fx_scan * x_scan < 0
+# near_axis = np.abs(x_scan) < near_axis_tolerance
+# restoring_or_axis = restoring | near_axis
+
+# plt.figure(figsize=force_check_figsize)
+# plt.plot(x_scan * 1e6, Fx_scan / (m*g), label="Fx at z_eq")
+# plt.axhline(0, color="black", linewidth=0.8)
+# plt.axvline(0, linestyle=":", color="black", label="beam axis")
+# plt.axvline(x_displacement * 1e6, linestyle="--", label="initial x displacement")
+# plt.axvline(-x_displacement * 1e6, linestyle="--")
+# plt.xlabel("x / micrometres")
+# plt.ylabel("Fx / mg")
+# plt.title("Transverse force check at z = z_eq")
+# plt.legend()
+# plt.grid()
+# plt.show()
+
+# if not np.interp(abs(x_displacement), x_scan[x_scan >= 0], restoring_or_axis[x_scan >= 0].astype(float)) > 0.5:
+#     pass
+#     # print(
+#         # "Warning: the chosen x displacement may be outside the local restoring region. "
+#         # "Try reducing x_displacement."
+#     # )
+
+# # ****************************************************************************************************************************************************
+# # Vertical force breakdown along the beam axis
+# # ****************************************************************************************************************************************************
+# z_force_values = np.linspace(
+#     z_eq - vertical_force_half_width,
+#     z_eq + vertical_force_half_width,
+#     vertical_force_points
+# )
+
+# Fz_ray_scat_values = []
+# Fz_ray_grad_values = []
+
+# for z_i in z_force_values:
+#     _, Fz_scat, _, Fz_grad = F_ray_optics_2d_components_scalar(0.0, z_i)
+#     Fz_ray_scat_values.append(Fz_scat)
+#     Fz_ray_grad_values.append(Fz_grad)
+
+# Fz_ray_scat_values = np.array(Fz_ray_scat_values)
+# Fz_ray_grad_values = np.array(Fz_ray_grad_values)
+# Fz_ray_values = Fz_ray_scat_values + Fz_ray_grad_values
+# Fz_photo_values = np.array([F_photo_2d(0.0, z_i)[1] for z_i in z_force_values])
+# Fz_gravity_values = -m * g * np.ones_like(z_force_values)
+# Fz_total_net_values = Fz_ray_values + Fz_photo_values + Fz_gravity_values
+
+# plt.figure(figsize=force_check_figsize)
+# plt.plot(
+#     z_force_values * 1e6,
+#     Fz_ray_scat_values / (m*g),
+#     label="Ray scattering-like axial force"
+# )
+# plt.plot(
+#     z_force_values * 1e6,
+#     Fz_ray_grad_values / (m*g),
+#     label="Ray gradient-like axial force"
+# )
+# plt.plot(
+#     z_force_values * 1e6,
+#     Fz_ray_values / (m*g),
+#     linestyle="--",
+#     label="Total ray-optics axial force"
+# )
+# plt.plot(z_force_values * 1e6, Fz_photo_values / (m*g), label="Photophoretic force")
+# plt.plot(z_force_values * 1e6, Fz_gravity_values / (m*g), label="Gravity")
+# plt.plot(
+#     z_force_values * 1e6,
+#     Fz_total_net_values / (m*g),
+#     linewidth=2,
+#     label="Total net vertical force"
+# )
+# plt.axhline(0, color="black", linewidth=0.8)
+# plt.axvline(z_eq * 1e6, linestyle=":", color="black", label="equilibrium")
+# plt.xlabel("z / micrometres")
+# plt.ylabel("Force / mg")
+# plt.title("Vertical force breakdown along beam axis")
+# plt.legend()
+# plt.grid()
+# plt.show()
+
+# # ****************************************************************************************************************************************************
+# # Plot an x-z force-field slice through y = 0
+# # ****************************************************************************************************************************************************
+# x_values = np.linspace(force_field_x_min, force_field_x_max, force_field_x_points)
+# z_values = np.linspace(
+#     z_eq - force_field_z_half_width,
+#     z_eq + force_field_z_half_width,
+#     force_field_z_points
+# )
+# X, Z = np.meshgrid(x_values, z_values)
+
+# Fx_field, Fz_field = F_optical_2d(X, Z)
+# Fz_net_field = Fz_field - m*g
+
+# force_scale = m*g
+
+# plt.figure(figsize=force_field_figsize)
+# plt.contourf(
+#     X * 1e6,
+#     Z * 1e6,
+#     intensity(X, Z),
+#     levels=force_field_contour_levels,
+#     cmap="viridis",
+#     alpha=0.75
+# )
+# plt.colorbar(label="Normalized intensity")
+# plt.quiver(
+#     X * 1e6,
+#     Z * 1e6,
+#     Fx_field / force_scale,
+#     Fz_net_field / force_scale,
+#     color="white",
+#     pivot="mid",
+#     scale=force_field_quiver_scale
+# )
+# plt.scatter([x_eq * 1e6], [z_eq * 1e6], color="red", s=35, label="equilibrium")
+
+# plt.xlabel("x / micrometres")
+# plt.ylabel("z / micrometres")
+# plt.title("x-z force-field slice over intensity, y = 0")
+# plt.legend()
+# plt.grid()
+# plt.show()
+
+# # ****************************************************************************************************************************************************
+# # On-axis force check
+# # ****************************************************************************************************************************************************
+# # z_axis = np.linspace(on_axis_check_z_min, on_axis_check_z_max, on_axis_check_points)
+# # Fx_axis, Fz_axis = F_optical_2d(0.0, z_axis)
+
+# # plt.figure(figsize=force_check_figsize)
+# # plt.plot(z_axis * 1e6, Fz_axis, label="upward optical + photophoretic force")
+# # plt.plot(z_axis * 1e6, Fz_axis - m*g, label="net vertical force")
+# # plt.axhline(m*g, linestyle="--", label="gravity mg")
+# # plt.axhline(0, linewidth=0.8, color="black")
+# # plt.axvline(z_eq * 1e6, linestyle=":", label="equilibrium")
+
+# # plt.xlabel("z / micrometres")
+# # plt.ylabel("Force / N")
+# # plt.title("On-axis vertical force check")
+# # plt.legend()
+# # plt.grid()
+# # plt.show()

@@ -640,73 +640,97 @@ plt.tight_layout()
 plt.show()
 
 #****************************************************************************************************************************************************
-#Fourier Tranform 
+# Power spectral density
 #****************************************************************************************************************************************************
 x_signal = x_det - x_eq
 z_signal = z_det - z_eq
 
-dt_fft = t[1] - t[0]
-
-x_signal = x_signal - np.mean(x_signal)
-z_signal = z_signal - np.mean(z_signal)
-
-window = np.hanning(len(t))
-
-x_fft = np.fft.rfft(x_signal * window)
-z_fft = np.fft.rfft(z_signal * window)
-
-freqs = np.fft.rfftfreq(len(t), dt_fft)
-
-x_amp = np.abs(x_fft)
-z_amp = np.abs(z_fft)
-
-sampling_frequency = 1 / dt_fft
+dt_psd = t[1] - t[0]
+sampling_frequency = 1 / dt_psd
 nyquist_frequency = sampling_frequency / 2
-frequency_bin_size = freqs[1] - freqs[0]
-fft_plot_max = 10_000
+frequency_bin_size = sampling_frequency / len(t)
+psd_plot_max = 10_000
 
-print("FFT sampling frequency =", sampling_frequency, "Hz")
-print("FFT Nyquist frequency =", nyquist_frequency, "Hz")
-print("FFT frequency bin size =", frequency_bin_size, "Hz")
+def raw_periodogram_psd(signal):
+    """
+    Return a full-record, non-Welch-averaged one-sided PSD in m^2/Hz.
+    """
+    signal = signal - np.mean(signal)
+    window = np.hanning(len(signal))
+    window_power = np.sum(window**2)
 
-positive_frequency_mask = freqs > 0
-freqs_to_plot = freqs[positive_frequency_mask]
-x_amp_to_plot = x_amp[positive_frequency_mask]
-z_amp_to_plot = z_amp[positive_frequency_mask]
+    fft_values = np.fft.rfft(signal * window)
+    freqs = np.fft.rfftfreq(len(signal), dt_psd)
+    psd = np.abs(fft_values)**2 / (sampling_frequency * window_power)
 
-x_amp_norm_to_plot = x_amp_to_plot / np.max(x_amp_to_plot)
-z_amp_norm_to_plot = z_amp_to_plot / np.max(z_amp_to_plot)
-minimum_resolvable_frequency = freqs_to_plot[0]
-minimum_plot_frequency = 0.95 * minimum_resolvable_frequency
+    if len(psd) > 2:
+        psd[1:-1] *= 2
 
-print("Minimum resolvable non-zero frequency =", minimum_resolvable_frequency, "Hz")
-print("Lower frequency shown on plot =", minimum_plot_frequency, "Hz")
+    return freqs, psd
 
-# Log-log x Fourier spectrum
-plt.figure(figsize=(8, 5))
-plt.loglog(freqs_to_plot, x_amp_norm_to_plot, label="x spectrum")
-plt.axvline(nyquist_frequency, color="red", linestyle=":", label="Nyquist limit")
-plt.xlim(2e0, fft_plot_max/10)
-plt.ylim(1e-12, 1.2)
-plt.xlabel("Frequency / Hz")
-plt.ylabel("Normalized amplitude")
-plt.title("Log-log Fourier spectrum of x motion")
-plt.legend()
-plt.grid(True, which="both")
-plt.show()
 
-# Log-log z Fourier spectrum
-plt.figure(figsize=(8, 5))
-plt.loglog(freqs_to_plot, z_amp_norm_to_plot, color="tab:orange", label="z spectrum")
-plt.axvline(nyquist_frequency, color="red", linestyle=":", label="Nyquist limit")
-plt.xlim(2e0, fft_plot_max/10)
-plt.ylim(1e-12, 1.2)
-plt.xlabel("Frequency / Hz")
-plt.ylabel("Normalized amplitude")
-plt.title("Log-log Fourier spectrum of z motion")
-plt.legend()
-plt.grid(True, which="both")
-plt.show()
+x_psd_freqs, x_psd = raw_periodogram_psd(x_signal)
+z_psd_freqs, z_psd = raw_periodogram_psd(z_signal)
+
+x_positive_psd_mask = (
+    (x_psd_freqs > 0)
+    & np.isfinite(x_psd)
+    & (x_psd > 0)
+)
+z_positive_psd_mask = (
+    (z_psd_freqs > 0)
+    & np.isfinite(z_psd)
+    & (z_psd > 0)
+)
+
+print("Raw PSD sampling frequency =", sampling_frequency, "Hz")
+print("Raw PSD Nyquist frequency =", nyquist_frequency, "Hz")
+print("Raw PSD frequency bin size =", frequency_bin_size, "Hz")
+
+if np.any(x_positive_psd_mask):
+    plt.figure(figsize=(8, 5))
+    plt.loglog(
+        x_psd_freqs[x_positive_psd_mask],
+        x_psd[x_positive_psd_mask] * 1e12,
+        label="x PSD"
+    )
+    plt.axvline(omega_x / (2*np.pi), linestyle="--", label="linear fx")
+    plt.axvline(nyquist_frequency, color="red", linestyle=":", label="Nyquist limit")
+    plt.xlim(
+        max(x_psd_freqs[x_positive_psd_mask][0] * 0.95, 1e-12),
+        min(psd_plot_max / 10, nyquist_frequency)
+    )
+    plt.xlabel("Frequency / Hz")
+    plt.ylabel("Displacement PSD / micrometre$^2$/Hz")
+    plt.title("Raw PSD of x motion")
+    plt.legend()
+    plt.grid(True, which="both")
+    plt.show()
+else:
+    print("Skipping x PSD plot because the x signal has no positive PSD values.")
+
+if np.any(z_positive_psd_mask):
+    plt.figure(figsize=(8, 5))
+    plt.loglog(
+        z_psd_freqs[z_positive_psd_mask],
+        z_psd[z_positive_psd_mask] * 1e12,
+        color="tab:orange",
+        label="z PSD"
+    )
+    plt.axvline(omega_z / (2*np.pi), linestyle="--", label="linear fz")
+    plt.axvline(nyquist_frequency, color="red", linestyle=":", label="Nyquist limit")
+    plt.xlim(
+        max(z_psd_freqs[z_positive_psd_mask][0] * 0.95, 1e-12),
+        min(psd_plot_max / 10, nyquist_frequency)
+    )
+    plt.xlabel("Frequency / Hz")
+    plt.ylabel("Displacement PSD / micrometre$^2$/Hz")
+    plt.title("Raw PSD of z motion")
+    plt.legend()
+    plt.grid(True, which="both")
+    plt.show()
+else:
+    print("Skipping z PSD plot because the z signal has no positive PSD values.")
 
 
 # ****************************************************************************************************************************************************

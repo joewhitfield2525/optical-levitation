@@ -1,7 +1,9 @@
 import time
+from pathlib import Path
 
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.ticker import FixedLocator, FuncFormatter, LogLocator
 from scipy.integrate import solve_ivp
 
 
@@ -20,6 +22,26 @@ v0 = 0.0
 t_start = 0.0
 t_end = 5.0
 t_eval = np.linspace(t_start, t_end, 5000)
+
+output_dir = Path("/Users/josephwhitfield/Documents/optical levitation/solver_validation_plots")
+output_dir.mkdir(parents=True, exist_ok=True)
+
+
+def format_decimal_tick(value, _position):
+    if value <= 0:
+        return ""
+    return f"{value:.3g}"
+
+
+def use_more_numeric_log_x_ticks(ax, fixed_ticks=None):
+    if fixed_ticks is None:
+        ax.xaxis.set_major_locator(LogLocator(base=10.0, subs=(1, 2, 3, 5, 7), numticks=20))
+    else:
+        ax.xaxis.set_major_locator(FixedLocator(np.sort(fixed_ticks)))
+
+    ax.xaxis.set_major_formatter(FuncFormatter(format_decimal_tick))
+    ax.xaxis.set_minor_locator(LogLocator(base=10.0, subs=np.arange(1, 10), numticks=50))
+    ax.tick_params(axis="x", which="major", labelrotation=0)
 
 
 # ---------------------------------------------------------------------
@@ -323,6 +345,176 @@ plt.ylabel("|(E(t) - E(0)) / E(0)|")
 plt.title("Absolute relative energy error, undamped oscillator")
 plt.legend()
 plt.grid(True, which="both")
+plt.show()
+
+
+# ---------------------------------------------------------------------
+# Deterministic timestep-convergence test
+# ---------------------------------------------------------------------
+# This test removes stochastic terms and compares the damped harmonic
+# oscillator against its analytic solution while restricting the maximum
+# timestep used by each deterministic solver.
+#
+# The plotted error is normalised by the initial displacement amplitude:
+#
+#     RMS trajectory error = sqrt(mean((x_num - x_exact)^2)) / |x0|
+#
+# A straight line on the log-log plot indicates power-law convergence.
+
+validation_period = 2.0 * np.pi / omega0
+convergence_dt_values = validation_period / np.array(
+    [4, 6, 8, 12, 16, 24, 32, 48, 64],
+    dtype=float,
+)
+convergence_results = {}
+
+for method in methods:
+    method_dt_values = []
+    method_rms_errors = []
+    method_max_errors = []
+    method_runtimes = []
+
+    for dt_value in convergence_dt_values:
+        convergence_t_eval = np.arange(
+            t_start,
+            t_end + 0.5 * dt_value,
+            dt_value,
+        )
+        convergence_t_eval = convergence_t_eval[convergence_t_eval <= t_end]
+        if convergence_t_eval[-1] < t_end:
+            convergence_t_eval = np.append(convergence_t_eval, t_end)
+
+        x_exact_dt, _ = analytic_solution(convergence_t_eval)
+
+        start = time.perf_counter()
+        sol = solve_ivp(
+            damped_oscillator,
+            [t_start, t_end],
+            [x0, v0],
+            t_eval=convergence_t_eval,
+            method=method,
+            max_step=dt_value,
+            rtol=1.0e-3,
+            atol=[1.0e-9, 1.0e-9],
+        )
+        runtime = time.perf_counter() - start
+
+        if not sol.success:
+            print(method, "failed in convergence test:", sol.message)
+            continue
+
+        displacement_error = sol.y[0] - x_exact_dt
+        normalisation = max(abs(x0), 1.0e-30)
+        rms_error = np.sqrt(np.mean(displacement_error**2)) / normalisation
+        max_error = np.max(np.abs(displacement_error)) / normalisation
+
+        method_dt_values.append(dt_value)
+        method_rms_errors.append(rms_error)
+        method_max_errors.append(max_error)
+        method_runtimes.append(runtime)
+
+    method_dt_values = np.asarray(method_dt_values)
+    method_rms_errors = np.asarray(method_rms_errors)
+    method_max_errors = np.asarray(method_max_errors)
+    method_runtimes = np.asarray(method_runtimes)
+
+    finite_mask = (
+        np.isfinite(method_dt_values)
+        & np.isfinite(method_rms_errors)
+        & (method_dt_values > 0)
+        & (method_rms_errors > 0)
+    )
+
+    if np.count_nonzero(finite_mask) >= 3:
+        # Fit the smallest timesteps, where the asymptotic convergence trend is
+        # most likely to dominate.
+        fit_indices = np.where(finite_mask)[0][-4:]
+        observed_order, log_prefactor = np.polyfit(
+            np.log(method_dt_values[fit_indices]),
+            np.log(method_rms_errors[fit_indices]),
+            1,
+        )
+    else:
+        observed_order = np.nan
+        log_prefactor = np.nan
+
+    convergence_results[method] = {
+        "dt": method_dt_values,
+        "rms_error": method_rms_errors,
+        "max_error": method_max_errors,
+        "runtime": method_runtimes,
+        "observed_order": observed_order,
+        "log_prefactor": log_prefactor,
+    }
+
+print()
+print("Deterministic solver convergence test")
+print(
+    f"{'method':<8} "
+    f"{'observed order':>16} "
+    f"{'RMS err @ min dt':>18} "
+    f"{'max err @ min dt':>18}"
+)
+
+for method, data in convergence_results.items():
+    if len(data["dt"]) == 0:
+        continue
+    min_dt_index = int(np.argmin(data["dt"]))
+    print(
+        f"{method:<8} "
+        f"{data['observed_order']:>16.5g} "
+        f"{data['rms_error'][min_dt_index]:>18.5e} "
+        f"{data['max_error'][min_dt_index]:>18.5e}"
+    )
+
+plt.figure(figsize=(9, 5))
+
+for method, data in convergence_results.items():
+    if len(data["dt"]) == 0:
+        continue
+    label = method
+    if np.isfinite(data["observed_order"]):
+        label += f" (order {data['observed_order']:.2g})"
+    plt.loglog(
+        data["dt"],
+        data["rms_error"],
+        "o-",
+        label=label,
+    )
+
+plt.xlabel("Maximum solver timestep / s")
+plt.ylabel("Normalised RMS displacement error")
+plt.title("Deterministic solver convergence")
+plt.legend(fontsize=8)
+plt.grid(True, which="both")
+use_more_numeric_log_x_ticks(
+    plt.gca(),
+    fixed_ticks=np.array([0.003, 0.004, 0.006, 0.008, 0.01, 0.02, 0.03, 0.05]),
+)
+plt.tight_layout()
+plt.savefig(output_dir / "deterministic_solver_convergence_error_vs_timestep.png", dpi=220)
+plt.show()
+
+plt.figure(figsize=(9, 5))
+
+for method, data in convergence_results.items():
+    if len(data["runtime"]) == 0:
+        continue
+    plt.loglog(
+        data["runtime"],
+        data["rms_error"],
+        "o-",
+        label=method,
+    )
+
+plt.xlabel("Runtime / s")
+plt.ylabel("Normalised RMS displacement error")
+plt.title("Deterministic solver accuracy vs runtime")
+plt.legend(fontsize=8)
+plt.grid(True, which="both")
+use_more_numeric_log_x_ticks(plt.gca())
+plt.tight_layout()
+plt.savefig(output_dir / "deterministic_solver_accuracy_vs_runtime.png", dpi=220)
 plt.show()
 
 
