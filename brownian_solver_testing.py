@@ -79,11 +79,23 @@ print("Theoretical v RMS =", v_rms_theory, "m/s")
 # =============================================================================
 # Benchmark controls
 # =============================================================================
-t_end = 20.0
+default_t_end = 50.0
 burn_in_fraction = 0.10
 
-dt_values = np.array([5.0e-4, 2.0e-4, 1.0e-4, 5.0e-5])
-seeds = np.array([101, 203, 307, 409, 503, 607, 709, 811])
+dt_values = np.array([5.0e-4, 2.0e-4, 1.0e-4, 5.0e-5, 1.0e-5, 1.0e-6])
+seeds = np.array([
+    101, 203, 307, 409, 503, 607, 709, 811,
+    907, 1009, 1103, 1201, 1301, 1409, 1511, 1601,
+])
+duration_by_dt = {
+    1.0e-5: 10.0,
+    1.0e-6: 0.5,
+}
+# The finest timestep remains short to keep the benchmark runtime practical.
+# The printed table reports the simulated duration used for each timestep.
+strong_error_t_end = 0.2
+strong_error_dt_reference = 2.0e-7
+strong_error_seeds = seeds[:4]
 
 x0 = 0.0
 v0 = 0.0
@@ -306,8 +318,14 @@ def analyse_solution(x, v, dt, runtime):
     return {
         "runtime": runtime,
         "unstable": unstable,
+        "x_variance": x_variance,
+        "v_variance": v_variance,
+        "x_sample_count": len(x_analysis),
+        "v_sample_count": len(v_analysis),
         "x_rms_ratio": x_rms_ratio,
         "v_rms_ratio": v_rms_ratio,
+        "x_rms_percent_error": abs(x_rms_ratio - 1.0) * 100.0,
+        "v_rms_percent_error": abs(v_rms_ratio - 1.0) * 100.0,
         "x_variance_error": abs(x_variance / x_variance_theory - 1.0),
         "v_variance_error": abs(v_variance / v_variance_theory - 1.0),
     }
@@ -340,6 +358,68 @@ def grouped_stable_fraction(rows, method_name, dt):
     if len(selected) == 0:
         return np.nan
     return np.mean([not row["unstable"] for row in selected])
+
+
+def grouped_runtime_per_simulated_second(rows, method_name, dt):
+    values = np.array(
+        [
+            row["runtime"] / row["simulated_duration"]
+            for row in rows
+            if row["method"] == method_name and np.isclose(row["dt"], dt)
+            and row["simulated_duration"] > 0
+        ],
+        dtype=float,
+    )
+    values = values[np.isfinite(values)]
+    if len(values) == 0:
+        return np.nan, np.nan
+    if len(values) == 1:
+        return values[0], 0.0
+    return np.mean(values), np.std(values, ddof=1)
+
+
+def grouped_pooled_rms_percent_error(
+    rows,
+    method_name,
+    dt,
+    variance_metric,
+    count_metric,
+    variance_theory,
+    *,
+    n_bootstrap=500,
+):
+    selected = [
+        row
+        for row in rows
+        if row["method"] == method_name and np.isclose(row["dt"], dt)
+        and not row["unstable"]
+        and np.isfinite(row[variance_metric])
+    ]
+    if len(selected) == 0:
+        return np.nan, np.nan
+
+    variances = np.array([row[variance_metric] for row in selected], dtype=float)
+    counts = np.array([row[count_metric] for row in selected], dtype=float)
+    pooled_variance = np.average(variances, weights=counts)
+    pooled_error = abs(np.sqrt(pooled_variance / variance_theory) - 1.0) * 100.0
+
+    if len(selected) == 1:
+        return pooled_error, 0.0
+
+    bootstrap_errors = []
+    rng = np.random.default_rng(12345)
+    indices = np.arange(len(selected))
+    for _ in range(n_bootstrap):
+        sample_indices = rng.choice(indices, size=len(indices), replace=True)
+        sample_variance = np.average(
+            variances[sample_indices],
+            weights=counts[sample_indices],
+        )
+        bootstrap_errors.append(
+            abs(np.sqrt(sample_variance / variance_theory) - 1.0) * 100.0
+        )
+
+    return pooled_error, np.std(bootstrap_errors, ddof=1)
 
 
 def offset_timestep_values(dt_array, method_name):
@@ -388,9 +468,32 @@ def plot_log_errorbar(
 
 
 def set_log_x_decimal_ticks(ax):
-    tick_values = np.array([5.0e-5, 1.0e-4, 2.0e-4, 5.0e-4])
+    tick_values = np.array([1.0e-6, 1.0e-5, 5.0e-5, 1.0e-4, 2.0e-4, 5.0e-4])
     ax.set_xticks(tick_values)
     ax.set_xticklabels([f"{value:g}" for value in tick_values])
+
+
+def aggregate_brownian_normals(reference_normals, step_ratio):
+    n_coarse_steps = len(reference_normals) // step_ratio
+    trimmed = reference_normals[:n_coarse_steps * step_ratio]
+    return trimmed.reshape(n_coarse_steps, step_ratio).sum(axis=1) / np.sqrt(step_ratio)
+
+
+def grouped_strong_error(rows, method_name, dt, metric):
+    values = np.array(
+        [
+            row[metric]
+            for row in rows
+            if row["method"] == method_name and np.isclose(row["dt"], dt)
+        ],
+        dtype=float,
+    )
+    values = values[np.isfinite(values)]
+    if len(values) == 0:
+        return np.nan, np.nan
+    if len(values) == 1:
+        return values[0], 0.0
+    return np.mean(values), np.std(values, ddof=1)
 
 
 # =============================================================================
@@ -403,6 +506,7 @@ print("\nRunning stochastic solver benchmark")
 print(
     f"{'method':<24} "
     f"{'dt/s':>10} "
+    f"{'duration/s':>12} "
     f"{'seed':>8} "
     f"{'runtime/s':>12} "
     f"{'status':>10} "
@@ -412,7 +516,9 @@ print(
 )
 
 for dt in dt_values:
-    n_steps = int(round(t_end / dt))
+    simulated_duration_target = duration_by_dt.get(float(dt), default_t_end)
+    n_steps = int(round(simulated_duration_target / dt))
+    simulated_duration = n_steps * dt
 
     for seed in seeds:
         rng = np.random.default_rng(int(seed))
@@ -425,6 +531,7 @@ for dt in dt_values:
             row = {
                 "method": method_name,
                 "dt": dt,
+                "simulated_duration": simulated_duration,
                 "seed": int(seed),
                 **metrics,
             }
@@ -442,6 +549,7 @@ for dt in dt_values:
                 print(
                     f"{method_name:<24} "
                     f"{dt:>10.1e} "
+                    f"{simulated_duration:>12.3g} "
                     f"{int(seed):>8} "
                     f"{runtime:>12.5g} "
                     f"{status:>10} "
@@ -453,6 +561,7 @@ for dt in dt_values:
                 print(
                     f"{method_name:<24} "
                     f"{dt:>10.1e} "
+                    f"{simulated_duration:>12.3g} "
                     f"{int(seed):>8} "
                     f"{runtime:>12.5g} "
                     f"{status:>10} "
@@ -492,6 +601,67 @@ for method_name in integrators:
             f"{error_text} "
             f"{runtime_text}"
         )
+
+
+# =============================================================================
+# Strong trajectory error against a fine BAOAB reference
+# =============================================================================
+strong_error_rows = []
+reference_steps = int(round(strong_error_t_end / strong_error_dt_reference))
+
+print("\nStrong trajectory error against fine-BAOAB reference")
+print(
+    f"{'method':<24} "
+    f"{'dt/s':>10} "
+    f"{'seed':>8} "
+    f"{'max |dx|/nm':>14} "
+    f"{'RMS |dx|/nm':>14}"
+)
+
+for seed in strong_error_seeds:
+    rng = np.random.default_rng(int(seed))
+    reference_normals = rng.normal(size=reference_steps)
+    x_reference, _, _ = integrate_baoab(
+        strong_error_dt_reference,
+        reference_normals,
+    )
+
+    for dt in dt_values:
+        step_ratio = int(round(dt / strong_error_dt_reference))
+
+        if step_ratio < 1 or not np.isclose(
+            step_ratio * strong_error_dt_reference,
+            dt,
+            rtol=0.0,
+            atol=1.0e-15
+        ):
+            continue
+
+        coarse_normals = aggregate_brownian_normals(reference_normals, step_ratio)
+        x_reference_at_dt = x_reference[::step_ratio][:len(coarse_normals) + 1]
+
+        for method_name, integrator in integrators.items():
+            x_test, _, _ = integrator(dt, coarse_normals)
+            displacement_error = x_test[:len(x_reference_at_dt)] - x_reference_at_dt
+            max_error_nm = np.max(np.abs(displacement_error)) * 1.0e9
+            rms_error_nm = np.sqrt(np.mean(displacement_error**2)) * 1.0e9
+
+            strong_error_rows.append(
+                {
+                    "method": method_name,
+                    "dt": dt,
+                    "seed": int(seed),
+                    "max_position_error_nm": max_error_nm,
+                    "rms_position_error_nm": rms_error_nm,
+                }
+            )
+            print(
+                f"{method_name:<24} "
+                f"{dt:>10.1e} "
+                f"{int(seed):>8} "
+                f"{max_error_nm:>14.5g} "
+                f"{rms_error_nm:>14.5g}"
+            )
 
 
 # =============================================================================
@@ -535,7 +705,87 @@ save_plot("brownian_solver_variance_error_vs_timestep.png")
 
 
 # =============================================================================
-# Plot 2: accuracy vs runtime
+# Plot 2: velocity variance error vs timestep
+# =============================================================================
+plt.figure(figsize=(9, 5))
+
+for method_name in integrators:
+    mean_errors = []
+    std_errors = []
+
+    for dt in dt_values:
+        mean_error, std_error = grouped_metric(
+            rows,
+            method_name,
+            dt,
+            "v_variance_error",
+        )
+        mean_errors.append(mean_error)
+        std_errors.append(std_error)
+
+    plot_log_errorbar(
+        dt_values,
+        mean_errors,
+        std_errors,
+        method_name,
+        offset_timestep=True,
+    )
+
+ax = plt.gca()
+ax.set_xscale("log")
+ax.set_yscale("log")
+set_log_x_decimal_ticks(ax)
+plt.xlabel("Timestep / s")
+plt.ylabel(r"mean $|\mathrm{var}(v)_\mathrm{sim}/\mathrm{var}(v)_\mathrm{theory} - 1|$")
+plt.title("Stochastic solver velocity variance error vs timestep")
+plt.legend(fontsize=8)
+plt.grid(True, which="both", alpha=0.35)
+plt.tight_layout()
+save_plot("brownian_solver_velocity_variance_error_vs_timestep.png")
+
+
+# =============================================================================
+# Plot 3: strong trajectory error vs timestep
+# =============================================================================
+plt.figure(figsize=(9, 5))
+
+for method_name in integrators:
+    mean_errors = []
+    std_errors = []
+
+    for dt in dt_values:
+        mean_error, std_error = grouped_strong_error(
+            strong_error_rows,
+            method_name,
+            dt,
+            "max_position_error_nm",
+        )
+        mean_errors.append(mean_error)
+        std_errors.append(std_error)
+
+    plot_log_errorbar(
+        dt_values,
+        mean_errors,
+        std_errors,
+        method_name,
+        offset_timestep=True,
+    )
+
+ax = plt.gca()
+ax.set_xscale("log")
+ax.set_yscale("log")
+set_log_x_decimal_ticks(ax)
+plt.xlabel("Timestep / s")
+plt.ylabel("Mean maximum trajectory error / nm")
+plt.title("Strong trajectory error vs fine BAOAB reference")
+plt.legend(fontsize=8)
+plt.grid(True, which="both", alpha=0.35)
+plt.tight_layout()
+save_plot("brownian_solver_strong_position_error_vs_timestep.png")
+
+
+# =============================================================================
+# Plot 4: accuracy vs runtime
 # =============================================================================
 plt.figure(figsize=(9, 5))
 
@@ -570,30 +820,29 @@ save_plot("brownian_solver_accuracy_vs_runtime.png")
 
 
 # =============================================================================
-# Plot 3: RMS ratio vs timestep
+# Plot 5: runtime per simulated second vs timestep
 # =============================================================================
 plt.figure(figsize=(9, 5))
 
 for method_name in integrators:
-    mean_ratios = []
-    std_ratios = []
+    mean_runtime_rates = []
+    std_runtime_rates = []
 
     for dt in dt_values:
-        mean_ratio, std_ratio = grouped_metric(
+        mean_runtime_rate, std_runtime_rate = grouped_runtime_per_simulated_second(
             rows,
             method_name,
             dt,
-            "x_rms_ratio",
         )
-        mean_ratios.append(mean_ratio)
-        std_ratios.append(std_ratio)
+        mean_runtime_rates.append(mean_runtime_rate)
+        std_runtime_rates.append(std_runtime_rate)
 
-    finite = np.isfinite(mean_ratios)
     style = method_styles.get(method_name, {})
+    finite = np.isfinite(mean_runtime_rates) & (np.asarray(mean_runtime_rates) > 0)
     plt.errorbar(
         offset_timestep_values(dt_values[finite], method_name),
-        np.asarray(mean_ratios)[finite],
-        yerr=np.asarray(std_ratios)[finite],
+        np.asarray(mean_runtime_rates)[finite],
+        yerr=np.asarray(std_runtime_rates)[finite],
         color=style.get("color"),
         marker=style.get("marker", "o"),
         linestyle=style.get("linestyle", "-"),
@@ -607,19 +856,61 @@ for method_name in integrators:
 
 ax = plt.gca()
 ax.set_xscale("log")
+ax.set_yscale("log")
 set_log_x_decimal_ticks(ax)
-plt.axhline(1.0, color="black", linestyle="--", linewidth=1.2, label="ideal = 1")
 plt.xlabel("Timestep / s")
-plt.ylabel(r"mean RMS$(x)_\mathrm{sim}$ / RMS$(x)_\mathrm{theory}$")
-plt.title("Thermal RMS preservation")
+plt.ylabel("Runtime per simulated second")
+plt.title("Stochastic solver computational cost")
 plt.legend(fontsize=8)
 plt.grid(True, which="both", alpha=0.35)
 plt.tight_layout()
-save_plot("brownian_solver_rms_ratio_vs_timestep.png")
+save_plot("brownian_solver_runtime_per_simulated_second.png")
 
 
 # =============================================================================
-# Plot 4: stability fraction
+# Plot 6: RMS percentage error vs timestep
+# =============================================================================
+plt.figure(figsize=(9, 5))
+
+for method_name in integrators:
+    mean_errors = []
+    std_errors = []
+
+    for dt in dt_values:
+        mean_error, std_error = grouped_pooled_rms_percent_error(
+            rows,
+            method_name,
+            dt,
+            "x_variance",
+            "x_sample_count",
+            x_variance_theory,
+        )
+        mean_errors.append(mean_error)
+        std_errors.append(std_error)
+
+    plot_log_errorbar(
+        dt_values,
+        mean_errors,
+        std_errors,
+        method_name,
+        offset_timestep=True,
+    )
+
+ax = plt.gca()
+ax.set_xscale("log")
+ax.set_yscale("log")
+set_log_x_decimal_ticks(ax)
+plt.xlabel("Timestep / s")
+plt.ylabel("RMS error / %")
+plt.title("Pooled thermal RMS error vs timestep")
+plt.legend(fontsize=8)
+plt.grid(True, which="both", alpha=0.35)
+plt.tight_layout()
+save_plot("brownian_solver_pooled_rms_percentage_error_vs_timestep.png")
+
+
+# =============================================================================
+# Plot 7: stability fraction
 # =============================================================================
 plt.figure(figsize=(9, 5))
 
@@ -656,7 +947,7 @@ save_plot("brownian_solver_stability_fraction.png")
 
 
 # =============================================================================
-# Plot 5: PSD comparison for representative timestep
+# Plot 7: PSD comparison for representative timestep
 # =============================================================================
 plt.figure(figsize=(9, 5))
 
@@ -695,7 +986,7 @@ save_plot("brownian_solver_psd_comparison.png")
 
 
 # =============================================================================
-# Plot 6: example trajectories
+# Plot 8: example trajectories
 # =============================================================================
 plt.figure(figsize=(9, 5))
 

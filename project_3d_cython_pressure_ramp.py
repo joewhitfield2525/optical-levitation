@@ -1,4 +1,6 @@
 import numpy as np
+import os
+import matplotlib as mpl
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 from scipy.interpolate import RegularGridInterpolator
@@ -8,6 +10,7 @@ from scipy.special import spherical_jn, spherical_yn
 from time import perf_counter
 
 from pathlib import Path
+import csv
 import sys
 
 CYTHON_DIR = Path(__file__).resolve().parent
@@ -46,6 +49,44 @@ except ImportError:
 
 script_start_time = perf_counter()
 
+# --- Publication style ---
+fontsize = 7
+mpl.rcParams.update({
+    # Figure
+    "figure.figsize": (3.4, 2.6),  # single column
+    "figure.dpi": 300,
+    "figure.facecolor": "white",
+    "savefig.facecolor": "white",
+    "savefig.transparent": False,
+    "axes.facecolor": "white",
+    # Font
+    "font.family": "sans-serif",
+    "font.size": fontsize,
+    "axes.labelsize": fontsize,
+    "axes.titlesize": fontsize,
+    "xtick.labelsize": fontsize - 1,
+    "ytick.labelsize": fontsize - 1,
+    "legend.fontsize": fontsize - 1,
+    # Lines
+    "lines.linewidth": 1.5,
+    "lines.markersize": 4,
+    # Axes
+    "axes.linewidth": 0.8,
+    "xtick.direction": "in",
+    "ytick.direction": "in",
+    "xtick.top": True,
+    "ytick.right": True,
+    # Grid
+    "grid.linestyle": ":",
+    "grid.linewidth": 0.5,
+    "grid.alpha": 0.6,
+    # Remove top/right spine? (optional)
+    # "axes.spines.top": False,
+    # "axes.spines.right": False,
+})
+save_path = "./pressure_ramp/"
+os.makedirs(save_path, exist_ok=True)
+
 # ****************************************************************************************************************************************************
 # Constants
 # ****************************************************************************************************************************************************
@@ -62,11 +103,11 @@ n_particle = 1.555      # particle refractive index
 n_medium = 1.00027     # surrounding medium refractive index, air
 
 # Gas properties
-p = 100000        # pressure, Pa
+p = 800     # pressure, Pa
 pressure_ramp_start = p
-pressure_ramp_mid = 1000.0
-pressure_ramp_end = 1.0
-pressure_ramp_stage_duration = 1000.0
+pressure_ramp_mid = p
+pressure_ramp_end = 400
+pressure_ramp_stage_duration = 2000.0
 pressure_ramp_profile = "log"
 T = 300           # impinging/ambient gas temperature, K
 eta = 1.8e-5      # dynamic viscosity of air, Pa s
@@ -76,13 +117,13 @@ kB = 1.38e-23
 d_air = 3.7e-10
 
 # Laser / force parameters
-w0 = 1.75e-6        # beam waist, m
+w0 = 2.97e-6        # beam waist, m
 wavelength = 532e-9
 M2 = 1.2
 use_m2_rayleigh_range = True
 zR_manual = 100e-6
-P_laser = 0.1             # W, example laser power
-use_laser_power_noise = False
+P_laser = 0.3             # W, example laser power
+use_laser_power_noise = True
 laser_noise_fraction = 0.01
 laser_noise_frequency=300
 laser_noise_step_duration = 1/laser_noise_frequency     # s
@@ -117,10 +158,10 @@ force_lookup_r_min = 0.0
 force_lookup_r_base_max = 80e-6
 force_lookup_r_displacement_factor = 4
 force_lookup_r_thermal_factor = 8
-force_lookup_z_base_half_width = 3.0e-3
+force_lookup_z_base_half_width = 3000e-6
 force_lookup_z_displacement_factor = 4
 force_lookup_z_thermal_factor = 8
-truncate_pressure_ramp_plot_at_lookup_exit = True
+truncate_pressure_ramp_plot_at_lookup_exit = False
 
 # Equilibrium and derivative settings
 x_equilibrium = 0.0
@@ -134,6 +175,7 @@ root_finding_rtol = 1e-15
 numerical_derivative_step = 1e-9
 
 # Damping model
+damping=True
 drag_model = "auto"
 # Choose one of:
 #   "stokes"       continuum Stokes drag, best for Kn << 1
@@ -144,6 +186,7 @@ cunningham_A = 1.257
 cunningham_B = 0.4
 cunningham_C = 1.1
 epstein_accommodation_alpha = 1.0
+drag_transition_half_width_decades = 0.5
 
 # Initial conditions relative to the chosen equilibrium
 x_displacement = 0e-6
@@ -155,21 +198,29 @@ vz0 = 0.0
 
 # Time integration
 t_start = 0
-t_end = 2000.0
-dt_baoab = 1 / 20000
-brownian_seed = 9
-laser_noise_seed = 12
+t_end = pressure_ramp_stage_duration
+dt_baoab = 1 / 300000
+brownian_seed = 900
+laser_noise_seed = 789
 
-# Trap-loss termination
-# The automatic limits are intentionally wider than the thermal motion but
-# local to the trapped region. Set either manual limit to a number in metres to
-# override the corresponding automatic value.
+# Set to False to run with Brownian motion (thermal noise kicks) switched
+# off entirely -- the BAOAB integrator still runs, but the random thermal
+# velocity kick each step is zero, so the only remaining stochastic driving
+# is laser-power noise (if use_laser_power_noise is also True).
+use_brownian_motion = True
+
+# Trap-loss termination is disabled so the particle is tracked for the full requested time range.
 terminate_on_trap_loss = False
-trap_loss_check_interval_steps = 20000
+trap_loss_check_interval_steps = 1000
 trap_loss_radial_limit_manual = None
 trap_loss_axial_limit_manual = None
 trap_loss_radial_beam_waists = 10.0
 trap_loss_axial_rayleigh_ranges = 3.0
+trap_loss_sustained_outside_time = 0.1
+trap_loss_prediction_time = 0.1
+trap_loss_prediction_steps = 200
+trap_loss_reentry_tolerance = 0.98
+trap_loss_post_loss_plot_time = 3.0
 
 # Optional laser feedback loop
 # Set this to True to add a delayed PD loop that reads z and varies laser power.
@@ -192,7 +243,7 @@ radial_zero_tolerance = 1e-30
 near_axis_tolerance = 1e-12
 
 # Plotting and diagnostic ranges
-display_plots = True
+display_plots = False
 max_plot_points = 200000
 psd_plot_max_frequency_override = None
 psd_min_frequency_factor = 0.95
@@ -228,8 +279,79 @@ trajectory_projection_figsize = (13, 4)
 force_check_figsize = (8, 5)
 force_field_figsize = (8, 6)
 
+# Single-column publication-width variants, used for the stacked multi-panel
+# time-trace figures (3 rows) and the detector-resolution/PSD figure (2 rows).
+# Height is tuned per layout so titles/legends/x-axis labels don't get
+# clipped at the narrower width -- do not shrink these further without
+# re-checking with a rendered test figure.
+time_trace_multipanel_figsize = (3.4, 5.6)
 
-def finish_plot():
+# Shades a vertical rectangle from unstable_region_start_time to
+# unstable_region_end_time (in seconds, on the time axis) across the main
+# pressure-ramp trajectory plot, to mark the window where burst/jump
+# behaviour is observed. Set either value to None to disable the shading.
+# Adjust these to match where the bursts actually start/stop in your run.
+unstable_region_start_time = None
+unstable_region_end_time = None
+# Taller variant for the "with/without laser-power noise" comparison: its
+# legend labels are long enough that a single 3-column legend row overflows
+# the single-column width, so that block uses a 1-column (stacked) legend
+# and needs the extra height to fit it without overlapping the top panel.
+time_trace_multipanel_legend3_figsize = (3.4, 6.1)
+detector_resolution_figsize = (3.4, 4.8)
+
+
+def save_plot_data_csv(fig, csv_path):
+    rows = []
+
+    for axis_index, axis in enumerate(fig.axes):
+        axis_name = axis.get_ylabel() or axis.get_title() or f"axis_{axis_index}"
+
+        for line_index, line in enumerate(axis.get_lines()):
+            x_data = np.asarray(line.get_xdata(orig=False), dtype=float)
+            y_data = np.asarray(line.get_ydata(orig=False), dtype=float)
+
+            if x_data.size == 0 or y_data.size == 0:
+                continue
+
+            label = line.get_label()
+            if label is None or label.startswith("_"):
+                label = f"line_{line_index}"
+
+            for x_value, y_value in zip(x_data, y_data):
+                rows.append((axis_index, axis_name, label, x_value, y_value))
+
+    with open(csv_path, "w", newline="") as csv_file:
+        writer = csv.writer(csv_file)
+        writer.writerow(["axis_index", "axis_name", "line_label", "x", "y"])
+        writer.writerows(rows)
+
+
+def make_legends_transparent(fig):
+    fig.patch.set_alpha(1.0)
+    fig.patch.set_facecolor("white")
+
+    for axis in fig.axes:
+        axis.patch.set_alpha(1.0)
+        axis.patch.set_facecolor("white")
+
+        legend = axis.get_legend()
+        if legend is not None:
+            legend.set_frame_on(False)
+
+    for legend in fig.legends:
+        legend.set_frame_on(False)
+
+
+def finish_plot(name=None, fig=None):
+    target_fig = fig if fig is not None else plt.gcf()
+
+    if name is not None:
+        make_legends_transparent(target_fig)
+        save_plot_data_csv(target_fig, os.path.join(save_path, f"{name}.csv"))
+        target_fig.savefig(os.path.join(save_path, f"{name}.pdf"), bbox_inches="tight", facecolor="white", transparent=False)
+        target_fig.savefig(os.path.join(save_path, f"{name}.png"), bbox_inches="tight", facecolor="white", transparent=False)
+
     if display_plots:
         plt.show()
     else:
@@ -1236,6 +1358,10 @@ for root in roots:
     if slope < 0:
         stable_roots.append(root)
 
+x_eq = x_equilibrium
+y_eq = y_equilibrium
+selected_equilibrium_is_stable = True
+
 if len(stable_roots) == 0:
     print("No stable on-axis equilibrium found.")
     print(
@@ -1251,17 +1377,23 @@ if len(stable_roots) == 0:
             "z range. Try regenerating it with a higher lmax and/or wider "
             "z range."
         )
-    raise ValueError("No stable on-axis equilibrium found.")
-
-if not -len(stable_roots) <= equilibrium_root_index < len(stable_roots):
-    raise IndexError(
-        "equilibrium_root_index is outside the stable root list. "
-        f"Found {len(stable_roots)} stable root(s)."
+    fallback_index = int(np.argmin(np.abs(F_scan)))
+    z_eq = z_scan[fallback_index]
+    selected_equilibrium_is_stable = False
+    print(
+        "Continuing pressure-ramp run from the least-unbalanced on-axis "
+        "scan point: z =",
+        z_eq * 1e6,
+        "micrometres, Fz_net / mg =",
+        F_scan[fallback_index] / (m * g)
     )
-
-x_eq = x_equilibrium
-y_eq = y_equilibrium
-z_eq = stable_roots[equilibrium_root_index]
+else:
+    if not -len(stable_roots) <= equilibrium_root_index < len(stable_roots):
+        raise IndexError(
+            "equilibrium_root_index is outside the stable root list. "
+            f"Found {len(stable_roots)} stable root(s)."
+        )
+    z_eq = stable_roots[equilibrium_root_index]
 
 # print("Chosen equilibrium x =", x_eq * 1e6, "micrometres")
 # print("Chosen equilibrium y =", y_eq * 1e6, "micrometres")
@@ -1288,15 +1420,16 @@ ky = kx
 kz = -numerical_derivative_1d(Fz_net_at_z, z_eq)
 
 if kx <= 0 or kz <= 0:
-    raise ValueError(
-        "The selected equilibrium is not stable. "
+    selected_equilibrium_is_stable = False
+    print(
+        "Warning: selected reference point is not a stable 3D equilibrium; "
         f"kx={kx:.3e} N/m, kz={kz:.3e} N/m. "
-        "Check the ray-optics force signs, laser power, search range, or chosen root."
+        "Continuing so the pressure-ramp trajectory can still be plotted."
     )
 
-omega_x = np.sqrt(kx / m)
-omega_y = np.sqrt(ky / m)
-omega_z = np.sqrt(kz / m)
+omega_x = np.sqrt(kx / m) if kx > 0 else np.nan
+omega_y = np.sqrt(ky / m) if ky > 0 else np.nan
+omega_z = np.sqrt(kz / m) if kz > 0 else np.nan
 
 print("kx =", kx, "N/m")
 # print("ky =", ky, "N/m")
@@ -1305,9 +1438,9 @@ print("kz =", kz, "N/m")
 # print("fy =", omega_y / (2*np.pi), "Hz")
 # print("fz =", omega_z / (2*np.pi), "Hz")
 
-x_rms_thermal = np.sqrt(kB * T / kx)
-y_rms_thermal = np.sqrt(kB * T / ky)
-z_rms_thermal = np.sqrt(kB * T / kz)
+x_rms_thermal = np.sqrt(kB * T / kx) if kx > 0 else 0.0
+y_rms_thermal = np.sqrt(kB * T / ky) if ky > 0 else 0.0
+z_rms_thermal = np.sqrt(kB * T / kz) if kz > 0 else 0.0
 
 # print("Expected x thermal RMS =", x_rms_thermal * 1e6, "micrometres")
 # print("Expected y thermal RMS =", y_rms_thermal * 1e6, "micrometres")
@@ -1662,40 +1795,11 @@ trap_loss_events = {}
 
 
 def trap_loss_reason(x, y, z):
-    if not terminate_on_trap_loss:
-        return None
-
-    if not np.all(np.isfinite([x, y, z])):
-        return "position became non-finite"
-
-    radial_displacement = np.sqrt((x - x_eq)**2 + (y - y_eq)**2)
-    axial_displacement = abs(z - z_eq)
-
-    if radial_displacement > trap_loss_radial_limit:
-        return (
-            "radial displacement "
-            f"{radial_displacement * 1e6:.3g} micrometres exceeded "
-            f"{trap_loss_radial_limit * 1e6:.3g} micrometres"
-        )
-
-    if axial_displacement > trap_loss_axial_limit:
-        return (
-            "axial displacement "
-            f"{axial_displacement * 1e6:.3g} micrometres exceeded "
-            f"{trap_loss_axial_limit * 1e6:.3g} micrometres"
-        )
-
     return None
 
 
 def should_check_trap_loss(sample_index):
-    return (
-        terminate_on_trap_loss
-        and (
-            sample_index % trap_loss_check_interval_steps == 0
-            or sample_index == len(t_baoab) - 1
-        )
-    )
+    return False
 
 
 def record_trap_loss(run_label, sample_index, x, y, z, reason):
@@ -1813,10 +1917,18 @@ for power_factor_value in laser_allowed_power_factors:
             stable_roots_power.append(root)
 
     if len(stable_roots_power) == 0:
-        raise ValueError(
-            "No stable on-axis equilibrium found for "
-            f"laser power factor {power_factor_value:.5f}."
+        fallback_index_power = int(np.argmin(np.abs(F_scan_power)))
+        instantaneous_z_equilibrium_by_power_factor[power_factor_value] = (
+            z_scan[fallback_index_power]
         )
+        print(
+            "No stable on-axis equilibrium found for "
+            f"laser power factor {power_factor_value:.5f}; using least-unbalanced "
+            "scan point z =",
+            z_scan[fallback_index_power] * 1e6,
+            "micrometres for diagnostic equilibrium tracking."
+        )
+        continue
 
     if not -len(stable_roots_power) <= equilibrium_root_index < len(stable_roots_power):
         raise IndexError(
@@ -2576,9 +2688,14 @@ def solve_baoab_3d_fast_with_pd_feedback(
     )
 
 
-brownian_normals_x = rng.normal(size=len(t_baoab) - 1)
-brownian_normals_y = rng.normal(size=len(t_baoab) - 1)
-brownian_normals_z = rng.normal(size=len(t_baoab) - 1)
+if use_brownian_motion:
+    brownian_normals_x = rng.normal(size=len(t_baoab) - 1)
+    brownian_normals_y = rng.normal(size=len(t_baoab) - 1)
+    brownian_normals_z = rng.normal(size=len(t_baoab) - 1)
+else:
+    brownian_normals_x = np.zeros(len(t_baoab) - 1)
+    brownian_normals_y = np.zeros(len(t_baoab) - 1)
+    brownian_normals_z = np.zeros(len(t_baoab) - 1)
 constant_power_factor = np.ones_like(t_baoab)
 
 pressure_time = pressure_ramp(t_baoab)
@@ -2647,16 +2764,17 @@ if lookup_exit_index is not None:
         pressure_time[lookup_exit_index],
         "Pa;",
         lookup_exit[1] + ".",
-        "Plotting only the trusted interval."
+        "Continuing to track and plot the full trajectory with clamped force lookups."
     )
-    if truncate_pressure_ramp_plot_at_lookup_exit:
-        plot_sample_count = lookup_exit_index + 1
 
 trusted_slice = slice(None, plot_sample_count)
 max_trusted_z_position_um = np.max(
     np.abs(z_baoab_pressure_ramp[trusted_slice])
 ) * 1e6
-print("Initial equilibrium z relative to laser focus =", z_eq * 1e6, "micrometres")
+if selected_equilibrium_is_stable:
+    print("Initial equilibrium z relative to laser focus =", z_eq * 1e6, "micrometres")
+else:
+    print("Initial reference z relative to laser focus =", z_eq * 1e6, "micrometres")
 print(
     "Maximum plotted |z position relative to laser focus| =",
     max_trusted_z_position_um,
@@ -2670,77 +2788,379 @@ pressure_plot_stride = max(1, len(t_baoab) // max_plot_points)
 pressure_plot_slice = slice(None, None, pressure_plot_stride)
 pressure_t_plot = t_baoab[pressure_plot_slice]
 pressure_plot = pressure_time[pressure_plot_slice]
+pressure_is_constant = np.isclose(np.min(pressure_time), np.max(pressure_time))
+pressure_trajectory_plot = pressure_time[trusted_slice][plot_slice]
+x_trajectory_plot = x_baoab_pressure_ramp[trusted_slice][plot_slice] * 1e6
+y_trajectory_plot = y_baoab_pressure_ramp[trusted_slice][plot_slice] * 1e6
+z_trajectory_plot = z_baoab_pressure_ramp[trusted_slice][plot_slice] * 1e6
+radial_trajectory_plot = np.hypot(
+    x_baoab_pressure_ramp[trusted_slice][plot_slice],
+    y_baoab_pressure_ramp[trusted_slice][plot_slice],
+)
+photo_force_magnitude_plot = (
+    photophoretic_force_magnitude(
+        radial_trajectory_plot,
+        z_baoab_pressure_ramp[trusted_slice][plot_slice],
+        power_factor=1.0,
+    )
+    * photophoretic_pressure_scale(pressure_trajectory_plot, pressure_ramp_start)
+)
 
-fig, position_axis = plt.subplots(figsize=time_trace_figsize)
-pressure_axis = position_axis.twinx()
 
-position_axis.plot(
+def pressure_axis_limits(pressure_values):
+    pressure_min = float(np.min(pressure_values))
+    pressure_max = float(np.max(pressure_values))
+
+    if pressure_min <= 0:
+        raise ValueError("Pressure axis values must be positive for log scaling.")
+
+    if np.isclose(pressure_min, pressure_max):
+        pressure_padding_factor = 1.0 + 1e-6
+        return pressure_min / pressure_padding_factor, pressure_max * pressure_padding_factor
+
+    return pressure_min, pressure_max
+
+# x/y position (small excursions near the laser focus) get their own panel,
+# separate from z (which spans a much larger range once the pressure drops
+# far enough to trigger loss/re-trap spikes) -- putting all three on one
+# linear axis made x and y collapse to flat lines near zero.
+fig, axes = plt.subplots(2, 1, figsize=time_trace_multipanel_figsize, sharex=True)
+xy_axis, z_axis = axes
+xy_pressure_axis = xy_axis.twinx()
+z_pressure_axis = z_axis.twinx()
+
+xy_axis.plot(
     t_plot,
-    x_baoab_pressure_ramp[trusted_slice][plot_slice] * 1e6,
+    x_trajectory_plot,
     linewidth=0.8,
     label="x position"
 )
-position_axis.plot(
+xy_axis.plot(
     t_plot,
-    y_baoab_pressure_ramp[trusted_slice][plot_slice] * 1e6,
+    y_trajectory_plot,
     linewidth=0.8,
     label="y position"
 )
-position_axis.plot(
-    t_plot,
-    z_baoab_pressure_ramp[trusted_slice][plot_slice] * 1e6,
-    linewidth=0.8,
-    label="z position"
-)
-position_axis.axhline(
+xy_axis.axhline(
     0.0,
     color="0.35",
     linestyle=":",
     linewidth=0.9,
     label="laser focus"
 )
-pressure_axis.plot(
-    pressure_t_plot,
-    pressure_plot,
-    color="black",
-    linestyle="--",
-    linewidth=1.1,
-    label="pressure"
-)
+xy_axis.set_ylabel("x, y (μm)")
+xy_axis.grid(True, alpha=0.3)
 
-position_axis.set_xlabel("time (s)")
-position_axis.set_ylabel("particle position relative to laser focus (micrometres)")
-position_axis.set_xlim(t_start, t_end)
-pressure_axis.set_ylabel("pressure (Pa)")
-pressure_axis.set_yscale("log")
-pressure_axis.set_ylim(
-    min(pressure_ramp_start, pressure_ramp_end),
-    max(pressure_ramp_start, pressure_ramp_end),
+z_axis.plot(
+    t_plot,
+    z_trajectory_plot,
+    linewidth=0.8,
+    color="tab:green",
+    label="z position"
 )
+z_axis.axhline(0.0, color="0.35", linestyle=":", linewidth=0.9)
+z_axis.set_xlabel("Time (s)")
+z_axis.set_ylabel("z (μm)")
+z_axis.set_xlim(t_start, t_end)
+z_axis.grid(True, alpha=0.3)
+
+unstable_region_patch = None
+if unstable_region_start_time is not None and unstable_region_end_time is not None:
+    unstable_region_patch = xy_axis.axvspan(
+        unstable_region_start_time,
+        unstable_region_end_time,
+        color="tab:red",
+        alpha=0.12,
+        linewidth=0,
+        label="unstable region"
+    )
+    z_axis.axvspan(
+        unstable_region_start_time,
+        unstable_region_end_time,
+        color="tab:red",
+        alpha=0.12,
+        linewidth=0
+    )
+
 pressure_decade_ticks = 10.0 ** np.arange(
     np.floor(np.log10(min(pressure_ramp_start, pressure_ramp_end))),
     np.ceil(np.log10(max(pressure_ramp_start, pressure_ramp_end))) + 1
 )
-pressure_axis.yaxis.set_major_locator(mticker.FixedLocator(pressure_decade_ticks))
-pressure_axis.yaxis.set_major_formatter(
-    mticker.FuncFormatter(lambda value, _: f"{value:g}")
-)
-pressure_axis.yaxis.set_minor_locator(
-    mticker.LogLocator(base=10.0, subs=np.arange(2, 10) * 0.1)
-)
-pressure_axis.yaxis.set_minor_formatter(mticker.NullFormatter())
-position_axis.set_title("Particle trajectory during pressure ramp")
-position_axis.grid(True, alpha=0.3)
+if pressure_is_constant:
+    xy_pressure_axis.set_visible(False)
+    z_pressure_axis.set_visible(False)
+else:
+    for pressure_axis, pressure_label in (
+        (xy_pressure_axis, "Pressure"),
+        (z_pressure_axis, None),
+    ):
+        pressure_axis.plot(
+            pressure_t_plot,
+            pressure_plot,
+            color="black",
+            linestyle="--",
+            linewidth=1.1,
+            label=pressure_label
+        )
+        pressure_axis.set_ylabel("Pressure (Pa)")
+        pressure_axis.set_yscale("log")
+        pressure_axis.set_ylim(pressure_axis_limits(pressure_time))
+        pressure_axis.yaxis.set_major_locator(mticker.FixedLocator(pressure_decade_ticks))
+        pressure_axis.yaxis.set_major_formatter(
+            mticker.FuncFormatter(lambda value, _: f"{value:g}")
+        )
+        pressure_axis.yaxis.set_minor_locator(
+            mticker.LogLocator(base=10.0, subs=np.arange(2, 10) * 0.1)
+        )
+        pressure_axis.yaxis.set_minor_formatter(mticker.NullFormatter())
 
-position_lines, position_labels = position_axis.get_legend_handles_labels()
-pressure_lines, pressure_labels = pressure_axis.get_legend_handles_labels()
-position_axis.legend(
-    position_lines + pressure_lines,
-    position_labels + pressure_labels,
-    loc="best"
+fig.suptitle("Particle trajectory during pressure ramp", y=0.99)
+legend_handles = [
+    xy_axis.lines[0],
+    xy_axis.lines[1],
+    z_axis.lines[0],
+    xy_axis.lines[2],
+]
+legend_labels = ["x position", "y position", "z position", "laser focus"]
+if not pressure_is_constant:
+    legend_handles.append(xy_pressure_axis.lines[0])
+    legend_labels.append("pressure")
+if unstable_region_patch is not None:
+    legend_handles.append(unstable_region_patch)
+    legend_labels.append("unstable region")
+fig.legend(
+    legend_handles,
+    legend_labels,
+    loc="upper center",
+    bbox_to_anchor=(0.5, 0.945),
+    ncol=3,
+    frameon=False,
 )
-fig.tight_layout()
-finish_plot()
+fig.tight_layout(rect=(0, 0.03, 1, 0.87), h_pad=1.6)
+finish_plot(name="pressure_ramp_trajectory", fig=fig)
+
+fig, axes = plt.subplots(2, 1, figsize=time_trace_multipanel_figsize, sharex=True)
+xy_pressure_axis, z_pressure_axis = axes
+photo_axis = z_pressure_axis.twinx()
+
+xy_pressure_axis.plot(
+    pressure_trajectory_plot,
+    x_trajectory_plot,
+    linewidth=0.8,
+    label="x position"
+)
+xy_pressure_axis.plot(
+    pressure_trajectory_plot,
+    y_trajectory_plot,
+    linewidth=0.8,
+    label="y position"
+)
+xy_pressure_axis.axhline(
+    0.0,
+    color="0.35",
+    linestyle=":",
+    linewidth=0.9,
+    label="laser focus"
+)
+xy_pressure_axis.set_ylabel("x, y (μm)")
+xy_pressure_axis.grid(True, alpha=0.3)
+
+z_pressure_axis.plot(
+    pressure_trajectory_plot,
+    z_trajectory_plot,
+    linewidth=0.8,
+    color="tab:green",
+    label="z position"
+)
+z_pressure_axis.axhline(0.0, color="0.35", linestyle=":", linewidth=0.9)
+z_pressure_axis.set_xlabel("Pressure (Pa)")
+z_pressure_axis.set_ylabel("z (μm)")
+z_pressure_axis.set_xscale("log")
+z_pressure_axis.grid(True, alpha=0.3)
+
+photo_axis.plot(
+    pressure_trajectory_plot,
+    photo_force_magnitude_plot,
+    color="tab:purple",
+    linestyle="--",
+    linewidth=1.0,
+    label="photophoretic force"
+)
+photo_axis.set_ylabel("Photophoretic force (N)")
+photo_axis.ticklabel_format(axis="y", style="sci", scilimits=(0, 0))
+
+pressure_min, pressure_max = pressure_axis_limits(pressure_trajectory_plot)
+if pressure_ramp_start > pressure_ramp_end:
+    xy_pressure_axis.set_xlim(pressure_max, pressure_min)
+else:
+    xy_pressure_axis.set_xlim(pressure_min, pressure_max)
+
+pressure_unstable_region_patch = None
+if (
+    unstable_region_start_time is not None
+    and unstable_region_end_time is not None
+    and not pressure_is_constant
+):
+    unstable_region_pressures = np.interp(
+        [unstable_region_start_time, unstable_region_end_time],
+        t_baoab,
+        pressure_time,
+    )
+    pressure_span_min = float(np.min(unstable_region_pressures))
+    pressure_span_max = float(np.max(unstable_region_pressures))
+    pressure_unstable_region_patch = xy_pressure_axis.axvspan(
+        pressure_span_min,
+        pressure_span_max,
+        color="tab:red",
+        alpha=0.12,
+        linewidth=0,
+        label="unstable region",
+    )
+    z_pressure_axis.axvspan(
+        pressure_span_min,
+        pressure_span_max,
+        color="tab:red",
+        alpha=0.12,
+        linewidth=0,
+    )
+
+fig.suptitle("Particle trajectory versus pressure", y=0.99)
+legend_handles = [
+    xy_pressure_axis.lines[0],
+    xy_pressure_axis.lines[1],
+    z_pressure_axis.lines[0],
+    xy_pressure_axis.lines[2],
+    photo_axis.lines[0],
+]
+legend_labels = [
+    "x position",
+    "y position",
+    "z position",
+    "laser focus",
+    "photophoretic force",
+]
+if pressure_unstable_region_patch is not None:
+    legend_handles.append(pressure_unstable_region_patch)
+    legend_labels.append("unstable region")
+fig.legend(
+    legend_handles,
+    legend_labels,
+    loc="upper center",
+    bbox_to_anchor=(0.5, 0.945),
+    ncol=2,
+    frameon=False,
+)
+fig.tight_layout(rect=(0, 0.03, 1, 0.87), h_pad=1.6)
+finish_plot(name="pressure_ramp_trajectory_vs_pressure", fig=fig)
+
+# ----------------------------------------------------------------------------
+# Zoomed-in, undecimated view of a single burst. This checks whether the
+# sudden "jumps" in the plot above are a genuinely instantaneous event or
+# just an aliasing artifact of the max_plot_points downsampling used there --
+# it slices the raw (dt_baoab-resolution) trajectory arrays directly, with no
+# plot_stride applied.
+#
+# Detection is based on the FAST (short-lag) change in z, compared against a
+# fixed threshold in real units (micrometres), not a statistical/relative
+# one. Both a fixed z_eq comparison and a local noise-statistics comparison
+# were tried and both false-triggered: the former on the initial settling
+# transient and the slow drift of the true equilibrium as the pressure ramp
+# shifts the photophoretic force balance; the latter on the smooth
+# curvature of that same drift whenever the ambient thermal-noise floor is
+# small (e.g. early in the ramp, while gas damping is still high). A simple
+# absolute threshold sidesteps both: over a 2 ms lag, smooth drift changes
+# by at most a few tens of nanometres, orders of magnitude below any real
+# burst, so it can never trip an absolute threshold set from the known
+# scale of real excursions (a fraction of the maximum |z| already measured
+# above).
+# ----------------------------------------------------------------------------
+burst_zoom_half_window_seconds = 0.05
+burst_zoom_lag_seconds = 0.002
+burst_zoom_min_start_seconds = 2.0
+burst_zoom_absolute_jump_threshold_um = max(0.2 * max_trusted_z_position_um, 10.0)
+
+z_trusted_raw = z_baoab_pressure_ramp[trusted_slice]
+lag_samples = max(1, int(round(burst_zoom_lag_seconds / dt_baoab)))
+search_start_index = min(
+    int(round(burst_zoom_min_start_seconds / dt_baoab)),
+    max(0, len(z_trusted_raw) - lag_samples - 1)
+)
+z_search = z_trusted_raw[search_start_index:]
+z_fast_change_um = (
+    (z_search[lag_samples:] - z_search[:-lag_samples]) * 1e6
+    if len(z_search) > lag_samples else np.array([])
+)
+burst_candidate_offsets = np.flatnonzero(
+    np.abs(z_fast_change_um) > burst_zoom_absolute_jump_threshold_um
+)
+
+if burst_candidate_offsets.size == 0:
+    print(
+        "No z change above",
+        burst_zoom_absolute_jump_threshold_um,
+        "micrometres over",
+        burst_zoom_lag_seconds,
+        "s found in the trusted interval; skipping zoomed burst plot."
+    )
+else:
+    burst_center_index = (
+        search_start_index + int(burst_candidate_offsets[0]) + lag_samples // 2
+    )
+    burst_half_window_samples = max(
+        1, int(round(burst_zoom_half_window_seconds / dt_baoab))
+    )
+    burst_start_index = max(0, burst_center_index - burst_half_window_samples)
+    burst_stop_index = min(
+        len(z_trusted_raw), burst_center_index + burst_half_window_samples
+    )
+    burst_slice = slice(burst_start_index, burst_stop_index)
+
+    t_burst = t_baoab[trusted_slice][burst_slice]
+    x_burst = x_baoab_pressure_ramp[trusted_slice][burst_slice] * 1e6
+    y_burst = y_baoab_pressure_ramp[trusted_slice][burst_slice] * 1e6
+    z_burst = z_baoab_pressure_ramp[trusted_slice][burst_slice] * 1e6
+
+    fig, axes = plt.subplots(2, 1, figsize=time_trace_multipanel_figsize, sharex=True)
+    xy_burst_axis, z_burst_axis = axes
+
+    xy_burst_axis.plot(t_burst, x_burst, linewidth=0.8, label="x position")
+    xy_burst_axis.plot(t_burst, y_burst, linewidth=0.8, label="y position")
+    xy_burst_axis.axhline(
+        0.0, color="0.35", linestyle=":", linewidth=0.9, label="laser focus"
+    )
+    xy_burst_axis.set_ylabel("x, y / micrometres")
+    xy_burst_axis.grid(True, alpha=0.3)
+
+    z_burst_axis.plot(
+        t_burst, z_burst, linewidth=0.8, color="tab:green", label="z position"
+    )
+    z_burst_axis.axhline(0.0, color="0.35", linestyle=":", linewidth=0.9)
+    z_burst_axis.set_xlabel("time (s)")
+    z_burst_axis.set_ylabel("z / micrometres")
+    z_burst_axis.grid(True, alpha=0.3)
+
+    fig.suptitle(
+        "Zoomed, undecimated view of first burst"
+        f" (t \u2248 {t_baoab[trusted_slice][burst_center_index]:.3f} s)",
+        y=0.99
+    )
+    legend_handles = [
+        xy_burst_axis.lines[0],
+        xy_burst_axis.lines[1],
+        z_burst_axis.lines[0],
+        xy_burst_axis.lines[2],
+    ]
+    legend_labels = ["x position", "y position", "z position", "laser focus"]
+    fig.legend(
+        legend_handles,
+        legend_labels,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.94),
+        ncol=2,
+        frameon=False,
+    )
+    fig.tight_layout(rect=(0, 0.03, 1, 0.87), h_pad=1.6)
+    finish_plot()
 
 raise SystemExit
 
@@ -3054,7 +3474,7 @@ t_plot = t_baoab[plot_slice]
 # ****************************************************************************************************************************************************
 # Plot x(t), y(t), and z(t)
 # ****************************************************************************************************************************************************
-fig, axes = plt.subplots(3, 1, figsize=time_trace_figsize, sharex=True)
+fig, axes = plt.subplots(3, 1, figsize=time_trace_multipanel_figsize, sharex=True)
 
 axes[0].plot(
     t_plot,
@@ -3065,7 +3485,6 @@ axes[0].plot(
 )
 axes[0].axhline(x_eq * 1e6, linestyle=":", color="black", label="Equilibrium")
 axes[0].set_ylabel("x / micrometres")
-axes[0].legend()
 axes[0].grid()
 
 axes[1].plot(
@@ -3077,7 +3496,6 @@ axes[1].plot(
 )
 axes[1].axhline(y_eq * 1e6, linestyle=":", color="black", label="Equilibrium")
 axes[1].set_ylabel("y / micrometres")
-axes[1].legend()
 axes[1].grid()
 
 axes[2].plot(
@@ -3090,11 +3508,19 @@ axes[2].plot(
 axes[2].axhline(z_eq * 1e6, linestyle=":", color="black", label="Equilibrium")
 axes[2].set_xlabel("Time / s")
 axes[2].set_ylabel("z / micrometres")
-axes[2].legend()
 axes[2].grid()
 
-fig.suptitle("3D BAOAB ray-optics motion")
-plt.tight_layout()
+fig.suptitle("3D BAOAB ray-optics motion", y=0.985)
+if len(axes[0].lines) >= 2:
+    fig.legend(
+        [axes[0].lines[0], axes[0].lines[1]],
+        ["BAOAB Brownian + laser noise", "Equilibrium"],
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.955),
+        ncol=2,
+        frameon=False,
+    )
+fig.tight_layout(rect=(0, 0.03, 1, 0.935), h_pad=1.6)
 finish_plot()
 
 # ****************************************************************************************************************************************************
@@ -3176,7 +3602,7 @@ if use_pd_feedback:
 # ****************************************************************************************************************************************************
 # Compare Brownian trajectories with and without laser-power noise
 # ****************************************************************************************************************************************************
-fig, axes = plt.subplots(3, 1, figsize=time_trace_figsize, sharex=True)
+fig, axes = plt.subplots(3, 1, figsize=time_trace_multipanel_legend3_figsize, sharex=True)
 
 axes[0].plot(
     t_plot,
@@ -3191,7 +3617,6 @@ axes[0].plot(
 )
 axes[0].axhline(x_eq * 1e6, linestyle=":", color="black", label="equilibrium")
 axes[0].set_ylabel("x / micrometres")
-axes[0].legend()
 axes[0].grid()
 
 axes[1].plot(
@@ -3207,7 +3632,6 @@ axes[1].plot(
 )
 axes[1].axhline(y_eq * 1e6, linestyle=":", color="black", label="equilibrium")
 axes[1].set_ylabel("y / micrometres")
-axes[1].legend()
 axes[1].grid()
 
 axes[2].plot(
@@ -3224,11 +3648,19 @@ axes[2].plot(
 axes[2].axhline(z_eq * 1e6, linestyle=":", color="black", label="equilibrium")
 axes[2].set_xlabel("Time / s")
 axes[2].set_ylabel("z / micrometres")
-axes[2].legend()
 axes[2].grid()
 
-fig.suptitle("BAOAB motion with and without laser-power noise")
-plt.tight_layout()
+fig.suptitle("BAOAB motion with and without laser-power noise", y=0.99)
+if len(axes[0].lines) >= 3:
+    fig.legend(
+        [axes[0].lines[0], axes[0].lines[1], axes[0].lines[2]],
+        ["BAOAB Brownian, constant laser power", "BAOAB Brownian + laser noise", "equilibrium"],
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.955),
+        ncol=1,
+        frameon=False,
+    )
+fig.tight_layout(rect=(0, 0.025, 1, 0.86), h_pad=1.6)
 finish_plot()
 
 
@@ -3236,7 +3668,7 @@ finish_plot()
 # Optional PD feedback trajectory comparison
 # ****************************************************************************************************************************************************
 if use_pd_feedback:
-    fig, axes = plt.subplots(3, 1, figsize=time_trace_figsize, sharex=True)
+    fig, axes = plt.subplots(3, 1, figsize=time_trace_multipanel_figsize, sharex=True)
 
     axes[0].plot(
         t_plot,
@@ -3251,7 +3683,6 @@ if use_pd_feedback:
     )
     axes[0].axhline(x_eq * 1e6, linestyle=":", color="black", label="equilibrium")
     axes[0].set_ylabel("x / micrometres")
-    axes[0].legend()
     axes[0].grid()
 
     axes[1].plot(
@@ -3267,7 +3698,6 @@ if use_pd_feedback:
     )
     axes[1].axhline(y_eq * 1e6, linestyle=":", color="black", label="equilibrium")
     axes[1].set_ylabel("y / micrometres")
-    axes[1].legend()
     axes[1].grid()
 
     axes[2].plot(
@@ -3284,17 +3714,25 @@ if use_pd_feedback:
     axes[2].axhline(z_eq * 1e6, linestyle=":", color="black", label="equilibrium")
     axes[2].set_xlabel("Time / s")
     axes[2].set_ylabel("z / micrometres")
-    axes[2].legend()
     axes[2].grid()
 
-    fig.suptitle("BAOAB motion with and without PD feedback")
-    plt.tight_layout()
+    fig.suptitle("BAOAB motion with and without PD feedback", y=0.985)
+    if len(axes[0].lines) >= 3:
+        fig.legend(
+            [axes[0].lines[0], axes[0].lines[1], axes[0].lines[2]],
+            ["without feedback", "with PD feedback", "equilibrium"],
+            loc="upper center",
+            bbox_to_anchor=(0.5, 0.955),
+            ncol=3,
+            frameon=False,
+        )
+    fig.tight_layout(rect=(0, 0.03, 1, 0.935), h_pad=1.6)
     finish_plot()
 
 # ****************************************************************************************************************************************************
 # Isolated laser-noise effect
 # ****************************************************************************************************************************************************
-fig, axes = plt.subplots(3, 1, figsize=time_trace_figsize, sharex=True)
+fig, axes = plt.subplots(3, 1, figsize=time_trace_multipanel_figsize, sharex=True)
 
 axes[0].plot(t_plot, x_laser_noise_difference[plot_slice] * 1e9)
 axes[0].axhline(0, linestyle=":", color="black")
@@ -3319,7 +3757,7 @@ finish_plot()
 # ****************************************************************************************************************************************************
 # Isolated Brownian-motion effect
 # ****************************************************************************************************************************************************
-fig, axes = plt.subplots(3, 1, figsize=time_trace_figsize, sharex=True)
+fig, axes = plt.subplots(3, 1, figsize=time_trace_multipanel_figsize, sharex=True)
 
 axes[0].plot(t_plot, x_brownian_difference[plot_slice] * 1e9)
 axes[0].axhline(0, linestyle=":", color="black")
@@ -3558,7 +3996,7 @@ if include_z_detector_resolution_psd:
     fig, axes = plt.subplots(
         2,
         1,
-        figsize=(spectrum_figsize[0], 1.6 * spectrum_figsize[1]),
+        figsize=detector_resolution_figsize,
         sharex=False
     )
 

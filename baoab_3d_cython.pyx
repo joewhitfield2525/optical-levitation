@@ -1,18 +1,124 @@
-# cython: boundscheck=False, wraparound=False, cdivision=True, initializedcheck=False, language_level=3
+# cython: boundscheck=False, wraparound=False, initializedcheck=False, cdivision=True
 import numpy as np
 cimport numpy as cnp
-from libc.math cimport sqrt
-
-ctypedef cnp.float64_t DTYPE_t
-
-cnp.import_array()
+from libc.math cimport ceil, isfinite, sqrt
 
 
-cdef inline int lookup_force_clamped(
-    DTYPE_t[::1] r_values,
-    DTYPE_t[::1] z_values,
-    DTYPE_t[:, ::1] Fr_table,
-    DTYPE_t[:, ::1] Fz_table,
+cdef inline double clamp_double(double value, double lower, double upper):
+    if value < lower:
+        return lower
+    if value > upper:
+        return upper
+    return value
+
+
+cdef inline int trap_lost_3d(
+    double x,
+    double y,
+    double z,
+    double vx,
+    double vz,
+    double axial_net_force,
+    double axial_potential,
+    double mass,
+    bint use_axial_energy_loss,
+    double axial_lower_escape_z,
+    double axial_lower_escape_energy,
+    double x_eq,
+    double y_eq,
+    double z_eq,
+    double x_outward_limit,
+    double below_equilibrium_limit
+):
+    cdef double dx
+    cdef double below_equilibrium_displacement
+    cdef double axial_energy
+
+    if not isfinite(x) or not isfinite(y) or not isfinite(z):
+        return 1
+
+    if not isfinite(vx) or not isfinite(vz):
+        return 1
+
+    if not isfinite(axial_net_force):
+        return 1
+
+    dx = x - x_eq
+    below_equilibrium_displacement = z_eq - z
+
+    if (dx > x_outward_limit and vx > 0.0) or (
+        dx < -x_outward_limit and vx < 0.0
+    ):
+        return 1
+
+    if use_axial_energy_loss:
+        if (
+            not isfinite(axial_potential)
+            or not isfinite(axial_lower_escape_z)
+            or not isfinite(axial_lower_escape_energy)
+        ):
+            return 1
+
+        axial_energy = 0.5 * mass * vz * vz + axial_potential
+        return (
+            (
+                axial_energy >= axial_lower_escape_energy
+                and vz < 0.0
+            )
+            or (
+                z <= axial_lower_escape_z
+                and vz <= 0.0
+            )
+        )
+
+    return (
+        below_equilibrium_displacement > below_equilibrium_limit
+        and axial_net_force < 0.0
+    )
+
+
+cdef inline double lookup_linear_1d(
+    double[::1] x_values,
+    double[::1] y_values,
+    double x
+):
+    cdef Py_ssize_t n = x_values.shape[0]
+    cdef double x_min
+    cdef double x_max
+    cdef double dx
+    cdef double grid_position
+    cdef Py_ssize_t index
+    cdef double weight
+
+    if n <= 1:
+        return y_values[0]
+
+    x_min = x_values[0]
+    x_max = x_values[n - 1]
+
+    if x <= x_min:
+        return y_values[0]
+    if x >= x_max:
+        return y_values[n - 1]
+
+    dx = (x_max - x_min) / (n - 1)
+    grid_position = (x - x_min) / dx
+    index = <Py_ssize_t>grid_position
+
+    if index >= n - 1:
+        index = n - 2
+        weight = 1.0
+    else:
+        weight = grid_position - index
+
+    return (1.0 - weight) * y_values[index] + weight * y_values[index + 1]
+
+
+cdef inline void lookup_force_3d(
+    double[::1] r_values,
+    double[::1] z_values,
+    double[:, ::1] Fr_table,
+    double[:, ::1] Fz_table,
     double x,
     double y,
     double z,
@@ -20,20 +126,20 @@ cdef inline int lookup_force_clamped(
     double radial_zero_tolerance,
     double* Fx,
     double* Fy,
-    double* Fz
-) noexcept nogil:
+    double* Fz,
+    int* was_clamped
+):
     cdef Py_ssize_t n_r = r_values.shape[0]
     cdef Py_ssize_t n_z = z_values.shape[0]
-    cdef double r = sqrt(x * x + y * y)
     cdef double r_min = r_values[0]
     cdef double r_max = r_values[n_r - 1]
     cdef double z_min = z_values[0]
     cdef double z_max = z_values[n_z - 1]
+    cdef double r = sqrt(x * x + y * y)
     cdef double r_lookup = r
     cdef double z_lookup = z
-    cdef int out_of_bounds = 0
-    cdef double dr
-    cdef double dz
+    cdef double dr = (r_max - r_min) / (n_r - 1)
+    cdef double dz = (z_max - z_min) / (n_z - 1)
     cdef double r_grid_position
     cdef double z_grid_position
     cdef Py_ssize_t ir
@@ -52,22 +158,21 @@ cdef inline int lookup_force_clamped(
     cdef double Fz_nominal
     cdef double Fr
 
+    was_clamped[0] = 0
+
     if r_lookup < r_min:
         r_lookup = r_min
-        out_of_bounds = 1
+        was_clamped[0] = 1
     elif r_lookup > r_max:
         r_lookup = r_max
-        out_of_bounds = 1
+        was_clamped[0] = 1
 
     if z_lookup < z_min:
         z_lookup = z_min
-        out_of_bounds = 1
+        was_clamped[0] = 1
     elif z_lookup > z_max:
         z_lookup = z_max
-        out_of_bounds = 1
-
-    dr = (r_max - r_min) / (n_r - 1)
-    dz = (z_max - z_min) / (n_z - 1)
+        was_clamped[0] = 1
 
     r_grid_position = (r_lookup - r_min) / dr
     z_grid_position = (z_lookup - z_min) / dz
@@ -120,181 +225,323 @@ cdef inline int lookup_force_clamped(
         Fx[0] = 0.0
         Fy[0] = 0.0
 
-    return out_of_bounds
-
-
-cdef inline int lookup_force_clamped_pressure(
-    DTYPE_t[::1] r_values,
-    DTYPE_t[::1] z_values,
-    DTYPE_t[:, ::1] Fr_table,
-    DTYPE_t[:, ::1] Fz_ray_table,
-    DTYPE_t[:, ::1] Fz_photo_base_table,
-    double x,
-    double y,
-    double z,
-    double power_factor,
-    double photo_pressure_factor,
-    double radial_zero_tolerance,
-    double* Fx,
-    double* Fy,
-    double* Fz
-) noexcept nogil:
-    cdef Py_ssize_t n_r = r_values.shape[0]
-    cdef Py_ssize_t n_z = z_values.shape[0]
-    cdef double r = sqrt(x * x + y * y)
-    cdef double r_min = r_values[0]
-    cdef double r_max = r_values[n_r - 1]
-    cdef double z_min = z_values[0]
-    cdef double z_max = z_values[n_z - 1]
-    cdef double r_lookup = r
-    cdef double z_lookup = z
-    cdef int out_of_bounds = 0
-    cdef double dr
-    cdef double dz
-    cdef double r_grid_position
-    cdef double z_grid_position
-    cdef Py_ssize_t ir
-    cdef Py_ssize_t iz
-    cdef double r_weight
-    cdef double z_weight
-    cdef double Fr00
-    cdef double Fr10
-    cdef double Fr01
-    cdef double Fr11
-    cdef double Fz_ray00
-    cdef double Fz_ray10
-    cdef double Fz_ray01
-    cdef double Fz_ray11
-    cdef double Fz_photo00
-    cdef double Fz_photo10
-    cdef double Fz_photo01
-    cdef double Fz_photo11
-    cdef double Fr_nominal
-    cdef double Fz_ray_nominal
-    cdef double Fz_photo_base
-    cdef double Fz_nominal
-    cdef double Fr
-
-    if r_lookup < r_min:
-        r_lookup = r_min
-        out_of_bounds = 1
-    elif r_lookup > r_max:
-        r_lookup = r_max
-        out_of_bounds = 1
-
-    if z_lookup < z_min:
-        z_lookup = z_min
-        out_of_bounds = 1
-    elif z_lookup > z_max:
-        z_lookup = z_max
-        out_of_bounds = 1
-
-    dr = (r_max - r_min) / (n_r - 1)
-    dz = (z_max - z_min) / (n_z - 1)
-
-    r_grid_position = (r_lookup - r_min) / dr
-    z_grid_position = (z_lookup - z_min) / dz
-
-    ir = <Py_ssize_t>r_grid_position
-    iz = <Py_ssize_t>z_grid_position
-
-    if ir >= n_r - 1:
-        ir = n_r - 2
-        r_weight = 1.0
-    else:
-        r_weight = r_grid_position - ir
-
-    if iz >= n_z - 1:
-        iz = n_z - 2
-        z_weight = 1.0
-    else:
-        z_weight = z_grid_position - iz
-
-    Fr00 = Fr_table[ir, iz]
-    Fr10 = Fr_table[ir + 1, iz]
-    Fr01 = Fr_table[ir, iz + 1]
-    Fr11 = Fr_table[ir + 1, iz + 1]
-
-    Fz_ray00 = Fz_ray_table[ir, iz]
-    Fz_ray10 = Fz_ray_table[ir + 1, iz]
-    Fz_ray01 = Fz_ray_table[ir, iz + 1]
-    Fz_ray11 = Fz_ray_table[ir + 1, iz + 1]
-
-    Fz_photo00 = Fz_photo_base_table[ir, iz]
-    Fz_photo10 = Fz_photo_base_table[ir + 1, iz]
-    Fz_photo01 = Fz_photo_base_table[ir, iz + 1]
-    Fz_photo11 = Fz_photo_base_table[ir + 1, iz + 1]
-
-    Fr_nominal = (
-        (1.0 - r_weight) * (1.0 - z_weight) * Fr00
-        + r_weight * (1.0 - z_weight) * Fr10
-        + (1.0 - r_weight) * z_weight * Fr01
-        + r_weight * z_weight * Fr11
-    )
-    Fz_ray_nominal = (
-        (1.0 - r_weight) * (1.0 - z_weight) * Fz_ray00
-        + r_weight * (1.0 - z_weight) * Fz_ray10
-        + (1.0 - r_weight) * z_weight * Fz_ray01
-        + r_weight * z_weight * Fz_ray11
-    )
-    Fz_photo_base = (
-        (1.0 - r_weight) * (1.0 - z_weight) * Fz_photo00
-        + r_weight * (1.0 - z_weight) * Fz_photo10
-        + (1.0 - r_weight) * z_weight * Fz_photo01
-        + r_weight * z_weight * Fz_photo11
-    )
-    Fz_nominal = Fz_ray_nominal + photo_pressure_factor * Fz_photo_base
-
-    Fr = power_factor * Fr_nominal
-    Fz[0] = power_factor * Fz_nominal
-
-    if r > radial_zero_tolerance:
-        Fx[0] = Fr * x / r
-        Fy[0] = Fr * y / r
-    else:
-        Fx[0] = 0.0
-        Fy[0] = 0.0
-
-    return out_of_bounds
-
 
 def solve_baoab_3d_lookup_cython(
-    DTYPE_t[::1] r_values,
-    DTYPE_t[::1] z_values,
-    DTYPE_t[:, ::1] Fr_table,
-    DTYPE_t[:, ::1] Fz_table,
-    DTYPE_t[::1] power_factor_time,
-    DTYPE_t[::1] brownian_normals_x,
-    DTYPE_t[::1] brownian_normals_y,
-    DTYPE_t[::1] brownian_normals_z,
+    cnp.ndarray[cnp.float64_t, ndim=1] r_values,
+    cnp.ndarray[cnp.float64_t, ndim=1] z_values,
+    cnp.ndarray[cnp.float64_t, ndim=2] Fr_table,
+    cnp.ndarray[cnp.float64_t, ndim=2] Fz_table,
+    cnp.ndarray[cnp.float64_t, ndim=1] power_factor_time,
+    cnp.ndarray[cnp.float64_t, ndim=1] brownian_normals_x,
+    cnp.ndarray[cnp.float64_t, ndim=1] brownian_normals_y,
+    cnp.ndarray[cnp.float64_t, ndim=1] brownian_normals_z,
     double dt,
     double mass,
     double weight,
-    damping_factor,
-    thermal_velocity_scale,
+    double damping_factor,
+    double thermal_velocity_scale,
     double x0,
     double y0,
     double z0,
     double vx0,
     double vy0,
     double vz0,
-    double radial_zero_tolerance=1.0e-30,
+    double radial_zero_tolerance,
+    bint use_axial_energy_loss,
+    cnp.ndarray[cnp.float64_t, ndim=1] axial_energy_z_values,
+    cnp.ndarray[cnp.float64_t, ndim=1] axial_potential_values,
+    double axial_lower_escape_z,
+    double axial_lower_escape_energy,
+    bint terminate_on_trap_loss=False,
+    long trap_loss_check_interval_steps=1,
+    double x_eq=0.0,
+    double y_eq=0.0,
+    double z_eq=0.0,
+    double trap_loss_x_outward_limit=1.0,
+    double trap_loss_below_equilibrium_limit=1.0,
 ):
     cdef Py_ssize_t n = power_factor_time.shape[0]
-    cdef cnp.ndarray[DTYPE_t, ndim=1] x_out_arr = np.zeros(n, dtype=np.float64)
-    cdef cnp.ndarray[DTYPE_t, ndim=1] y_out_arr = np.zeros(n, dtype=np.float64)
-    cdef cnp.ndarray[DTYPE_t, ndim=1] z_out_arr = np.zeros(n, dtype=np.float64)
-    cdef cnp.ndarray[DTYPE_t, ndim=1] vx_out_arr = np.zeros(n, dtype=np.float64)
-    cdef cnp.ndarray[DTYPE_t, ndim=1] vy_out_arr = np.zeros(n, dtype=np.float64)
-    cdef cnp.ndarray[DTYPE_t, ndim=1] vz_out_arr = np.zeros(n, dtype=np.float64)
-    cdef DTYPE_t[::1] x_out = x_out_arr
-    cdef DTYPE_t[::1] y_out = y_out_arr
-    cdef DTYPE_t[::1] z_out = z_out_arr
-    cdef DTYPE_t[::1] vx_out = vx_out_arr
-    cdef DTYPE_t[::1] vy_out = vy_out_arr
-    cdef DTYPE_t[::1] vz_out = vz_out_arr
     cdef Py_ssize_t i
+    cdef Py_ssize_t sample_index
+    cdef Py_ssize_t stop_index = n - 1
+    cdef int lost_flag = 0
+    cdef double x_i
+    cdef double y_i
+    cdef double z_i
+    cdef double vx_i
+    cdef double vy_i
+    cdef double vz_i
+    cdef double power_factor_i
+    cdef double Fx_i
+    cdef double Fy_i
+    cdef double Fz_i
+    cdef double axial_potential_i
+    cdef int clamped
     cdef long out_of_bounds_count = 0
+
+    cdef cnp.ndarray[cnp.float64_t, ndim=1] x_out = np.zeros(n, dtype=np.float64)
+    cdef cnp.ndarray[cnp.float64_t, ndim=1] y_out = np.zeros(n, dtype=np.float64)
+    cdef cnp.ndarray[cnp.float64_t, ndim=1] z_out = np.zeros(n, dtype=np.float64)
+    cdef cnp.ndarray[cnp.float64_t, ndim=1] vx_out = np.zeros(n, dtype=np.float64)
+    cdef cnp.ndarray[cnp.float64_t, ndim=1] vy_out = np.zeros(n, dtype=np.float64)
+    cdef cnp.ndarray[cnp.float64_t, ndim=1] vz_out = np.zeros(n, dtype=np.float64)
+
+    cdef double[::1] r_values_mv = r_values
+    cdef double[::1] z_values_mv = z_values
+    cdef double[:, ::1] Fr_table_mv = Fr_table
+    cdef double[:, ::1] Fz_table_mv = Fz_table
+    cdef double[::1] power_mv = power_factor_time
+    cdef double[::1] brownian_x_mv = brownian_normals_x
+    cdef double[::1] brownian_y_mv = brownian_normals_y
+    cdef double[::1] brownian_z_mv = brownian_normals_z
+    cdef double[::1] axial_energy_z_mv = axial_energy_z_values
+    cdef double[::1] axial_potential_mv = axial_potential_values
+    cdef double[::1] x_out_mv = x_out
+    cdef double[::1] y_out_mv = y_out
+    cdef double[::1] z_out_mv = z_out
+    cdef double[::1] vx_out_mv = vx_out
+    cdef double[::1] vy_out_mv = vy_out
+    cdef double[::1] vz_out_mv = vz_out
+
+    if trap_loss_check_interval_steps < 1:
+        trap_loss_check_interval_steps = 1
+
+    x_out_mv[0] = x0
+    y_out_mv[0] = y0
+    z_out_mv[0] = z0
+    vx_out_mv[0] = vx0
+    vy_out_mv[0] = vy0
+    vz_out_mv[0] = vz0
+
+    if terminate_on_trap_loss:
+        lookup_force_3d(
+            r_values_mv,
+            z_values_mv,
+            Fr_table_mv,
+            Fz_table_mv,
+            x0,
+            y0,
+            z0,
+            power_mv[0],
+            radial_zero_tolerance,
+            &Fx_i,
+            &Fy_i,
+            &Fz_i,
+            &clamped
+        )
+        out_of_bounds_count += clamped
+        axial_potential_i = lookup_linear_1d(
+            axial_energy_z_mv,
+            axial_potential_mv,
+            z0
+        )
+
+        if trap_lost_3d(
+            x0,
+            y0,
+            z0,
+            vx0,
+            vz0,
+            Fz_i - weight,
+            axial_potential_i,
+            mass,
+            use_axial_energy_loss,
+            axial_lower_escape_z,
+            axial_lower_escape_energy,
+            x_eq,
+            y_eq,
+            z_eq,
+            trap_loss_x_outward_limit,
+            trap_loss_below_equilibrium_limit
+        ):
+            return x_out, y_out, z_out, vx_out, vy_out, vz_out, out_of_bounds_count, 0, 1
+
+    for i in range(n - 1):
+        x_i = x_out_mv[i]
+        y_i = y_out_mv[i]
+        z_i = z_out_mv[i]
+        vx_i = vx_out_mv[i]
+        vy_i = vy_out_mv[i]
+        vz_i = vz_out_mv[i]
+        power_factor_i = power_mv[i]
+
+        lookup_force_3d(
+            r_values_mv,
+            z_values_mv,
+            Fr_table_mv,
+            Fz_table_mv,
+            x_i,
+            y_i,
+            z_i,
+            power_factor_i,
+            radial_zero_tolerance,
+            &Fx_i,
+            &Fy_i,
+            &Fz_i,
+            &clamped
+        )
+        out_of_bounds_count += clamped
+
+        vx_i += 0.5 * dt * Fx_i / mass
+        vy_i += 0.5 * dt * Fy_i / mass
+        vz_i += 0.5 * dt * (Fz_i - weight) / mass
+
+        x_i += 0.5 * dt * vx_i
+        y_i += 0.5 * dt * vy_i
+        z_i += 0.5 * dt * vz_i
+
+        vx_i = damping_factor * vx_i + thermal_velocity_scale * brownian_x_mv[i]
+        vy_i = damping_factor * vy_i + thermal_velocity_scale * brownian_y_mv[i]
+        vz_i = damping_factor * vz_i + thermal_velocity_scale * brownian_z_mv[i]
+
+        x_i += 0.5 * dt * vx_i
+        y_i += 0.5 * dt * vy_i
+        z_i += 0.5 * dt * vz_i
+
+        lookup_force_3d(
+            r_values_mv,
+            z_values_mv,
+            Fr_table_mv,
+            Fz_table_mv,
+            x_i,
+            y_i,
+            z_i,
+            power_factor_i,
+            radial_zero_tolerance,
+            &Fx_i,
+            &Fy_i,
+            &Fz_i,
+            &clamped
+        )
+        out_of_bounds_count += clamped
+
+        vx_i += 0.5 * dt * Fx_i / mass
+        vy_i += 0.5 * dt * Fy_i / mass
+        vz_i += 0.5 * dt * (Fz_i - weight) / mass
+
+        sample_index = i + 1
+        x_out_mv[sample_index] = x_i
+        y_out_mv[sample_index] = y_i
+        z_out_mv[sample_index] = z_i
+        vx_out_mv[sample_index] = vx_i
+        vy_out_mv[sample_index] = vy_i
+        vz_out_mv[sample_index] = vz_i
+        axial_potential_i = lookup_linear_1d(
+            axial_energy_z_mv,
+            axial_potential_mv,
+            z_i
+        )
+
+        if (
+            terminate_on_trap_loss
+            and (
+                sample_index % trap_loss_check_interval_steps == 0
+                or sample_index == n - 1
+            )
+            and trap_lost_3d(
+                x_i,
+                y_i,
+                z_i,
+                vx_i,
+                vz_i,
+                Fz_i - weight,
+                axial_potential_i,
+                mass,
+                use_axial_energy_loss,
+                axial_lower_escape_z,
+                axial_lower_escape_energy,
+                x_eq,
+                y_eq,
+                z_eq,
+                trap_loss_x_outward_limit,
+                trap_loss_below_equilibrium_limit
+            )
+        ):
+            stop_index = sample_index
+            lost_flag = 1
+            break
+
+    return (
+        x_out,
+        y_out,
+        z_out,
+        vx_out,
+        vy_out,
+        vz_out,
+        out_of_bounds_count,
+        stop_index,
+        lost_flag
+    )
+
+
+def solve_baoab_3d_feedback_lookup_cython(
+    cnp.ndarray[cnp.float64_t, ndim=1] r_values,
+    cnp.ndarray[cnp.float64_t, ndim=1] z_values,
+    cnp.ndarray[cnp.float64_t, ndim=2] Fr_table,
+    cnp.ndarray[cnp.float64_t, ndim=2] Fz_table,
+    cnp.ndarray[cnp.float64_t, ndim=1] disturbance_power_factor_time,
+    cnp.ndarray[cnp.float64_t, ndim=1] brownian_normals_x,
+    cnp.ndarray[cnp.float64_t, ndim=1] brownian_normals_y,
+    cnp.ndarray[cnp.float64_t, ndim=1] brownian_normals_z,
+    cnp.ndarray[cnp.float64_t, ndim=1] feedback_position_noise,
+    double dt,
+    double mass,
+    double weight,
+    double damping_factor,
+    double thermal_velocity_scale,
+    double x0,
+    double y0,
+    double z0,
+    double vx0,
+    double vy0,
+    double vz0,
+    double z_eq,
+    double P_laser,
+    double feedback_kp,
+    double feedback_kd,
+    double force_per_watt,
+    double feedback_power_min_factor,
+    double feedback_power_max_factor,
+    double feedback_velocity_filter_alpha,
+    long control_decimation,
+    long loop_delay_baoab_steps,
+    double dt_control,
+    double radial_zero_tolerance,
+    bint use_axial_energy_loss,
+    cnp.ndarray[cnp.float64_t, ndim=1] axial_energy_z_values,
+    cnp.ndarray[cnp.float64_t, ndim=1] axial_potential_values,
+    double axial_lower_escape_z,
+    double axial_lower_escape_energy,
+    bint terminate_on_trap_loss=False,
+    long trap_loss_check_interval_steps=1,
+    double x_eq=0.0,
+    double y_eq=0.0,
+    double trap_loss_x_outward_limit=1.0,
+    double trap_loss_below_equilibrium_limit=1.0,
+):
+    cdef Py_ssize_t n = disturbance_power_factor_time.shape[0]
+    cdef Py_ssize_t i
+    cdef Py_ssize_t delayed_i
+    cdef Py_ssize_t sample_index
+    cdef Py_ssize_t stop_index = n - 1
+    cdef int lost_flag = 0
+    cdef long out_of_bounds_count = 0
+    cdef int clamped
+    cdef int have_filtered_z_previous = 0
+    cdef Py_ssize_t control_count = 0
+    cdef Py_ssize_t n_control_updates = 0
+    cdef double feedback_power_min = feedback_power_min_factor * P_laser
+    cdef double feedback_power_max = feedback_power_max_factor * P_laser
+    cdef double command_power = P_laser
+    cdef double filtered_z_previous = 0.0
+    cdef double z_measured
+    cdef double z_filtered
+    cdef double measured_vz
+    cdef double z_error
+    cdef double feedback_force
+    cdef double power_change
+    cdef double command_factor
+    cdef double actual_power_factor
     cdef double x_i
     cdef double y_i
     cdef double z_i
@@ -304,349 +551,384 @@ def solve_baoab_3d_lookup_cython(
     cdef double Fx_i
     cdef double Fy_i
     cdef double Fz_i
-    cdef double power_factor_i
-    cdef double damping_factor_i
-    cdef double thermal_velocity_scale_i
-    cdef double damping_factor_constant = 0.0
-    cdef double thermal_velocity_scale_constant = 0.0
-    cdef bint use_damping_factor_time = False
-    cdef bint use_thermal_velocity_scale_time = False
-    cdef cnp.ndarray[DTYPE_t, ndim=1] damping_factor_time_arr = np.empty(0, dtype=np.float64)
-    cdef cnp.ndarray[DTYPE_t, ndim=1] thermal_velocity_scale_time_arr = np.empty(0, dtype=np.float64)
-    cdef DTYPE_t[::1] damping_factor_time = damping_factor_time_arr
-    cdef DTYPE_t[::1] thermal_velocity_scale_time = thermal_velocity_scale_time_arr
+    cdef double axial_potential_i
 
-    if n < 1:
-        raise ValueError("power_factor_time must contain at least one sample.")
-    if r_values.shape[0] < 2 or z_values.shape[0] < 2:
-        raise ValueError("Force lookup table needs at least two grid points per axis.")
-    if brownian_normals_x.shape[0] < n - 1 or brownian_normals_y.shape[0] < n - 1 or brownian_normals_z.shape[0] < n - 1:
-        raise ValueError("Brownian normal arrays must have len(power_factor_time) - 1 samples.")
+    cdef cnp.ndarray[cnp.float64_t, ndim=1] x_out
+    cdef cnp.ndarray[cnp.float64_t, ndim=1] y_out
+    cdef cnp.ndarray[cnp.float64_t, ndim=1] z_out
+    cdef cnp.ndarray[cnp.float64_t, ndim=1] vx_out
+    cdef cnp.ndarray[cnp.float64_t, ndim=1] vy_out
+    cdef cnp.ndarray[cnp.float64_t, ndim=1] vz_out
+    cdef cnp.ndarray[cnp.float64_t, ndim=1] command_power_time
+    cdef cnp.ndarray[cnp.float64_t, ndim=1] actual_power_time
+    cdef cnp.ndarray[cnp.float64_t, ndim=1] control_times
+    cdef cnp.ndarray[cnp.float64_t, ndim=1] measurement_times
+    cdef cnp.ndarray[cnp.float64_t, ndim=1] measured_positions
+    cdef cnp.ndarray[cnp.float64_t, ndim=1] filtered_positions
+    cdef cnp.ndarray[cnp.float64_t, ndim=1] requested_powers
 
-    if np.ndim(damping_factor) == 0:
-        damping_factor_constant = float(damping_factor)
-    else:
-        use_damping_factor_time = True
-        damping_factor_time_arr = np.ascontiguousarray(damping_factor, dtype=np.float64)
-        if damping_factor_time_arr.shape[0] < n - 1:
-            raise ValueError("damping_factor must be scalar or have len(power_factor_time) - 1 samples.")
-        damping_factor_time = damping_factor_time_arr
+    cdef double[::1] r_values_mv
+    cdef double[::1] z_values_mv
+    cdef double[:, ::1] Fr_table_mv
+    cdef double[:, ::1] Fz_table_mv
+    cdef double[::1] disturbance_power_mv
+    cdef double[::1] brownian_x_mv
+    cdef double[::1] brownian_y_mv
+    cdef double[::1] brownian_z_mv
+    cdef double[::1] feedback_noise_mv
+    cdef double[::1] axial_energy_z_mv
+    cdef double[::1] axial_potential_mv
+    cdef double[::1] x_out_mv
+    cdef double[::1] y_out_mv
+    cdef double[::1] z_out_mv
+    cdef double[::1] vx_out_mv
+    cdef double[::1] vy_out_mv
+    cdef double[::1] vz_out_mv
+    cdef double[::1] command_power_mv
+    cdef double[::1] actual_power_mv
+    cdef double[::1] control_times_mv
+    cdef double[::1] measurement_times_mv
+    cdef double[::1] measured_positions_mv
+    cdef double[::1] filtered_positions_mv
+    cdef double[::1] requested_powers_mv
 
-    if np.ndim(thermal_velocity_scale) == 0:
-        thermal_velocity_scale_constant = float(thermal_velocity_scale)
-    else:
-        use_thermal_velocity_scale_time = True
-        thermal_velocity_scale_time_arr = np.ascontiguousarray(thermal_velocity_scale, dtype=np.float64)
-        if thermal_velocity_scale_time_arr.shape[0] < n - 1:
-            raise ValueError("thermal_velocity_scale must be scalar or have len(power_factor_time) - 1 samples.")
-        thermal_velocity_scale_time = thermal_velocity_scale_time_arr
+    if n >= 2:
+        n_control_updates = ((n - 2) // control_decimation) + 1
 
-    x_out[0] = x0
-    y_out[0] = y0
-    z_out[0] = z0
-    vx_out[0] = vx0
-    vy_out[0] = vy0
-    vz_out[0] = vz0
+    if trap_loss_check_interval_steps < 1:
+        trap_loss_check_interval_steps = 1
 
-    with nogil:
-        for i in range(n - 1):
-            x_i = x_out[i]
-            y_i = y_out[i]
-            z_i = z_out[i]
-            vx_i = vx_out[i]
-            vy_i = vy_out[i]
-            vz_i = vz_out[i]
-            power_factor_i = power_factor_time[i]
-            if use_damping_factor_time:
-                damping_factor_i = damping_factor_time[i]
+    x_out = np.zeros(n, dtype=np.float64)
+    y_out = np.zeros(n, dtype=np.float64)
+    z_out = np.zeros(n, dtype=np.float64)
+    vx_out = np.zeros(n, dtype=np.float64)
+    vy_out = np.zeros(n, dtype=np.float64)
+    vz_out = np.zeros(n, dtype=np.float64)
+    command_power_time = np.zeros(n, dtype=np.float64)
+    actual_power_time = np.zeros(n, dtype=np.float64)
+    control_times = np.zeros(n_control_updates, dtype=np.float64)
+    measurement_times = np.zeros(n_control_updates, dtype=np.float64)
+    measured_positions = np.zeros(n_control_updates, dtype=np.float64)
+    filtered_positions = np.zeros(n_control_updates, dtype=np.float64)
+    requested_powers = np.zeros(n_control_updates, dtype=np.float64)
+
+    r_values_mv = r_values
+    z_values_mv = z_values
+    Fr_table_mv = Fr_table
+    Fz_table_mv = Fz_table
+    disturbance_power_mv = disturbance_power_factor_time
+    brownian_x_mv = brownian_normals_x
+    brownian_y_mv = brownian_normals_y
+    brownian_z_mv = brownian_normals_z
+    feedback_noise_mv = feedback_position_noise
+    axial_energy_z_mv = axial_energy_z_values
+    axial_potential_mv = axial_potential_values
+    x_out_mv = x_out
+    y_out_mv = y_out
+    z_out_mv = z_out
+    vx_out_mv = vx_out
+    vy_out_mv = vy_out
+    vz_out_mv = vz_out
+    command_power_mv = command_power_time
+    actual_power_mv = actual_power_time
+    control_times_mv = control_times
+    measurement_times_mv = measurement_times
+    measured_positions_mv = measured_positions
+    filtered_positions_mv = filtered_positions
+    requested_powers_mv = requested_powers
+
+    x_out_mv[0] = x0
+    y_out_mv[0] = y0
+    z_out_mv[0] = z0
+    vx_out_mv[0] = vx0
+    vy_out_mv[0] = vy0
+    vz_out_mv[0] = vz0
+    command_power_mv[0] = command_power
+    actual_power_mv[0] = P_laser * clamp_double(
+        disturbance_power_mv[0],
+        feedback_power_min_factor,
+        feedback_power_max_factor
+    )
+
+    if terminate_on_trap_loss:
+        actual_power_factor = actual_power_mv[0] / P_laser
+        lookup_force_3d(
+            r_values_mv,
+            z_values_mv,
+            Fr_table_mv,
+            Fz_table_mv,
+            x0,
+            y0,
+            z0,
+            actual_power_factor,
+            radial_zero_tolerance,
+            &Fx_i,
+            &Fy_i,
+            &Fz_i,
+            &clamped
+        )
+        out_of_bounds_count += clamped
+        axial_potential_i = lookup_linear_1d(
+            axial_energy_z_mv,
+            axial_potential_mv,
+            z0
+        )
+
+        if trap_lost_3d(
+            x0,
+            y0,
+            z0,
+            vx0,
+            vz0,
+            Fz_i - weight,
+            axial_potential_i,
+            mass,
+            use_axial_energy_loss,
+            axial_lower_escape_z,
+            axial_lower_escape_energy,
+            x_eq,
+            y_eq,
+            z_eq,
+            trap_loss_x_outward_limit,
+            trap_loss_below_equilibrium_limit
+        ):
+            return (
+                x_out,
+                y_out,
+                z_out,
+                vx_out,
+                vy_out,
+                vz_out,
+                command_power_time,
+                actual_power_time,
+                control_times[:0].copy(),
+                measurement_times[:0].copy(),
+                measured_positions[:0].copy(),
+                filtered_positions[:0].copy(),
+                requested_powers[:0].copy(),
+                out_of_bounds_count,
+                0,
+                1
+            )
+
+    for i in range(n - 1):
+        if i % control_decimation == 0:
+            delayed_i = i - loop_delay_baoab_steps
+            if delayed_i < 0:
+                delayed_i = 0
+
+            z_measured = z_out_mv[delayed_i] + feedback_noise_mv[control_count]
+
+            if not have_filtered_z_previous:
+                z_filtered = z_measured
+                measured_vz = 0.0
+                have_filtered_z_previous = 1
             else:
-                damping_factor_i = damping_factor_constant
-            if use_thermal_velocity_scale_time:
-                thermal_velocity_scale_i = thermal_velocity_scale_time[i]
-            else:
-                thermal_velocity_scale_i = thermal_velocity_scale_constant
+                z_filtered = (
+                    feedback_velocity_filter_alpha * z_measured
+                    + (1.0 - feedback_velocity_filter_alpha) * filtered_z_previous
+                )
+                measured_vz = (z_filtered - filtered_z_previous) / dt_control
 
-            out_of_bounds_count += lookup_force_clamped(
-                r_values,
-                z_values,
-                Fr_table,
-                Fz_table,
+            z_error = z_filtered - z_eq
+            feedback_force = -feedback_kp * z_error - feedback_kd * measured_vz
+            power_change = feedback_force / force_per_watt
+            command_power = clamp_double(
+                P_laser + power_change,
+                feedback_power_min,
+                feedback_power_max
+            )
+
+            control_times_mv[control_count] = i * dt
+            measurement_times_mv[control_count] = delayed_i * dt
+            measured_positions_mv[control_count] = z_measured
+            filtered_positions_mv[control_count] = z_filtered
+            requested_powers_mv[control_count] = command_power
+            control_count += 1
+
+            filtered_z_previous = z_filtered
+
+        command_factor = command_power / P_laser
+        actual_power_factor = clamp_double(
+            command_factor * disturbance_power_mv[i],
+            feedback_power_min_factor,
+            feedback_power_max_factor
+        )
+
+        x_i = x_out_mv[i]
+        y_i = y_out_mv[i]
+        z_i = z_out_mv[i]
+        vx_i = vx_out_mv[i]
+        vy_i = vy_out_mv[i]
+        vz_i = vz_out_mv[i]
+
+        lookup_force_3d(
+            r_values_mv,
+            z_values_mv,
+            Fr_table_mv,
+            Fz_table_mv,
+            x_i,
+            y_i,
+            z_i,
+            actual_power_factor,
+            radial_zero_tolerance,
+            &Fx_i,
+            &Fy_i,
+            &Fz_i,
+            &clamped
+        )
+        out_of_bounds_count += clamped
+
+        vx_i += 0.5 * dt * Fx_i / mass
+        vy_i += 0.5 * dt * Fy_i / mass
+        vz_i += 0.5 * dt * (Fz_i - weight) / mass
+
+        x_i += 0.5 * dt * vx_i
+        y_i += 0.5 * dt * vy_i
+        z_i += 0.5 * dt * vz_i
+
+        vx_i = damping_factor * vx_i + thermal_velocity_scale * brownian_x_mv[i]
+        vy_i = damping_factor * vy_i + thermal_velocity_scale * brownian_y_mv[i]
+        vz_i = damping_factor * vz_i + thermal_velocity_scale * brownian_z_mv[i]
+
+        x_i += 0.5 * dt * vx_i
+        y_i += 0.5 * dt * vy_i
+        z_i += 0.5 * dt * vz_i
+
+        lookup_force_3d(
+            r_values_mv,
+            z_values_mv,
+            Fr_table_mv,
+            Fz_table_mv,
+            x_i,
+            y_i,
+            z_i,
+            actual_power_factor,
+            radial_zero_tolerance,
+            &Fx_i,
+            &Fy_i,
+            &Fz_i,
+            &clamped
+        )
+        out_of_bounds_count += clamped
+
+        vx_i += 0.5 * dt * Fx_i / mass
+        vy_i += 0.5 * dt * Fy_i / mass
+        vz_i += 0.5 * dt * (Fz_i - weight) / mass
+
+        sample_index = i + 1
+        x_out_mv[sample_index] = x_i
+        y_out_mv[sample_index] = y_i
+        z_out_mv[sample_index] = z_i
+        vx_out_mv[sample_index] = vx_i
+        vy_out_mv[sample_index] = vy_i
+        vz_out_mv[sample_index] = vz_i
+        command_power_mv[i] = command_power
+        actual_power_mv[i] = P_laser * actual_power_factor
+        command_power_mv[sample_index] = command_power
+        actual_power_mv[sample_index] = P_laser * actual_power_factor
+        axial_potential_i = lookup_linear_1d(
+            axial_energy_z_mv,
+            axial_potential_mv,
+            z_i
+        )
+
+        if (
+            terminate_on_trap_loss
+            and (
+                sample_index % trap_loss_check_interval_steps == 0
+                or sample_index == n - 1
+            )
+            and trap_lost_3d(
                 x_i,
                 y_i,
                 z_i,
-                power_factor_i,
-                radial_zero_tolerance,
-                &Fx_i,
-                &Fy_i,
-                &Fz_i,
+                vx_i,
+                vz_i,
+                Fz_i - weight,
+                axial_potential_i,
+                mass,
+                use_axial_energy_loss,
+                axial_lower_escape_z,
+                axial_lower_escape_energy,
+                x_eq,
+                y_eq,
+                z_eq,
+                trap_loss_x_outward_limit,
+                trap_loss_below_equilibrium_limit
             )
-            Fz_i -= weight
-            vx_i += 0.5 * dt * Fx_i / mass
-            vy_i += 0.5 * dt * Fy_i / mass
-            vz_i += 0.5 * dt * Fz_i / mass
+        ):
+            stop_index = sample_index
+            lost_flag = 1
+            break
 
-            x_i += 0.5 * dt * vx_i
-            y_i += 0.5 * dt * vy_i
-            z_i += 0.5 * dt * vz_i
-
-            vx_i = damping_factor_i * vx_i + thermal_velocity_scale_i * brownian_normals_x[i]
-            vy_i = damping_factor_i * vy_i + thermal_velocity_scale_i * brownian_normals_y[i]
-            vz_i = damping_factor_i * vz_i + thermal_velocity_scale_i * brownian_normals_z[i]
-
-            x_i += 0.5 * dt * vx_i
-            y_i += 0.5 * dt * vy_i
-            z_i += 0.5 * dt * vz_i
-
-            out_of_bounds_count += lookup_force_clamped(
-                r_values,
-                z_values,
-                Fr_table,
-                Fz_table,
-                x_i,
-                y_i,
-                z_i,
-                power_factor_i,
-                radial_zero_tolerance,
-                &Fx_i,
-                &Fy_i,
-                &Fz_i,
-            )
-            Fz_i -= weight
-            vx_i += 0.5 * dt * Fx_i / mass
-            vy_i += 0.5 * dt * Fy_i / mass
-            vz_i += 0.5 * dt * Fz_i / mass
-
-            x_out[i + 1] = x_i
-            y_out[i + 1] = y_i
-            z_out[i + 1] = z_i
-            vx_out[i + 1] = vx_i
-            vy_out[i + 1] = vy_i
-            vz_out[i + 1] = vz_i
+    if stop_index == n - 1 and n >= 2:
+        command_power_mv[n - 1] = command_power
+        actual_power_mv[n - 1] = actual_power_mv[n - 2]
 
     return (
-        x_out_arr,
-        y_out_arr,
-        z_out_arr,
-        vx_out_arr,
-        vy_out_arr,
-        vz_out_arr,
+        x_out,
+        y_out,
+        z_out,
+        vx_out,
+        vy_out,
+        vz_out,
+        command_power_time,
+        actual_power_time,
+        control_times[:control_count].copy(),
+        measurement_times[:control_count].copy(),
+        measured_positions[:control_count].copy(),
+        filtered_positions[:control_count].copy(),
+        requested_powers[:control_count].copy(),
         out_of_bounds_count,
+        stop_index,
+        lost_flag
     )
 
 
-def solve_baoab_3d_pressure_lookup_cython(
-    DTYPE_t[::1] r_values,
-    DTYPE_t[::1] z_values,
-    DTYPE_t[:, ::1] Fr_table,
-    DTYPE_t[:, ::1] Fz_ray_table,
-    DTYPE_t[:, ::1] Fz_photo_base_table,
-    DTYPE_t[::1] power_factor_time,
-    DTYPE_t[::1] photo_pressure_factor_time,
-    DTYPE_t[::1] brownian_normals_x,
-    DTYPE_t[::1] brownian_normals_y,
-    DTYPE_t[::1] brownian_normals_z,
+def classify_baoab_3d_lookup_cython(
+    cnp.ndarray[cnp.float64_t, ndim=1] r_values,
+    cnp.ndarray[cnp.float64_t, ndim=1] z_values,
+    cnp.ndarray[cnp.float64_t, ndim=2] Fr_table,
+    cnp.ndarray[cnp.float64_t, ndim=2] Fz_table,
+    long n_steps,
     double dt,
     double mass,
     double weight,
-    damping_factor,
-    thermal_velocity_scale,
+    double damping_factor,
     double x0,
     double y0,
     double z0,
     double vx0,
     double vy0,
     double vz0,
-    double radial_zero_tolerance=1.0e-30,
+    double power_factor,
+    double radial_zero_tolerance,
+    bint use_axial_energy_loss,
+    cnp.ndarray[cnp.float64_t, ndim=1] axial_energy_z_values,
+    cnp.ndarray[cnp.float64_t, ndim=1] axial_potential_values,
+    double axial_lower_escape_z,
+    double axial_lower_escape_energy,
+    long trap_loss_check_interval_steps,
+    double x_eq,
+    double y_eq,
+    double z_eq,
+    double trap_loss_x_outward_limit,
+    double trap_loss_below_equilibrium_limit,
 ):
-    cdef Py_ssize_t n = power_factor_time.shape[0]
-    cdef cnp.ndarray[DTYPE_t, ndim=1] x_out_arr = np.zeros(n, dtype=np.float64)
-    cdef cnp.ndarray[DTYPE_t, ndim=1] y_out_arr = np.zeros(n, dtype=np.float64)
-    cdef cnp.ndarray[DTYPE_t, ndim=1] z_out_arr = np.zeros(n, dtype=np.float64)
-    cdef cnp.ndarray[DTYPE_t, ndim=1] vx_out_arr = np.zeros(n, dtype=np.float64)
-    cdef cnp.ndarray[DTYPE_t, ndim=1] vy_out_arr = np.zeros(n, dtype=np.float64)
-    cdef cnp.ndarray[DTYPE_t, ndim=1] vz_out_arr = np.zeros(n, dtype=np.float64)
-    cdef DTYPE_t[::1] x_out = x_out_arr
-    cdef DTYPE_t[::1] y_out = y_out_arr
-    cdef DTYPE_t[::1] z_out = z_out_arr
-    cdef DTYPE_t[::1] vx_out = vx_out_arr
-    cdef DTYPE_t[::1] vy_out = vy_out_arr
-    cdef DTYPE_t[::1] vz_out = vz_out_arr
-    cdef Py_ssize_t i
-    cdef long out_of_bounds_count = 0
-    cdef double x_i
-    cdef double y_i
-    cdef double z_i
-    cdef double vx_i
-    cdef double vy_i
-    cdef double vz_i
-    cdef double Fx_i
-    cdef double Fy_i
-    cdef double Fz_i
-    cdef double power_factor_i
-    cdef double photo_pressure_factor_i
-    cdef double damping_factor_i
-    cdef double thermal_velocity_scale_i
-    cdef double damping_factor_constant = 0.0
-    cdef double thermal_velocity_scale_constant = 0.0
-    cdef bint use_damping_factor_time = False
-    cdef bint use_thermal_velocity_scale_time = False
-    cdef cnp.ndarray[DTYPE_t, ndim=1] damping_factor_time_arr = np.empty(0, dtype=np.float64)
-    cdef cnp.ndarray[DTYPE_t, ndim=1] thermal_velocity_scale_time_arr = np.empty(0, dtype=np.float64)
-    cdef DTYPE_t[::1] damping_factor_time = damping_factor_time_arr
-    cdef DTYPE_t[::1] thermal_velocity_scale_time = thermal_velocity_scale_time_arr
+    """
+    Fast deterministic capture/loss classifier for parameter sweeps.
 
-    if n < 1:
-        raise ValueError("power_factor_time must contain at least one sample.")
-    if r_values.shape[0] < 2 or z_values.shape[0] < 2:
-        raise ValueError("Force lookup table needs at least two grid points per axis.")
-    if photo_pressure_factor_time.shape[0] < n - 1:
-        raise ValueError("photo_pressure_factor_time must have len(power_factor_time) - 1 samples.")
-    if brownian_normals_x.shape[0] < n - 1 or brownian_normals_y.shape[0] < n - 1 or brownian_normals_z.shape[0] < n - 1:
-        raise ValueError("Brownian normal arrays must have len(power_factor_time) - 1 samples.")
-
-    if np.ndim(damping_factor) == 0:
-        damping_factor_constant = float(damping_factor)
-    else:
-        use_damping_factor_time = True
-        damping_factor_time_arr = np.ascontiguousarray(damping_factor, dtype=np.float64)
-        if damping_factor_time_arr.shape[0] < n - 1:
-            raise ValueError("damping_factor must be scalar or have len(power_factor_time) - 1 samples.")
-        damping_factor_time = damping_factor_time_arr
-
-    if np.ndim(thermal_velocity_scale) == 0:
-        thermal_velocity_scale_constant = float(thermal_velocity_scale)
-    else:
-        use_thermal_velocity_scale_time = True
-        thermal_velocity_scale_time_arr = np.ascontiguousarray(thermal_velocity_scale, dtype=np.float64)
-        if thermal_velocity_scale_time_arr.shape[0] < n - 1:
-            raise ValueError("thermal_velocity_scale must be scalar or have len(power_factor_time) - 1 samples.")
-        thermal_velocity_scale_time = thermal_velocity_scale_time_arr
-
-    x_out[0] = x0
-    y_out[0] = y0
-    z_out[0] = z0
-    vx_out[0] = vx0
-    vy_out[0] = vy0
-    vz_out[0] = vz0
-
-    with nogil:
-        for i in range(n - 1):
-            x_i = x_out[i]
-            y_i = y_out[i]
-            z_i = z_out[i]
-            vx_i = vx_out[i]
-            vy_i = vy_out[i]
-            vz_i = vz_out[i]
-            power_factor_i = power_factor_time[i]
-            photo_pressure_factor_i = photo_pressure_factor_time[i]
-            if use_damping_factor_time:
-                damping_factor_i = damping_factor_time[i]
-            else:
-                damping_factor_i = damping_factor_constant
-            if use_thermal_velocity_scale_time:
-                thermal_velocity_scale_i = thermal_velocity_scale_time[i]
-            else:
-                thermal_velocity_scale_i = thermal_velocity_scale_constant
-
-            out_of_bounds_count += lookup_force_clamped_pressure(
-                r_values,
-                z_values,
-                Fr_table,
-                Fz_ray_table,
-                Fz_photo_base_table,
-                x_i,
-                y_i,
-                z_i,
-                power_factor_i,
-                photo_pressure_factor_i,
-                radial_zero_tolerance,
-                &Fx_i,
-                &Fy_i,
-                &Fz_i,
-            )
-            Fz_i -= weight
-            vx_i += 0.5 * dt * Fx_i / mass
-            vy_i += 0.5 * dt * Fy_i / mass
-            vz_i += 0.5 * dt * Fz_i / mass
-
-            x_i += 0.5 * dt * vx_i
-            y_i += 0.5 * dt * vy_i
-            z_i += 0.5 * dt * vz_i
-
-            vx_i = damping_factor_i * vx_i + thermal_velocity_scale_i * brownian_normals_x[i]
-            vy_i = damping_factor_i * vy_i + thermal_velocity_scale_i * brownian_normals_y[i]
-            vz_i = damping_factor_i * vz_i + thermal_velocity_scale_i * brownian_normals_z[i]
-
-            x_i += 0.5 * dt * vx_i
-            y_i += 0.5 * dt * vy_i
-            z_i += 0.5 * dt * vz_i
-
-            out_of_bounds_count += lookup_force_clamped_pressure(
-                r_values,
-                z_values,
-                Fr_table,
-                Fz_ray_table,
-                Fz_photo_base_table,
-                x_i,
-                y_i,
-                z_i,
-                power_factor_i,
-                photo_pressure_factor_i,
-                radial_zero_tolerance,
-                &Fx_i,
-                &Fy_i,
-                &Fz_i,
-            )
-            Fz_i -= weight
-            vx_i += 0.5 * dt * Fx_i / mass
-            vy_i += 0.5 * dt * Fy_i / mass
-            vz_i += 0.5 * dt * Fz_i / mass
-
-            x_out[i + 1] = x_i
-            y_out[i + 1] = y_i
-            z_out[i + 1] = z_i
-            vx_out[i + 1] = vx_i
-            vy_out[i + 1] = vy_i
-            vz_out[i + 1] = vz_i
-
-    return (
-        x_out_arr,
-        y_out_arr,
-        z_out_arr,
-        vx_out_arr,
-        vy_out_arr,
-        vz_out_arr,
-        out_of_bounds_count,
-    )
-
-
-def solve_baoab_3d_lookup_cython_positions_into(
-    DTYPE_t[::1] r_values,
-    DTYPE_t[::1] z_values,
-    DTYPE_t[:, ::1] Fr_table,
-    DTYPE_t[:, ::1] Fz_table,
-    DTYPE_t[::1] power_factor_time,
-    DTYPE_t[::1] brownian_normals_x,
-    DTYPE_t[::1] brownian_normals_y,
-    DTYPE_t[::1] brownian_normals_z,
-    double dt,
-    double mass,
-    double weight,
-    damping_factor,
-    thermal_velocity_scale,
-    double x0,
-    double y0,
-    double z0,
-    double vx0,
-    double vy0,
-    double vz0,
-    DTYPE_t[::1] x_out,
-    DTYPE_t[::1] y_out,
-    DTYPE_t[::1] z_out,
-    double radial_zero_tolerance=1.0e-30,
-):
-    cdef Py_ssize_t n = power_factor_time.shape[0]
-    cdef Py_ssize_t i
+    This uses the same BAOAB drift/kick structure and force lookup as the full
+    trajectory solver, but it stores only the current state. Brownian kicks and
+    laser-power noise are intentionally omitted so the returned basin boundary is
+    deterministic.
+    """
+    cdef long i
+    cdef long sample_index
+    cdef long stop_index = n_steps
+    cdef int lost_flag = 0
+    cdef int clamped
     cdef long out_of_bounds_count = 0
     cdef double x_i = x0
     cdef double y_i = y0
@@ -657,410 +939,165 @@ def solve_baoab_3d_lookup_cython_positions_into(
     cdef double Fx_i
     cdef double Fy_i
     cdef double Fz_i
-    cdef double power_factor_i
-    cdef double damping_factor_i
-    cdef double thermal_velocity_scale_i
-    cdef double damping_factor_constant = 0.0
-    cdef double thermal_velocity_scale_constant = 0.0
-    cdef bint use_damping_factor_time = False
-    cdef bint use_thermal_velocity_scale_time = False
-    cdef cnp.ndarray[DTYPE_t, ndim=1] damping_factor_time_arr = np.empty(0, dtype=np.float64)
-    cdef cnp.ndarray[DTYPE_t, ndim=1] thermal_velocity_scale_time_arr = np.empty(0, dtype=np.float64)
-    cdef DTYPE_t[::1] damping_factor_time = damping_factor_time_arr
-    cdef DTYPE_t[::1] thermal_velocity_scale_time = thermal_velocity_scale_time_arr
+    cdef double axial_potential_i
 
-    if n < 1:
-        raise ValueError("power_factor_time must contain at least one sample.")
-    if r_values.shape[0] < 2 or z_values.shape[0] < 2:
-        raise ValueError("Force lookup table needs at least two grid points per axis.")
-    if brownian_normals_x.shape[0] < n - 1 or brownian_normals_y.shape[0] < n - 1 or brownian_normals_z.shape[0] < n - 1:
-        raise ValueError("Brownian normal arrays must have len(power_factor_time) - 1 samples.")
-    if x_out.shape[0] < n or y_out.shape[0] < n or z_out.shape[0] < n:
-        raise ValueError("Output arrays must have len(power_factor_time) samples.")
+    cdef double[::1] r_values_mv = r_values
+    cdef double[::1] z_values_mv = z_values
+    cdef double[:, ::1] Fr_table_mv = Fr_table
+    cdef double[:, ::1] Fz_table_mv = Fz_table
+    cdef double[::1] axial_energy_z_mv = axial_energy_z_values
+    cdef double[::1] axial_potential_mv = axial_potential_values
 
-    if np.ndim(damping_factor) == 0:
-        damping_factor_constant = float(damping_factor)
-    else:
-        use_damping_factor_time = True
-        damping_factor_time_arr = np.ascontiguousarray(damping_factor, dtype=np.float64)
-        if damping_factor_time_arr.shape[0] < n - 1:
-            raise ValueError("damping_factor must be scalar or have len(power_factor_time) - 1 samples.")
-        damping_factor_time = damping_factor_time_arr
+    if trap_loss_check_interval_steps < 1:
+        trap_loss_check_interval_steps = 1
 
-    if np.ndim(thermal_velocity_scale) == 0:
-        thermal_velocity_scale_constant = float(thermal_velocity_scale)
-    else:
-        use_thermal_velocity_scale_time = True
-        thermal_velocity_scale_time_arr = np.ascontiguousarray(thermal_velocity_scale, dtype=np.float64)
-        if thermal_velocity_scale_time_arr.shape[0] < n - 1:
-            raise ValueError("thermal_velocity_scale must be scalar or have len(power_factor_time) - 1 samples.")
-        thermal_velocity_scale_time = thermal_velocity_scale_time_arr
+    lookup_force_3d(
+        r_values_mv,
+        z_values_mv,
+        Fr_table_mv,
+        Fz_table_mv,
+        x_i,
+        y_i,
+        z_i,
+        power_factor,
+        radial_zero_tolerance,
+        &Fx_i,
+        &Fy_i,
+        &Fz_i,
+        &clamped
+    )
+    out_of_bounds_count += clamped
+    axial_potential_i = lookup_linear_1d(
+        axial_energy_z_mv,
+        axial_potential_mv,
+        z_i
+    )
 
-    x_out[0] = x_i
-    y_out[0] = y_i
-    z_out[0] = z_i
+    if trap_lost_3d(
+        x_i,
+        y_i,
+        z_i,
+        vx_i,
+        vz_i,
+        Fz_i - weight,
+        axial_potential_i,
+        mass,
+        use_axial_energy_loss,
+        axial_lower_escape_z,
+        axial_lower_escape_energy,
+        x_eq,
+        y_eq,
+        z_eq,
+        trap_loss_x_outward_limit,
+        trap_loss_below_equilibrium_limit
+    ):
+        return (
+            1,
+            0,
+            x_i,
+            y_i,
+            z_i,
+            vx_i,
+            vy_i,
+            vz_i,
+            out_of_bounds_count
+        )
 
-    with nogil:
-        for i in range(n - 1):
-            power_factor_i = power_factor_time[i]
-            if use_damping_factor_time:
-                damping_factor_i = damping_factor_time[i]
-            else:
-                damping_factor_i = damping_factor_constant
-            if use_thermal_velocity_scale_time:
-                thermal_velocity_scale_i = thermal_velocity_scale_time[i]
-            else:
-                thermal_velocity_scale_i = thermal_velocity_scale_constant
+    for i in range(n_steps):
+        lookup_force_3d(
+            r_values_mv,
+            z_values_mv,
+            Fr_table_mv,
+            Fz_table_mv,
+            x_i,
+            y_i,
+            z_i,
+            power_factor,
+            radial_zero_tolerance,
+            &Fx_i,
+            &Fy_i,
+            &Fz_i,
+            &clamped
+        )
+        out_of_bounds_count += clamped
 
-            out_of_bounds_count += lookup_force_clamped(
-                r_values,
-                z_values,
-                Fr_table,
-                Fz_table,
-                x_i,
-                y_i,
-                z_i,
-                power_factor_i,
-                radial_zero_tolerance,
-                &Fx_i,
-                &Fy_i,
-                &Fz_i,
-            )
-            Fz_i -= weight
-            vx_i += 0.5 * dt * Fx_i / mass
-            vy_i += 0.5 * dt * Fy_i / mass
-            vz_i += 0.5 * dt * Fz_i / mass
+        vx_i += 0.5 * dt * Fx_i / mass
+        vy_i += 0.5 * dt * Fy_i / mass
+        vz_i += 0.5 * dt * (Fz_i - weight) / mass
 
-            x_i += 0.5 * dt * vx_i
-            y_i += 0.5 * dt * vy_i
-            z_i += 0.5 * dt * vz_i
+        x_i += 0.5 * dt * vx_i
+        y_i += 0.5 * dt * vy_i
+        z_i += 0.5 * dt * vz_i
 
-            vx_i = damping_factor_i * vx_i + thermal_velocity_scale_i * brownian_normals_x[i]
-            vy_i = damping_factor_i * vy_i + thermal_velocity_scale_i * brownian_normals_y[i]
-            vz_i = damping_factor_i * vz_i + thermal_velocity_scale_i * brownian_normals_z[i]
+        vx_i = damping_factor * vx_i
+        vy_i = damping_factor * vy_i
+        vz_i = damping_factor * vz_i
 
-            x_i += 0.5 * dt * vx_i
-            y_i += 0.5 * dt * vy_i
-            z_i += 0.5 * dt * vz_i
+        x_i += 0.5 * dt * vx_i
+        y_i += 0.5 * dt * vy_i
+        z_i += 0.5 * dt * vz_i
 
-            out_of_bounds_count += lookup_force_clamped(
-                r_values,
-                z_values,
-                Fr_table,
-                Fz_table,
-                x_i,
-                y_i,
-                z_i,
-                power_factor_i,
-                radial_zero_tolerance,
-                &Fx_i,
-                &Fy_i,
-                &Fz_i,
-            )
-            Fz_i -= weight
-            vx_i += 0.5 * dt * Fx_i / mass
-            vy_i += 0.5 * dt * Fy_i / mass
-            vz_i += 0.5 * dt * Fz_i / mass
+        lookup_force_3d(
+            r_values_mv,
+            z_values_mv,
+            Fr_table_mv,
+            Fz_table_mv,
+            x_i,
+            y_i,
+            z_i,
+            power_factor,
+            radial_zero_tolerance,
+            &Fx_i,
+            &Fy_i,
+            &Fz_i,
+            &clamped
+        )
+        out_of_bounds_count += clamped
 
-            x_out[i + 1] = x_i
-            y_out[i + 1] = y_i
-            z_out[i + 1] = z_i
+        vx_i += 0.5 * dt * Fx_i / mass
+        vy_i += 0.5 * dt * Fy_i / mass
+        vz_i += 0.5 * dt * (Fz_i - weight) / mass
 
-    return out_of_bounds_count
+        sample_index = i + 1
+        axial_potential_i = lookup_linear_1d(
+            axial_energy_z_mv,
+            axial_potential_mv,
+            z_i
+        )
 
-
-def solve_baoab_3d_feedback_lookup_cython(
-    DTYPE_t[::1] r_values,
-    DTYPE_t[::1] z_values,
-    DTYPE_t[:, ::1] Fr_table,
-    DTYPE_t[:, ::1] Fz_table,
-    DTYPE_t[::1] disturbance_power_factor_time,
-    DTYPE_t[::1] brownian_normals_x,
-    DTYPE_t[::1] brownian_normals_y,
-    DTYPE_t[::1] brownian_normals_z,
-    DTYPE_t[::1] feedback_position_noise,
-    double dt,
-    double mass,
-    double weight,
-    damping_factor,
-    thermal_velocity_scale,
-    double x0,
-    double y0,
-    double z0,
-    double vx0,
-    double vy0,
-    double vz0,
-    double z_eq,
-    double laser_power,
-    double feedback_kp,
-    double feedback_kd,
-    double force_per_watt,
-    double feedback_power_min_factor,
-    double feedback_power_max_factor,
-    double feedback_velocity_filter_alpha,
-    Py_ssize_t control_decimation,
-    Py_ssize_t loop_delay_baoab_steps,
-    double dt_control,
-    double radial_zero_tolerance=1.0e-30,
-):
-    cdef Py_ssize_t n = disturbance_power_factor_time.shape[0]
-    cdef Py_ssize_t n_control = 0
-    cdef cnp.ndarray[DTYPE_t, ndim=1] x_out_arr = np.zeros(n, dtype=np.float64)
-    cdef cnp.ndarray[DTYPE_t, ndim=1] y_out_arr = np.zeros(n, dtype=np.float64)
-    cdef cnp.ndarray[DTYPE_t, ndim=1] z_out_arr = np.zeros(n, dtype=np.float64)
-    cdef cnp.ndarray[DTYPE_t, ndim=1] vx_out_arr = np.zeros(n, dtype=np.float64)
-    cdef cnp.ndarray[DTYPE_t, ndim=1] vy_out_arr = np.zeros(n, dtype=np.float64)
-    cdef cnp.ndarray[DTYPE_t, ndim=1] vz_out_arr = np.zeros(n, dtype=np.float64)
-    cdef cnp.ndarray[DTYPE_t, ndim=1] command_power_arr = np.zeros(n, dtype=np.float64)
-    cdef cnp.ndarray[DTYPE_t, ndim=1] actual_power_arr = np.zeros(n, dtype=np.float64)
-    cdef cnp.ndarray[DTYPE_t, ndim=1] control_t_arr
-    cdef cnp.ndarray[DTYPE_t, ndim=1] measurement_t_arr
-    cdef cnp.ndarray[DTYPE_t, ndim=1] z_measured_arr
-    cdef cnp.ndarray[DTYPE_t, ndim=1] z_filtered_arr
-    cdef cnp.ndarray[DTYPE_t, ndim=1] requested_power_arr
-    cdef DTYPE_t[::1] x_out = x_out_arr
-    cdef DTYPE_t[::1] y_out = y_out_arr
-    cdef DTYPE_t[::1] z_out = z_out_arr
-    cdef DTYPE_t[::1] vx_out = vx_out_arr
-    cdef DTYPE_t[::1] vy_out = vy_out_arr
-    cdef DTYPE_t[::1] vz_out = vz_out_arr
-    cdef DTYPE_t[::1] command_power = command_power_arr
-    cdef DTYPE_t[::1] actual_power = actual_power_arr
-    cdef DTYPE_t[::1] control_t
-    cdef DTYPE_t[::1] measurement_t
-    cdef DTYPE_t[::1] z_measured_values
-    cdef DTYPE_t[::1] z_filtered_values
-    cdef DTYPE_t[::1] requested_power
-    cdef Py_ssize_t i
-    cdef Py_ssize_t delayed_i
-    cdef Py_ssize_t control_count = 0
-    cdef long out_of_bounds_count = 0
-    cdef int have_filtered = 0
-    cdef double x_i
-    cdef double y_i
-    cdef double z_i
-    cdef double vx_i
-    cdef double vy_i
-    cdef double vz_i
-    cdef double Fx_i
-    cdef double Fy_i
-    cdef double Fz_i
-    cdef double command_power_i = laser_power
-    cdef double command_factor
-    cdef double actual_power_factor
-    cdef double z_measured
-    cdef double z_filtered = 0.0
-    cdef double filtered_z_previous = 0.0
-    cdef double measured_vz
-    cdef double z_error
-    cdef double feedback_force
-    cdef double power_change
-    cdef double feedback_power_min = feedback_power_min_factor * laser_power
-    cdef double feedback_power_max = feedback_power_max_factor * laser_power
-    cdef double damping_factor_i
-    cdef double thermal_velocity_scale_i
-    cdef double damping_factor_constant = 0.0
-    cdef double thermal_velocity_scale_constant = 0.0
-    cdef bint use_damping_factor_time = False
-    cdef bint use_thermal_velocity_scale_time = False
-    cdef cnp.ndarray[DTYPE_t, ndim=1] damping_factor_time_arr = np.empty(0, dtype=np.float64)
-    cdef cnp.ndarray[DTYPE_t, ndim=1] thermal_velocity_scale_time_arr = np.empty(0, dtype=np.float64)
-    cdef DTYPE_t[::1] damping_factor_time = damping_factor_time_arr
-    cdef DTYPE_t[::1] thermal_velocity_scale_time = thermal_velocity_scale_time_arr
-
-    if n < 1:
-        raise ValueError("disturbance_power_factor_time must contain at least one sample.")
-    if r_values.shape[0] < 2 or z_values.shape[0] < 2:
-        raise ValueError("Force lookup table needs at least two grid points per axis.")
-    if control_decimation < 1:
-        raise ValueError("control_decimation must be at least 1.")
-    if brownian_normals_x.shape[0] < n - 1 or brownian_normals_y.shape[0] < n - 1 or brownian_normals_z.shape[0] < n - 1:
-        raise ValueError("Brownian normal arrays must have len(disturbance_power_factor_time) - 1 samples.")
-
-    if n >= 2:
-        n_control = ((n - 2) // control_decimation) + 1
-    else:
-        n_control = 0
-
-    if feedback_position_noise.shape[0] < n_control:
-        raise ValueError("feedback_position_noise must contain one sample per control update.")
-
-    if np.ndim(damping_factor) == 0:
-        damping_factor_constant = float(damping_factor)
-    else:
-        use_damping_factor_time = True
-        damping_factor_time_arr = np.ascontiguousarray(damping_factor, dtype=np.float64)
-        if damping_factor_time_arr.shape[0] < n - 1:
-            raise ValueError("damping_factor must be scalar or have len(disturbance_power_factor_time) - 1 samples.")
-        damping_factor_time = damping_factor_time_arr
-
-    if np.ndim(thermal_velocity_scale) == 0:
-        thermal_velocity_scale_constant = float(thermal_velocity_scale)
-    else:
-        use_thermal_velocity_scale_time = True
-        thermal_velocity_scale_time_arr = np.ascontiguousarray(thermal_velocity_scale, dtype=np.float64)
-        if thermal_velocity_scale_time_arr.shape[0] < n - 1:
-            raise ValueError("thermal_velocity_scale must be scalar or have len(disturbance_power_factor_time) - 1 samples.")
-        thermal_velocity_scale_time = thermal_velocity_scale_time_arr
-
-    control_t_arr = np.zeros(n_control, dtype=np.float64)
-    measurement_t_arr = np.zeros(n_control, dtype=np.float64)
-    z_measured_arr = np.zeros(n_control, dtype=np.float64)
-    z_filtered_arr = np.zeros(n_control, dtype=np.float64)
-    requested_power_arr = np.zeros(n_control, dtype=np.float64)
-    control_t = control_t_arr
-    measurement_t = measurement_t_arr
-    z_measured_values = z_measured_arr
-    z_filtered_values = z_filtered_arr
-    requested_power = requested_power_arr
-
-    x_out[0] = x0
-    y_out[0] = y0
-    z_out[0] = z0
-    vx_out[0] = vx0
-    vy_out[0] = vy0
-    vz_out[0] = vz0
-
-    with nogil:
-        for i in range(n - 1):
-            if i % control_decimation == 0:
-                delayed_i = i - loop_delay_baoab_steps
-                if delayed_i < 0:
-                    delayed_i = 0
-
-                z_measured = z_out[delayed_i] + feedback_position_noise[control_count]
-
-                if have_filtered == 0:
-                    z_filtered = z_measured
-                    measured_vz = 0.0
-                    have_filtered = 1
-                else:
-                    z_filtered = (
-                        feedback_velocity_filter_alpha * z_measured
-                        + (1.0 - feedback_velocity_filter_alpha) * filtered_z_previous
-                    )
-                    measured_vz = (z_filtered - filtered_z_previous) / dt_control
-
-                z_error = z_filtered - z_eq
-                feedback_force = -feedback_kp * z_error - feedback_kd * measured_vz
-                power_change = feedback_force / force_per_watt
-                command_power_i = laser_power + power_change
-
-                if command_power_i < feedback_power_min:
-                    command_power_i = feedback_power_min
-                elif command_power_i > feedback_power_max:
-                    command_power_i = feedback_power_max
-
-                control_t[control_count] = i * dt
-                measurement_t[control_count] = delayed_i * dt
-                z_measured_values[control_count] = z_measured
-                z_filtered_values[control_count] = z_filtered
-                requested_power[control_count] = command_power_i
-                control_count += 1
-                filtered_z_previous = z_filtered
-
-            command_factor = command_power_i / laser_power
-            actual_power_factor = command_factor * disturbance_power_factor_time[i]
-            if use_damping_factor_time:
-                damping_factor_i = damping_factor_time[i]
-            else:
-                damping_factor_i = damping_factor_constant
-            if use_thermal_velocity_scale_time:
-                thermal_velocity_scale_i = thermal_velocity_scale_time[i]
-            else:
-                thermal_velocity_scale_i = thermal_velocity_scale_constant
-
-            if actual_power_factor < feedback_power_min_factor:
-                actual_power_factor = feedback_power_min_factor
-            elif actual_power_factor > feedback_power_max_factor:
-                actual_power_factor = feedback_power_max_factor
-
-            x_i = x_out[i]
-            y_i = y_out[i]
-            z_i = z_out[i]
-            vx_i = vx_out[i]
-            vy_i = vy_out[i]
-            vz_i = vz_out[i]
-
-            out_of_bounds_count += lookup_force_clamped(
-                r_values,
-                z_values,
-                Fr_table,
-                Fz_table,
-                x_i,
-                y_i,
-                z_i,
-                actual_power_factor,
-                radial_zero_tolerance,
-                &Fx_i,
-                &Fy_i,
-                &Fz_i,
-            )
-            Fz_i -= weight
-            vx_i += 0.5 * dt * Fx_i / mass
-            vy_i += 0.5 * dt * Fy_i / mass
-            vz_i += 0.5 * dt * Fz_i / mass
-
-            x_i += 0.5 * dt * vx_i
-            y_i += 0.5 * dt * vy_i
-            z_i += 0.5 * dt * vz_i
-
-            vx_i = damping_factor_i * vx_i + thermal_velocity_scale_i * brownian_normals_x[i]
-            vy_i = damping_factor_i * vy_i + thermal_velocity_scale_i * brownian_normals_y[i]
-            vz_i = damping_factor_i * vz_i + thermal_velocity_scale_i * brownian_normals_z[i]
-
-            x_i += 0.5 * dt * vx_i
-            y_i += 0.5 * dt * vy_i
-            z_i += 0.5 * dt * vz_i
-
-            out_of_bounds_count += lookup_force_clamped(
-                r_values,
-                z_values,
-                Fr_table,
-                Fz_table,
-                x_i,
-                y_i,
-                z_i,
-                actual_power_factor,
-                radial_zero_tolerance,
-                &Fx_i,
-                &Fy_i,
-                &Fz_i,
-            )
-            Fz_i -= weight
-            vx_i += 0.5 * dt * Fx_i / mass
-            vy_i += 0.5 * dt * Fy_i / mass
-            vz_i += 0.5 * dt * Fz_i / mass
-
-            x_out[i + 1] = x_i
-            y_out[i + 1] = y_i
-            z_out[i + 1] = z_i
-            vx_out[i + 1] = vx_i
-            vy_out[i + 1] = vy_i
-            vz_out[i + 1] = vz_i
-            command_power[i] = command_power_i
-            actual_power[i] = laser_power * actual_power_factor
-
-    if n >= 2:
-        command_power[n - 1] = command_power_i
-        actual_power[n - 1] = actual_power[n - 2]
-    elif n == 1:
-        command_power[0] = command_power_i
-        actual_power[0] = laser_power
+        if (
+            sample_index % trap_loss_check_interval_steps == 0
+            or sample_index == n_steps
+        ) and trap_lost_3d(
+            x_i,
+            y_i,
+            z_i,
+            vx_i,
+            vz_i,
+            Fz_i - weight,
+            axial_potential_i,
+            mass,
+            use_axial_energy_loss,
+            axial_lower_escape_z,
+            axial_lower_escape_energy,
+            x_eq,
+            y_eq,
+            z_eq,
+            trap_loss_x_outward_limit,
+            trap_loss_below_equilibrium_limit
+        ):
+            stop_index = sample_index
+            lost_flag = 1
+            break
 
     return (
-        x_out_arr,
-        y_out_arr,
-        z_out_arr,
-        vx_out_arr,
-        vy_out_arr,
-        vz_out_arr,
-        command_power_arr,
-        actual_power_arr,
-        control_t_arr,
-        measurement_t_arr,
-        z_measured_arr,
-        z_filtered_arr,
-        requested_power_arr,
-        out_of_bounds_count,
+        lost_flag,
+        stop_index,
+        x_i,
+        y_i,
+        z_i,
+        vx_i,
+        vy_i,
+        vz_i,
+        out_of_bounds_count
     )

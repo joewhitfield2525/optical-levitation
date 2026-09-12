@@ -1,4 +1,6 @@
 import numpy as np
+import os
+import matplotlib as mpl
 import matplotlib.pyplot as plt
 from scipy.interpolate import RegularGridInterpolator
 from scipy.optimize import brentq, least_squares
@@ -9,6 +11,46 @@ from time import perf_counter
 from pathlib import Path
 import csv
 import sys
+
+# --- Publication style ---
+fontsize = 7
+mpl.rcParams.update({
+
+    # Figure
+    "figure.figsize": (3.4, 2.6),  # single column
+    "figure.dpi": 300,
+
+    # Font
+    "font.family": "sans-serif",
+    "font.size": fontsize,
+    "axes.labelsize": fontsize,
+    "axes.titlesize": fontsize,
+    "xtick.labelsize": fontsize - 1,
+    "ytick.labelsize": fontsize - 1,
+    "legend.fontsize": fontsize - 1,
+
+    # Lines
+    "lines.linewidth": 1.5,
+    "lines.markersize": 4,
+
+    # Axes
+    "axes.linewidth": 0.8,
+    "xtick.direction": "in",
+    "ytick.direction": "in",
+    "xtick.top": True,
+    "ytick.right": True,
+
+    # Grid
+    "grid.linestyle": ":",
+    "grid.linewidth": 0.5,
+    "grid.alpha": 0.6,
+
+    # Remove top/right spine? (optional)
+    # "axes.spines.top": False,
+    # "axes.spines.right": False,
+})
+save_path = "./Figures/"
+os.makedirs(save_path, exist_ok=True)
 
 CYTHON_DIR = Path("/Users/josephwhitfield/Masters/Summer Project/cython_improved")
 sys.path.insert(0, str(CYTHON_DIR))
@@ -51,7 +93,7 @@ c_light = 299792458
 # User-adjustable parameters
 # ****************************************************************************************************************************************************
 # Particle properties
-radius = 7e-6          # m
+radius = 6.3e-6          # m
 density = 1100         # kg/m^3
 n_particle = 1.555      # particle refractive index
 n_medium = 1.00027     # surrounding medium refractive index, air
@@ -66,26 +108,29 @@ kB = 1.38e-23
 d_air = 3.7e-10
 
 # Laser / force parameters
-w0 = 20e-6        # beam waist, m
+w0 = 2.96e-6        # beam waist, m
 wavelength = 532e-9
 M2 = 1.2
 use_m2_rayleigh_range = True
 zR_manual = 100e-6
-P_laser = 0.075           # W, example laser power
+P_laser = 0.04           # W, example laser power
 use_laser_power_noise = True
 laser_noise_model = "synthetic_step"
 # Choose one of:
-#   "synthetic_step"  old three-level random walk using laser_noise_fraction
+#   "synthetic_step"  three-level random walk using laser_noise_fraction
 #   "measured_csv"    measured trace shape, scaled so its mean is P_laser
+#   "psd_matched"     synthetic trace with the measured laser-noise PSD
 laser_noise_fraction = 0.01
 laser_noise_frequency = 300
 laser_noise_step_duration = 1 / laser_noise_frequency     # s
 measured_laser_noise_csv = Path(
-    "/Users/josephwhitfield/Masters/Summer Project/Power_02min.csv"
+    "/Users/josephwhitfield/Masters/Summer Project/Power_30min.csv"
 )
 measured_laser_noise_loop = True
 measured_laser_noise_match_input_mean = True
 measured_laser_noise_equilibrium_points = 31
+psd_matched_laser_noise_welch_duration = 2.0
+psd_matched_laser_noise_peak_fraction = 0.01
 
 # Optical force model
 optical_force_model = "ray_optics"
@@ -99,6 +144,7 @@ optical_force_model = "ray_optics"
 #   "external_lookup" Optical force from an externally generated .npz lookup
 #                     table, for example from MiePy/GLMT/T-matrix calculations.
 external_optical_force_table_path = "miepy_optical_force_table.npz"
+optical_force_scale = 1.0
 
 # Ashkin ray-optics sampling
 ray_grid_points = 200
@@ -107,7 +153,7 @@ ray_grid_points = 200
 k_particle = 0.135       # W/(m K)
 alpha_acc = 1.0
 kappa_t = 1.14
-absorption_fraction = 1e-3
+absorption_fraction = 15e-3
 
 # 3D force lookup table
 use_force_lookup_table = True
@@ -146,6 +192,7 @@ cunningham_A = 1.257
 cunningham_B = 0.4
 cunningham_C = 1.1
 epstein_accommodation_alpha = 1.0
+effective_damping_scale = 1.0
 
 # Initial conditions relative to the chosen equilibrium
 x_displacement = 0e-6
@@ -157,8 +204,8 @@ vz0 = 0.0
 
 # Time integration
 t_start = 0
-t_end =35.0
-dt_baoab = 1 / 200000
+t_end =20
+dt_baoab = 1 / 35000
 use_brownian_noise = True
 brownian_seed = 747
 laser_noise_seed = 132
@@ -206,7 +253,7 @@ radial_zero_tolerance = 1e-30
 near_axis_tolerance = 1e-12
 
 # Plotting and diagnostic ranges
-display_plots = True
+display_plots = False
 if (
     psd_normalisation_only
     or welch_averaging_only
@@ -253,16 +300,17 @@ force_field_quiver_scale = 55
 on_axis_check_z_min = -200e-6
 on_axis_check_z_max = 300e-6
 on_axis_check_points = 1000
-time_trace_figsize = (8, 8)
-single_diagnostic_figsize = (8, 4)
-spectrum_figsize = (8, 5)
-trajectory_3d_figsize = (8, 6)
-trajectory_projection_figsize = (13, 4)
-force_check_figsize = (8, 5)
-force_field_figsize = (8, 6)
+publication_figsize = tuple(mpl.rcParams["figure.figsize"])
+time_trace_figsize = publication_figsize
+single_diagnostic_figsize = publication_figsize
+spectrum_figsize = publication_figsize
+trajectory_3d_figsize = publication_figsize
+trajectory_projection_figsize = publication_figsize
+force_check_figsize = publication_figsize
+force_field_figsize = publication_figsize
 
 # Validation output
-validation_plot_dir = Path("/Users/josephwhitfield/Documents/optical levitation/validation_plots")
+validation_plot_dir = Path("/Users/josephwhitfield/Masters/Summer Project/cython_improved/simvexp")
 run_brownian_force_scaling_validation = brownian_force_scaling_only
 run_psd_normalisation_validation = True
 run_welch_averaging_validation = True
@@ -281,19 +329,40 @@ experimental_data_npy = Path(
     "/Users/josephwhitfield/Masters/Summer Project/11_06_2026 PSD/Particle_02_WP_27_1.15V_75mW.npy"
 )
 experimental_use_recorded_time = True
-experimental_dt_s = 1 / 20000
+experimental_dt_s = 1 / 32500
 experimental_adc_min = 32500.0
 experimental_adc_max = 31.0
-experimental_position_scale_um = 1750.0 / 6.0
+experimental_position_scale_um = 1750.0 / 6.4
 experimental_plot_seconds = None
 # Convert the simulation time used only in the experiment/simulation overlay.
 # Use 1e-3 when the simulation time array is in ms; use 1.0 if it is already in s.
 experimental_comparison_simulation_time_to_seconds = 1
-experimental_comparison_figsize = (11, 6)
+# Taller than the standard single-column figsize: a stacked 2-panel plot
+# with its own per-panel titles plus a shared legend and figure title needs
+# more vertical room, otherwise the title/legend area and the y-axis labels
+# of the two panels visually collide.
+experimental_comparison_figsize = (publication_figsize[0], publication_figsize[1] * 1.7)
 plot_experimental_psd_comparison = True
-experimental_psd_comparison_figsize = (11, 6)
+experimental_psd_comparison_figsize = (
+    publication_figsize[0],
+    publication_figsize[1] * 1.7,
+)
+plot_experimental_welch_psd_comparison = True
+experimental_welch_psd_comparison_figsize = (
+    publication_figsize[0],
+    publication_figsize[1] * 1.7,
+)
+experimental_welch_psd_smoothing_window_seconds = 0.010
+additional_experimental_welch_psd_smoothing_windows_seconds = (0.001, 0.005)
+plot_simulation_plus_background_noise_trajectory = True
+plot_simulation_plus_background_noise_psd = True
+background_noise_data_npy = Path(
+    "/Users/josephwhitfield/Masters/Summer Project/11_06_2026 PSD/ADC_data_block_raw_PSD_On_LED_Diffuse_Bench_PSU19_05_2026_18_31_V0.npy"
+)
+background_noise_label = "LED diffuse bench background"
+simulation_plus_background_welch_segment_duration_seconds = 0.25
 plot_experimental_psd_four_panel = True
-experimental_psd_four_panel_figsize = (11, 8)
+experimental_psd_four_panel_figsize = publication_figsize
 experimental_psd_min_frequency = None
 experimental_psd_max_frequency = None
 experimental_psd_min_value = 1e-12
@@ -301,8 +370,86 @@ fit_experimental_psd_parameters = True
 experimental_psd_fit_min_frequency = 50
 experimental_psd_fit_max_frequency = 5000
 
+# Simulation uncertainty / sensitivity envelope for experiment comparison.
+# This is intentionally a small one-at-a-time sweep, not a full Monte Carlo.
+plot_simulation_uncertainty_band = "--skip-uncertainty-band" not in sys.argv
+simulation_uncertainty_combination = "quadrature"
+simulation_uncertainty_particle_diameter_uncertainty_m = 0.45e-6
+simulation_uncertainty_beam_waist_relative_delta = 0.05
+simulation_uncertainty_laser_power_relative_delta = None
+simulation_uncertainty_absorption_fraction_factor_bounds = (0.5, 2.0)
+simulation_uncertainty_optical_force_scale_bounds = (0.868, 1.132)
+simulation_uncertainty_effective_damping_scale_bounds = (0.8, 1.2)
+simulation_uncertainty_refractive_index_bounds = None
+simulation_uncertainty_laser_noise_amplitude_scales = (0.0, 0.5, 1.5)
+experimental_detector_calibration_relative_delta = None
+simulation_uncertainty_include_single_record_psd = True
+simulation_uncertainty_include_welch_psd = True
 
-def finish_plot():
+
+def save_plot_data_csv(fig, csv_path):
+    rows = []
+
+    for axis_index, axis in enumerate(fig.axes):
+        axis_name = axis.get_ylabel() or axis.get_title() or f"axis_{axis_index}"
+
+        for line_index, line in enumerate(axis.get_lines()):
+            x_data = np.asarray(line.get_xdata(orig=False), dtype=float)
+            y_data = np.asarray(line.get_ydata(orig=False), dtype=float)
+
+            if x_data.size == 0 or y_data.size == 0:
+                continue
+
+            label = line.get_label()
+            if label.startswith("_"):
+                label = f"line_{line_index}"
+
+            for x_value, y_value in zip(x_data, y_data):
+                rows.append((axis_index, axis_name, label, x_value, y_value))
+
+    with open(csv_path, "w", newline="") as csv_file:
+        writer = csv.writer(csv_file)
+        writer.writerow(["axis_index", "axis_name", "line_label", "x", "y"])
+        writer.writerows(rows)
+
+
+def make_legends_transparent(fig):
+    fig.patch.set_alpha(0.0)
+    fig.patch.set_facecolor("none")
+
+    for axis in fig.axes:
+        axis.patch.set_alpha(0.0)
+        axis.patch.set_facecolor("none")
+
+        legend = axis.get_legend()
+        if legend is not None:
+            legend.set_frame_on(False)
+            frame = legend.get_frame()
+            frame.set_facecolor("none")
+            frame.set_edgecolor("none")
+            frame.set_alpha(0.0)
+            frame.set_linewidth(0.0)
+
+    for legend in fig.legends:
+        legend.set_frame_on(False)
+        frame = legend.get_frame()
+        frame.set_facecolor("none")
+        frame.set_edgecolor("none")
+        frame.set_alpha(0.0)
+        frame.set_linewidth(0.0)
+
+
+def finish_plot(name=None, fig=None, output_dir=save_path, transparent=True):
+    target_fig = fig if fig is not None else plt.gcf()
+
+    if name is not None:
+        os.makedirs(output_dir, exist_ok=True)
+        if transparent:
+            make_legends_transparent(target_fig)
+        save_plot_data_csv(target_fig, os.path.join(output_dir, f"{name}.csv"))
+        target_fig.savefig(os.path.join(output_dir, f"{name}.pdf"), bbox_inches="tight", transparent=transparent)
+        target_fig.savefig(os.path.join(output_dir, f"{name}.png"), bbox_inches="tight", transparent=transparent)
+
     if display_plots:
         plt.show()
     else:
@@ -312,7 +459,7 @@ def finish_plot():
 def save_validation_plot(filename):
     validation_plot_dir.mkdir(parents=True, exist_ok=True)
     output_path = validation_plot_dir / filename
-    plt.savefig(output_path, dpi=220, bbox_inches="tight")
+    plt.savefig(output_path, dpi=mpl.rcParams["figure.dpi"], bbox_inches="tight")
     print("Saved validation plot:", output_path)
 
 
@@ -430,6 +577,129 @@ def measured_laser_power_factor_from_trace(
     return power_factor, example_time_s, example_power_w
 
 
+def psd_matched_laser_power_factor_from_trace(
+    target_time_s,
+    csv_path,
+    rng,
+    welch_segment_duration_s=2.0,
+    target_peak_fraction=None,
+    match_input_mean=True
+):
+    measured_time_s, measured_power_w = load_measured_laser_power_trace(csv_path)
+    measured_dt_s = np.median(np.diff(measured_time_s))
+
+    if measured_dt_s <= 0:
+        raise ValueError("Measured laser-power sample spacing must be positive.")
+
+    measured_sampling_frequency_hz = 1.0 / measured_dt_s
+    measured_nyquist_frequency_hz = 0.5 * measured_sampling_frequency_hz
+    uniform_time_s = np.arange(0.0, measured_time_s[-1] + 0.5 * measured_dt_s, measured_dt_s)
+    uniform_power_w = np.interp(uniform_time_s, measured_time_s, measured_power_w)
+    measured_relative_noise = uniform_power_w / np.mean(uniform_power_w) - 1.0
+    measured_relative_noise -= np.mean(measured_relative_noise)
+    measured_relative_rms = np.std(measured_relative_noise)
+
+    if measured_relative_rms <= 0:
+        raise ValueError("Measured laser-power trace has zero relative RMS noise.")
+
+    nperseg = min(
+        len(measured_relative_noise),
+        max(8, int(round(welch_segment_duration_s * measured_sampling_frequency_hz)))
+    )
+    measured_frequency_hz, measured_relative_psd = welch(
+        measured_relative_noise,
+        fs=measured_sampling_frequency_hz,
+        nperseg=nperseg,
+        detrend="constant",
+        scaling="density"
+    )
+
+    target_time_s = np.asarray(target_time_s, dtype=float)
+    target_time_s = target_time_s - target_time_s[0]
+    target_duration_s = target_time_s[-1]
+
+    if target_duration_s <= 0:
+        raise ValueError("Target simulation time must have a positive duration.")
+
+    synthetic_sample_count = max(2, int(np.ceil(target_duration_s / measured_dt_s)) + 1)
+    synthetic_time_s = np.arange(synthetic_sample_count) * measured_dt_s
+    synthetic_frequency_hz = np.fft.rfftfreq(synthetic_sample_count, d=measured_dt_s)
+
+    # The PSD is only defined up to the measured Nyquist frequency, so the
+    # synthetic trace is not assigned additional unmeasured high-frequency noise.
+    target_relative_psd = np.interp(
+        synthetic_frequency_hz,
+        measured_frequency_hz,
+        measured_relative_psd,
+        left=measured_relative_psd[0],
+        right=0.0
+    )
+    target_relative_psd[synthetic_frequency_hz > measured_nyquist_frequency_hz] = 0.0
+    target_relative_psd[0] = 0.0
+
+    spectrum = np.zeros(len(synthetic_frequency_hz), dtype=complex)
+    phases = rng.uniform(0.0, 2.0 * np.pi, len(synthetic_frequency_hz))
+    spectrum_magnitude = np.sqrt(
+        target_relative_psd * measured_sampling_frequency_hz * synthetic_sample_count / 2.0
+    )
+    spectrum[1:] = spectrum_magnitude[1:] * np.exp(1j * phases[1:])
+
+    if synthetic_sample_count % 2 == 0 and len(spectrum) > 1:
+        nyquist_magnitude = np.sqrt(
+            target_relative_psd[-1] * measured_sampling_frequency_hz * synthetic_sample_count
+        )
+        spectrum[-1] = nyquist_magnitude * rng.choice([-1.0, 1.0])
+
+    synthetic_relative_noise = np.fft.irfft(spectrum, n=synthetic_sample_count)
+    synthetic_relative_noise -= np.mean(synthetic_relative_noise)
+    synthetic_relative_rms = np.std(synthetic_relative_noise)
+
+    if synthetic_relative_rms <= 0:
+        raise ValueError("Generated PSD-matched laser noise has zero RMS.")
+
+    synthetic_relative_noise *= measured_relative_rms / synthetic_relative_rms
+    target_relative_noise = np.interp(
+        target_time_s,
+        synthetic_time_s,
+        synthetic_relative_noise
+    )
+    target_relative_noise -= np.mean(target_relative_noise)
+    unscaled_target_relative_rms = np.std(target_relative_noise)
+    unscaled_target_positive_peak = np.max(target_relative_noise)
+
+    if target_peak_fraction is not None:
+        if target_peak_fraction <= 0:
+            raise ValueError("Target PSD-matched laser-noise peak must be positive.")
+        if unscaled_target_positive_peak <= 0:
+            raise ValueError("Generated PSD-matched laser noise has no positive peak.")
+
+        target_relative_noise *= target_peak_fraction / unscaled_target_positive_peak
+
+    power_factor = 1.0 + target_relative_noise
+
+    if match_input_mean:
+        power_factor_mean = np.mean(power_factor)
+
+        if power_factor_mean <= 0:
+            raise ValueError("PSD-matched laser-power factor mean must be positive.")
+
+        power_factor = power_factor / power_factor_mean
+
+    metadata = {
+        "measured_sampling_frequency_hz": measured_sampling_frequency_hz,
+        "measured_nyquist_frequency_hz": measured_nyquist_frequency_hz,
+        "measured_relative_rms": measured_relative_rms,
+        "synthetic_relative_rms": np.std(power_factor),
+        "unscaled_synthetic_relative_rms": unscaled_target_relative_rms,
+        "unscaled_synthetic_positive_peak": unscaled_target_positive_peak,
+        "target_peak_fraction": target_peak_fraction,
+        "synthetic_positive_peak": np.max(power_factor) - np.mean(power_factor),
+        "welch_nperseg": nperseg
+    }
+
+    return power_factor, measured_time_s, measured_power_w, metadata
+
+
 def finite_experimental_trace(time_s, position_um):
     time_s = np.asarray(time_s, dtype=float)
     position_um = np.asarray(position_um, dtype=float)
@@ -448,8 +718,8 @@ def downsample_for_plot(x_values, y_values, max_points):
     return x_values[::stride], y_values[::stride]
 
 
-def load_experimental_photodiode_motion():
-    data = np.load(experimental_data_npy)
+def load_photodiode_motion_from_npy(data_path, use_recorded_time=True):
+    data = np.load(data_path)
 
     if data.ndim != 2:
         raise ValueError(f"Expected a 2D experimental NPY array, got {data.shape}.")
@@ -471,7 +741,7 @@ def load_experimental_photodiode_motion():
     channel_3 = channels[2].astype(float) - adc_delta
     channel_4 = channels[3].astype(float) - adc_delta
 
-    if experimental_use_recorded_time:
+    if use_recorded_time:
         time_s = channels[4].astype(float) / 1e9
         time_s = time_s - time_s[0]
     else:
@@ -504,6 +774,105 @@ def load_experimental_photodiode_motion():
         "vertical_time_s": vertical_time_s,
         "vertical_um": vertical_um,
     }
+
+
+def load_experimental_photodiode_motion():
+    return load_photodiode_motion_from_npy(
+        experimental_data_npy,
+        use_recorded_time=experimental_use_recorded_time,
+    )
+
+
+def load_background_noise_photodiode_motion():
+    return load_photodiode_motion_from_npy(
+        background_noise_data_npy,
+        use_recorded_time=True,
+    )
+
+
+def repeated_background_displacement_on_time_grid(
+    target_time_s,
+    background_time_s,
+    background_displacement_um,
+):
+    target_time_s = np.asarray(target_time_s, dtype=float)
+    background_time_s = np.asarray(background_time_s, dtype=float)
+    background_displacement_um = np.asarray(background_displacement_um, dtype=float)
+    valid_background = (
+        np.isfinite(background_time_s)
+        & np.isfinite(background_displacement_um)
+    )
+
+    if np.count_nonzero(valid_background) < 2:
+        raise ValueError("Need at least two background-noise samples.")
+
+    background_time_s = background_time_s[valid_background]
+    background_displacement_um = background_displacement_um[valid_background]
+    order = np.argsort(background_time_s)
+    background_time_s = background_time_s[order]
+    background_displacement_um = background_displacement_um[order]
+    increasing_mask = np.concatenate(([True], np.diff(background_time_s) > 0))
+    background_time_s = background_time_s[increasing_mask]
+    background_displacement_um = background_displacement_um[increasing_mask]
+
+    if len(background_time_s) < 2:
+        raise ValueError("Need at least two increasing-time background samples.")
+
+    background_time_s = background_time_s - background_time_s[0]
+    background_displacement_um = (
+        background_displacement_um - np.mean(background_displacement_um)
+    )
+    background_duration_s = background_time_s[-1]
+
+    if background_duration_s <= 0:
+        raise ValueError("Background-noise duration must be positive.")
+
+    target_relative_time_s = target_time_s - np.nanmin(target_time_s)
+    repeated_time_s = np.mod(target_relative_time_s, background_duration_s)
+    return np.interp(
+        repeated_time_s,
+        background_time_s,
+        background_displacement_um,
+    )
+
+
+def moving_average_smooth_trace(time_s, displacement_um, window_seconds):
+    if window_seconds is None or window_seconds <= 0:
+        return np.asarray(displacement_um, dtype=float)
+
+    time_s = np.asarray(time_s, dtype=float)
+    displacement_um = np.asarray(displacement_um, dtype=float)
+
+    if len(time_s) < 3:
+        return displacement_um
+
+    dt_s = np.median(np.diff(time_s))
+    if not np.isfinite(dt_s) or dt_s <= 0:
+        return displacement_um
+
+    window_samples = int(round(window_seconds / dt_s))
+    if window_samples < 2:
+        return displacement_um
+
+    if window_samples % 2 == 0:
+        window_samples += 1
+
+    if window_samples >= len(displacement_um):
+        window_samples = len(displacement_um) - 1
+        if window_samples % 2 == 0:
+            window_samples -= 1
+
+    if window_samples < 3:
+        return displacement_um
+
+    pad_width = window_samples // 2
+    padded_displacement_um = np.pad(
+        displacement_um,
+        pad_width,
+        mode="edge",
+    )
+    kernel = np.ones(window_samples, dtype=float) / window_samples
+    return np.convolve(padded_displacement_um, kernel, mode="valid")
 
 
 
@@ -545,7 +914,128 @@ def experimental_comparison_single_record_psd(time_s, displacement_um):
 
     positive_mask = (frequencies_hz > 0) & (psd_um2_per_hz > 0)
 
+    if not np.any(positive_mask):
+        raise ValueError("PSD contains no positive power.")
+
     return frequencies_hz[positive_mask], psd_um2_per_hz[positive_mask]
+
+
+def experimental_comparison_welch_averaged_psd(
+    time_s,
+    displacement_um,
+    segment_duration_seconds=None,
+):
+    time_s = np.asarray(time_s, dtype=float)
+    displacement_um = np.asarray(displacement_um, dtype=float)
+    finite_mask = np.isfinite(time_s) & np.isfinite(displacement_um)
+    time_s = time_s[finite_mask]
+    displacement_um = displacement_um[finite_mask]
+
+    if len(time_s) < 4:
+        raise ValueError("Need at least four samples to calculate a Welch PSD.")
+
+    order = np.argsort(time_s)
+    time_s = time_s[order]
+    displacement_um = displacement_um[order]
+    increasing_mask = np.concatenate(([True], np.diff(time_s) > 0))
+    time_s = time_s[increasing_mask]
+    displacement_um = displacement_um[increasing_mask]
+
+    if len(time_s) < 4:
+        raise ValueError("Need at least four increasing-time samples to calculate a Welch PSD.")
+
+    dt_s = np.median(np.diff(time_s))
+
+    if dt_s <= 0:
+        raise ValueError("Welch PSD time step must be positive.")
+
+    fs = 1 / dt_s
+    displacement_um = displacement_um - np.mean(displacement_um)
+    if segment_duration_seconds is None:
+        segment_duration_seconds = welch_average_segment_duration_seconds
+
+    nperseg = min(
+        max(2, int(round(segment_duration_seconds * fs))),
+        len(displacement_um),
+    )
+
+    if nperseg < 2:
+        raise ValueError("Welch PSD settings must leave at least two samples.")
+
+    if psd_overlap_samples is not None:
+        noverlap = min(psd_overlap_samples, nperseg - 1)
+    else:
+        noverlap = min(int(round(psd_overlap_fraction * nperseg)), nperseg - 1)
+
+    frequencies_hz, psd_um2_per_hz = welch(
+        displacement_um,
+        fs=fs,
+        window="hann",
+        nperseg=nperseg,
+        noverlap=noverlap,
+        detrend=False,
+        scaling="density",
+        return_onesided=True,
+    )
+    positive_mask = (frequencies_hz > 0) & (psd_um2_per_hz > 0)
+
+    if not np.any(positive_mask):
+        raise ValueError("Welch PSD contains no positive power.")
+
+    return (
+        frequencies_hz[positive_mask],
+        psd_um2_per_hz[positive_mask],
+        nperseg,
+        fs / nperseg,
+    )
+
+
+def simulation_plus_background_psd(sim_freqs, sim_psd, background_freqs, background_psd):
+    sim_freqs = np.asarray(sim_freqs, dtype=float)
+    sim_psd = np.asarray(sim_psd, dtype=float)
+    background_freqs = np.asarray(background_freqs, dtype=float)
+    background_psd = np.asarray(background_psd, dtype=float)
+    valid_background = (
+        np.isfinite(background_freqs)
+        & np.isfinite(background_psd)
+        & (background_freqs > 0)
+        & (background_psd > 0)
+    )
+
+    if np.count_nonzero(valid_background) < 2:
+        return None, None
+
+    background_freqs = background_freqs[valid_background]
+    background_psd = background_psd[valid_background]
+    order = np.argsort(background_freqs)
+    background_freqs = background_freqs[order]
+    background_psd = background_psd[order]
+    unique_frequency_mask = np.concatenate(
+        ([True], np.diff(background_freqs) > 0)
+    )
+    background_freqs = background_freqs[unique_frequency_mask]
+    background_psd = background_psd[unique_frequency_mask]
+
+    interpolated_background_psd = np.interp(
+        sim_freqs,
+        background_freqs,
+        background_psd,
+        left=np.nan,
+        right=np.nan,
+    )
+    valid_combined = (
+        np.isfinite(sim_freqs)
+        & np.isfinite(sim_psd)
+        & np.isfinite(interpolated_background_psd)
+        & (sim_freqs > 0)
+        & (sim_psd > 0)
+        & (interpolated_background_psd > 0)
+    )
+
+    if not np.any(valid_combined):
+        return None, None
+
+    return valid_combined, sim_psd + interpolated_background_psd
 
 
 def damped_harmonic_psd_model_hz(frequencies_hz, amplitude, f0_hz, gamma_hz, noise_floor):
@@ -685,12 +1175,381 @@ def print_psd_fit_parameter_table(rows):
         )
 
 
+def normalise_simulation_uncertainty_runs(simulation_uncertainty_runs):
+    if not simulation_uncertainty_runs:
+        return []
+
+    normalised_runs = []
+    for run in simulation_uncertainty_runs:
+        parameters = dict(run.get("parameters", {}))
+        time_values_s = (
+            np.asarray(run["time_s"], dtype=float)
+            * experimental_comparison_simulation_time_to_seconds
+        )
+        normalised_runs.append(
+            {
+                "label": run.get("label", "uncertainty case"),
+                "parameters": parameters,
+                "uncertainty_group": run.get(
+                    "uncertainty_group",
+                    simulation_uncertainty_group(
+                        run.get("label", "uncertainty case"),
+                        parameters,
+                    ),
+                ),
+                "time_s": time_values_s,
+                "horizontal_um": np.asarray(run["horizontal_m"], dtype=float) * 1e6,
+                "vertical_um": np.asarray(run["vertical_m"], dtype=float) * 1e6,
+            }
+        )
+
+    return normalised_runs
+
+
+def rms_from_masked_trace(time_s, displacement_um, plot_seconds):
+    if plot_seconds is None:
+        mask = np.ones_like(time_s, dtype=bool)
+    else:
+        mask = time_s <= plot_seconds
+
+    if np.count_nonzero(mask) < 2:
+        return np.nan
+
+    return np.sqrt(np.mean(displacement_um[mask] ** 2))
+
+
+def simulation_uncertainty_group(label, parameters=None):
+    if parameters is None:
+        parameters = {}
+
+    parameter_group_map = (
+        ("optical_force_scale", "optical force scale"),
+        ("effective_damping_scale", "effective damping"),
+        ("n_particle", "refractive index"),
+        ("laser_noise_amplitude_scale", "laser noise amplitude"),
+        ("radius", "particle diameter"),
+        ("w0", "beam waist"),
+        ("P_laser", "laser power"),
+        ("absorption_fraction", "absorption strength"),
+    )
+    for parameter_name, group_name in parameter_group_map:
+        if parameter_name in parameters:
+            return group_name
+
+    label_lower = str(label).lower()
+    label_prefix_map = (
+        ("optical force", "optical force scale"),
+        ("effective damping", "effective damping"),
+        ("refractive index", "refractive index"),
+        ("laser noise", "laser noise amplitude"),
+        ("diameter", "particle diameter"),
+        ("beam waist", "beam waist"),
+        ("laser power", "laser power"),
+        ("absorption", "absorption strength"),
+    )
+    for label_prefix, group_name in label_prefix_map:
+        if label_lower.startswith(label_prefix):
+            return group_name
+
+    return str(label)
+
+
+def interpolate_positive_psd_on_reference(
+    reference_frequencies_hz,
+    frequencies_hz,
+    psd_values,
+):
+    reference_frequencies_hz = np.asarray(reference_frequencies_hz, dtype=float)
+    frequencies_hz = np.asarray(frequencies_hz, dtype=float)
+    psd_values = np.asarray(psd_values, dtype=float)
+
+    interpolated_psd = np.full_like(reference_frequencies_hz, np.nan, dtype=float)
+    valid_reference = (
+        np.isfinite(reference_frequencies_hz)
+        & (reference_frequencies_hz > 0)
+    )
+    valid = (
+        np.isfinite(frequencies_hz)
+        & np.isfinite(psd_values)
+        & (frequencies_hz > 0)
+        & (psd_values > 0)
+    )
+
+    if np.count_nonzero(valid_reference) == 0 or np.count_nonzero(valid) < 2:
+        return interpolated_psd
+
+    frequencies_valid = frequencies_hz[valid]
+    psd_valid = psd_values[valid]
+    order = np.argsort(frequencies_valid)
+    frequencies_valid = frequencies_valid[order]
+    psd_valid = psd_valid[order]
+    unique_frequency_mask = np.concatenate(
+        ([True], np.diff(frequencies_valid) > 0)
+    )
+    frequencies_valid = frequencies_valid[unique_frequency_mask]
+    psd_valid = psd_valid[unique_frequency_mask]
+
+    if len(frequencies_valid) < 2:
+        return interpolated_psd
+
+    interpolated_log_psd = np.interp(
+        np.log(reference_frequencies_hz[valid_reference]),
+        np.log(frequencies_valid),
+        np.log(psd_valid),
+        left=np.nan,
+        right=np.nan,
+    )
+    interpolated_psd[valid_reference] = np.exp(interpolated_log_psd)
+    return interpolated_psd
+
+
+def psd_envelope_on_reference(reference_frequencies_hz, psd_records):
+    reference_frequencies_hz = np.asarray(reference_frequencies_hz, dtype=float)
+    valid_reference = (
+        np.isfinite(reference_frequencies_hz)
+        & (reference_frequencies_hz > 0)
+    )
+
+    if not np.any(valid_reference):
+        return None
+
+    log_reference = np.full_like(reference_frequencies_hz, np.nan, dtype=float)
+    log_reference[valid_reference] = np.log(reference_frequencies_hz[valid_reference])
+    interpolated_logs = []
+
+    for frequencies_hz, psd_values in psd_records:
+        frequencies_hz = np.asarray(frequencies_hz, dtype=float)
+        psd_values = np.asarray(psd_values, dtype=float)
+        valid = (
+            np.isfinite(frequencies_hz)
+            & np.isfinite(psd_values)
+            & (frequencies_hz > 0)
+            & (psd_values > 0)
+        )
+
+        if np.count_nonzero(valid) < 2:
+            continue
+
+        frequencies_valid = frequencies_hz[valid]
+        psd_valid = psd_values[valid]
+        order = np.argsort(frequencies_valid)
+        frequencies_valid = frequencies_valid[order]
+        psd_valid = psd_valid[order]
+        unique_frequency_mask = np.concatenate(
+            ([True], np.diff(frequencies_valid) > 0)
+        )
+        frequencies_valid = frequencies_valid[unique_frequency_mask]
+        psd_valid = psd_valid[unique_frequency_mask]
+
+        if len(frequencies_valid) < 2:
+            continue
+
+        interpolated_logs.append(
+            np.interp(
+                log_reference,
+                np.log(frequencies_valid),
+                np.log(psd_valid),
+                left=np.nan,
+                right=np.nan,
+            )
+        )
+
+    if not interpolated_logs:
+        return None
+
+    log_stack = np.vstack(interpolated_logs)
+    finite_count = np.sum(np.isfinite(log_stack), axis=0)
+    if not np.any(finite_count):
+        return None
+
+    log_lower = np.full_like(reference_frequencies_hz, np.nan, dtype=float)
+    log_upper = np.full_like(reference_frequencies_hz, np.nan, dtype=float)
+    finite_columns = finite_count > 0
+    log_lower[finite_columns] = np.nanmin(log_stack[:, finite_columns], axis=0)
+    log_upper[finite_columns] = np.nanmax(log_stack[:, finite_columns], axis=0)
+
+    return np.exp(log_lower), np.exp(log_upper), finite_columns
+
+
+def psd_quadrature_uncertainty_on_reference(
+    reference_frequencies_hz,
+    nominal_psd_values,
+    psd_records,
+):
+    reference_frequencies_hz = np.asarray(reference_frequencies_hz, dtype=float)
+    nominal_psd_values = np.asarray(nominal_psd_values, dtype=float)
+    valid_nominal = (
+        np.isfinite(reference_frequencies_hz)
+        & (reference_frequencies_hz > 0)
+        & np.isfinite(nominal_psd_values)
+        & (nominal_psd_values > 0)
+    )
+
+    if not np.any(valid_nominal):
+        return None
+
+    grouped_lower_deltas = {}
+    grouped_upper_deltas = {}
+    grouped_valid = {}
+
+    for record_index, record in enumerate(psd_records):
+        if len(record) == 3:
+            frequencies_hz, psd_values, group_name = record
+        else:
+            frequencies_hz, psd_values = record
+            group_name = f"uncertainty case {record_index + 1}"
+
+        interpolated_psd = interpolate_positive_psd_on_reference(
+            reference_frequencies_hz,
+            frequencies_hz,
+            psd_values,
+        )
+        valid = valid_nominal & np.isfinite(interpolated_psd)
+
+        if not np.any(valid):
+            continue
+
+        group_name = str(group_name)
+        if group_name not in grouped_lower_deltas:
+            grouped_lower_deltas[group_name] = np.zeros_like(
+                nominal_psd_values,
+                dtype=float,
+            )
+            grouped_upper_deltas[group_name] = np.zeros_like(
+                nominal_psd_values,
+                dtype=float,
+            )
+            grouped_valid[group_name] = np.zeros_like(valid_nominal, dtype=bool)
+
+        lower_delta = np.maximum(
+            nominal_psd_values[valid] - interpolated_psd[valid],
+            0.0,
+        )
+        upper_delta = np.maximum(
+            interpolated_psd[valid] - nominal_psd_values[valid],
+            0.0,
+        )
+        grouped_lower_deltas[group_name][valid] = np.maximum(
+            grouped_lower_deltas[group_name][valid],
+            lower_delta,
+        )
+        grouped_upper_deltas[group_name][valid] = np.maximum(
+            grouped_upper_deltas[group_name][valid],
+            upper_delta,
+        )
+        grouped_valid[group_name][valid] = True
+
+    if not grouped_lower_deltas:
+        return None
+
+    lower_delta_squared = np.zeros_like(nominal_psd_values, dtype=float)
+    upper_delta_squared = np.zeros_like(nominal_psd_values, dtype=float)
+    combined_valid = np.zeros_like(valid_nominal, dtype=bool)
+
+    for group_name in grouped_lower_deltas:
+        group_valid = grouped_valid[group_name]
+        lower_delta_squared[group_valid] += (
+            grouped_lower_deltas[group_name][group_valid] ** 2
+        )
+        upper_delta_squared[group_valid] += (
+            grouped_upper_deltas[group_name][group_valid] ** 2
+        )
+        combined_valid |= group_valid
+
+    combined_valid &= valid_nominal
+    if not np.any(combined_valid):
+        return None
+
+    lower_psd = np.full_like(nominal_psd_values, np.nan, dtype=float)
+    upper_psd = np.full_like(nominal_psd_values, np.nan, dtype=float)
+    lower_delta = np.sqrt(lower_delta_squared[combined_valid])
+    upper_delta = np.sqrt(upper_delta_squared[combined_valid])
+    lower_floor = nominal_psd_values[combined_valid] * 1e-6
+    lower_psd[combined_valid] = np.maximum(
+        nominal_psd_values[combined_valid] - lower_delta,
+        lower_floor,
+    )
+    upper_psd[combined_valid] = nominal_psd_values[combined_valid] + upper_delta
+
+    return lower_psd, upper_psd, combined_valid
+
+
+def simulation_psd_uncertainty_bounds_on_reference(
+    reference_frequencies_hz,
+    nominal_psd_values,
+    uncertainty_psd_records,
+):
+    if not uncertainty_psd_records:
+        return None
+
+    if simulation_uncertainty_combination == "quadrature":
+        return psd_quadrature_uncertainty_on_reference(
+            reference_frequencies_hz,
+            nominal_psd_values,
+            uncertainty_psd_records,
+        )
+
+    return psd_envelope_on_reference(
+        reference_frequencies_hz,
+        [(reference_frequencies_hz, nominal_psd_values), *uncertainty_psd_records],
+    )
+
+
+def quadrature_scalar_uncertainty_bounds(nominal_value, uncertainty_records):
+    if not np.isfinite(nominal_value):
+        return None
+
+    grouped_lower_deltas = {}
+    grouped_upper_deltas = {}
+
+    for record in uncertainty_records:
+        value = float(record.get("value", np.nan))
+        if not np.isfinite(value):
+            continue
+
+        group_name = str(record.get("group", record.get("label", "uncertainty")))
+        grouped_lower_deltas[group_name] = max(
+            grouped_lower_deltas.get(group_name, 0.0),
+            max(nominal_value - value, 0.0),
+        )
+        grouped_upper_deltas[group_name] = max(
+            grouped_upper_deltas.get(group_name, 0.0),
+            max(value - nominal_value, 0.0),
+        )
+
+    if not grouped_lower_deltas:
+        return None
+
+    lower_delta = np.sqrt(
+        sum(delta ** 2 for delta in grouped_lower_deltas.values())
+    )
+    upper_delta = np.sqrt(
+        sum(delta ** 2 for delta in grouped_upper_deltas.values())
+    )
+
+    return max(nominal_value - lower_delta, 0.0), nominal_value + upper_delta
+
+
+def detector_calibration_psd_bounds(psd_values):
+    if experimental_detector_calibration_relative_delta is None:
+        return None
+
+    calibration_delta = float(experimental_detector_calibration_relative_delta)
+    if calibration_delta <= 0:
+        return None
+
+    low_scale = max(0.0, 1.0 - calibration_delta)
+    high_scale = 1.0 + calibration_delta
+    return psd_values * low_scale**2, psd_values * high_scale**2
+
+
 def plot_experimental_simulation_comparison(
     simulation_time_s,
     simulation_horizontal_m,
     simulation_vertical_m,
     horizontal_simulation_label="simulation x",
     vertical_simulation_label="simulation z",
+    simulation_uncertainty_runs=None,
 ):
     if not plot_experimental_comparison:
         return
@@ -707,6 +1566,9 @@ def plot_experimental_simulation_comparison(
     )
     simulation_horizontal_um = np.asarray(simulation_horizontal_m, dtype=float) * 1e6
     simulation_vertical_um = np.asarray(simulation_vertical_m, dtype=float) * 1e6
+    simulation_uncertainty_runs = normalise_simulation_uncertainty_runs(
+        simulation_uncertainty_runs
+    )
 
     fig, axes = plt.subplots(
         2,
@@ -737,6 +1599,8 @@ def plot_experimental_simulation_comparison(
         ),
     )
 
+    rms_summary_rows = []
+
     for (
         ax,
         axis_label,
@@ -753,6 +1617,32 @@ def plot_experimental_simulation_comparison(
         simulation_displacement_um = (
             simulation_position_um - np.mean(simulation_position_um)
         )
+        uncertainty_rms_records = []
+
+        for uncertainty_run in simulation_uncertainty_runs:
+            uncertainty_time_s = uncertainty_run["time_s"]
+            uncertainty_position_um = (
+                uncertainty_run["horizontal_um"]
+                if axis_label == "Horizontal"
+                else uncertainty_run["vertical_um"]
+            )
+            uncertainty_displacement_um = (
+                uncertainty_position_um - np.mean(uncertainty_position_um)
+            )
+            uncertainty_rms_records.append(
+                {
+                    "label": uncertainty_run.get("label", "uncertainty case"),
+                    "group": uncertainty_run.get(
+                        "uncertainty_group",
+                        uncertainty_run.get("label", "uncertainty case"),
+                    ),
+                    "value": rms_from_masked_trace(
+                        uncertainty_time_s,
+                        uncertainty_displacement_um,
+                        experimental_plot_seconds,
+                    ),
+                }
+            )
 
         if experimental_plot_seconds is None:
             experiment_mask = np.ones_like(experiment_time_s, dtype=bool)
@@ -800,15 +1690,245 @@ def plot_experimental_simulation_comparison(
             label=simulation_label,
         )
         ax.axhline(0.0, color="black", linestyle=":", linewidth=1.0)
-        ax.set_ylabel("Displacement / micrometres")
-        ax.set_title(f"{axis_label} time-domain comparison")
-        ax.legend()
+        ax.set_ylabel("Displacement (μm)")
         ax.grid(True, alpha=0.3)
 
-    axes[-1].set_xlabel("Time / s")
-    fig.suptitle("Experimental data compared with BAOAB simulation")
-    plt.tight_layout()
-    finish_plot()
+        theory_rms_m = x_rms_thermal if axis_label == "Horizontal" else z_rms_thermal
+        rms_summary_rows.append(
+            {
+                "axis_label": axis_label,
+                "experiment_rms_um": np.sqrt(
+                    np.mean(experiment_displacement_um[experiment_mask] ** 2)
+                ),
+                "simulation_rms_um": np.sqrt(
+                    np.mean(simulation_displacement_um[simulation_mask] ** 2)
+                ),
+                "theory_rms_um": theory_rms_m * 1e6,
+                "uncertainty_rms_records": uncertainty_rms_records,
+            }
+        )
+
+    axes[0].set_title("Horizontal trajectory")
+    axes[1].set_title("Vertical trajectory")
+    axes[-1].set_xlabel("Time (s)")
+
+    # Shared figure title: keep for standalone use, or drop this line if the
+    # plot is going into a captioned dissertation/paper figure.
+    fig.suptitle("Experimental data compared with BAOAB simulation", y=0.985)
+
+    if len(axes[0].lines) >= 2:
+        fig.legend(
+            [axes[0].lines[0], axes[0].lines[1]],
+            ["experiment", "simulation"],
+            loc="upper center",
+            bbox_to_anchor=(0.5, 0.955),
+            ncol=2,
+            frameon=False,
+        )
+
+    fig.tight_layout(rect=(0, 0.05, 1, 0.935), h_pad=1.6)
+    finish_plot(
+        name="experimental_baoab_comparison",
+        fig=fig,
+        output_dir=validation_plot_dir,
+    )
+
+    if plot_simulation_plus_background_noise_trajectory:
+        try:
+            background_noise = load_background_noise_photodiode_motion()
+        except (OSError, ValueError) as exc:
+            print("Skipping simulation + background trajectory plot:", exc)
+        else:
+            fig_background_traj, background_traj_axes = plt.subplots(
+                2,
+                1,
+                figsize=experimental_comparison_figsize,
+                sharex=True,
+            )
+            fig_background_traj.patch.set_facecolor("white")
+            for background_axis in background_traj_axes:
+                background_axis.set_facecolor("white")
+
+            for ax, (
+                _,
+                axis_label,
+                experiment_time_s,
+                experiment_position_um,
+                simulation_time_values_s,
+                simulation_position_um,
+                experiment_label,
+                simulation_label,
+            ) in zip(background_traj_axes, comparisons):
+                experiment_displacement_um = (
+                    experiment_position_um - np.mean(experiment_position_um)
+                )
+                simulation_displacement_um = (
+                    simulation_position_um - np.mean(simulation_position_um)
+                )
+                background_time_s = (
+                    background_noise["horizontal_time_s"]
+                    if axis_label == "Horizontal"
+                    else background_noise["vertical_time_s"]
+                )
+                background_position_um = (
+                    background_noise["horizontal_um"]
+                    if axis_label == "Horizontal"
+                    else background_noise["vertical_um"]
+                )
+                background_displacement_um = (
+                    background_position_um - np.mean(background_position_um)
+                )
+
+                if experimental_plot_seconds is None:
+                    experiment_mask = np.ones_like(experiment_time_s, dtype=bool)
+                    simulation_mask = np.ones_like(
+                        simulation_time_values_s,
+                        dtype=bool,
+                    )
+                else:
+                    experiment_mask = experiment_time_s <= experimental_plot_seconds
+                    simulation_mask = (
+                        simulation_time_values_s <= experimental_plot_seconds
+                    )
+
+                if (
+                    np.count_nonzero(experiment_mask) < 2
+                    or np.count_nonzero(simulation_mask) < 2
+                ):
+                    ax.text(
+                        0.5,
+                        0.5,
+                        "Not enough samples in requested plot window",
+                        ha="center",
+                        va="center",
+                        transform=ax.transAxes,
+                    )
+                    ax.set_axis_off()
+                    continue
+
+                try:
+                    repeated_background_um = (
+                        repeated_background_displacement_on_time_grid(
+                            simulation_time_values_s[simulation_mask],
+                            background_time_s,
+                            background_displacement_um,
+                        )
+                    )
+                except ValueError as exc:
+                    ax.text(
+                        0.5,
+                        0.5,
+                        str(exc),
+                        ha="center",
+                        va="center",
+                        transform=ax.transAxes,
+                    )
+                    ax.set_axis_off()
+                    continue
+
+                simulation_plus_background_um = (
+                    simulation_displacement_um[simulation_mask]
+                    + repeated_background_um
+                )
+                exp_time_plot, exp_disp_plot = downsample_for_plot(
+                    experiment_time_s[experiment_mask],
+                    experiment_displacement_um[experiment_mask],
+                    max_plot_points,
+                )
+                sim_time_plot, sim_disp_plot = downsample_for_plot(
+                    simulation_time_values_s[simulation_mask],
+                    simulation_plus_background_um,
+                    max_plot_points,
+                )
+
+                ax.plot(
+                    exp_time_plot,
+                    exp_disp_plot,
+                    linewidth=0.65,
+                    color="tab:blue",
+                    label=experiment_label,
+                )
+                ax.plot(
+                    sim_time_plot,
+                    sim_disp_plot,
+                    linewidth=0.75,
+                    color="tab:orange",
+                    label=f"{simulation_label} + background",
+                )
+                ax.axhline(0.0, color="black", linestyle=":", linewidth=1.0)
+                ax.set_ylabel("Displacement (μm)")
+                ax.set_title(f"{axis_label} trajectory")
+                ax.grid(True, alpha=0.3)
+                ax.legend()
+
+            background_traj_axes[-1].set_xlabel("Time (s)")
+            fig_background_traj.suptitle(
+                "Experimental trajectory compared with simulation + background",
+                y=0.985,
+            )
+            fig_background_traj.tight_layout(
+                rect=(0, 0.05, 1, 0.935),
+                h_pad=1.6,
+            )
+            finish_plot(
+                name="experimental_baoab_trajectory_simulation_plus_background_noise",
+                fig=fig_background_traj,
+                output_dir=validation_plot_dir,
+                transparent=False,
+            )
+
+    if rms_summary_rows:
+        have_uncertainty = any(
+            any(
+                np.isfinite(record.get("value", np.nan))
+                for record in row["uncertainty_rms_records"]
+            )
+            for row in rms_summary_rows
+        )
+
+        if have_uncertainty:
+            print(
+                "\nRMS displacement: experiment vs quadrature-combined "
+                "simulation uncertainty range vs theory (\u03bcm)"
+            )
+            print(
+                f"{'Axis':<12}"
+                f"{'Experiment':>14}"
+                f"{'Simulation':>14}"
+                f"{'Sim low':>14}"
+                f"{'Sim high':>14}"
+                f"{'Theory':>14}"
+            )
+            for row in rms_summary_rows:
+                uncertainty_bounds = quadrature_scalar_uncertainty_bounds(
+                    row["simulation_rms_um"],
+                    row["uncertainty_rms_records"],
+                )
+                if uncertainty_bounds is None:
+                    simulation_low = row["simulation_rms_um"]
+                    simulation_high = row["simulation_rms_um"]
+                else:
+                    simulation_low, simulation_high = uncertainty_bounds
+                print(
+                    f"{row['axis_label']:<12}"
+                    f"{row['experiment_rms_um']:>14.4f}"
+                    f"{row['simulation_rms_um']:>14.4f}"
+                    f"{simulation_low:>14.4f}"
+                    f"{simulation_high:>14.4f}"
+                    f"{row['theory_rms_um']:>14.4f}"
+                )
+        else:
+            print("\nRMS displacement: experiment vs simulation vs theory (\u03bcm)")
+            print(
+                f"{'Axis':<12}{'Experiment':>14}{'Simulation':>14}{'Theory':>14}"
+            )
+            for row in rms_summary_rows:
+                print(
+                    f"{row['axis_label']:<12}"
+                    f"{row['experiment_rms_um']:>14.4f}"
+                    f"{row['simulation_rms_um']:>14.4f}"
+                    f"{row['theory_rms_um']:>14.4f}"
+                )
 
     if not plot_experimental_psd_comparison:
         return
@@ -882,6 +2002,49 @@ def plot_experimental_simulation_comparison(
             ax.set_axis_off()
             continue
 
+        uncertainty_psd_records = []
+
+        if simulation_uncertainty_include_single_record_psd:
+            for uncertainty_run in simulation_uncertainty_runs:
+                uncertainty_time_s = uncertainty_run["time_s"]
+                uncertainty_position_um = (
+                    uncertainty_run["horizontal_um"]
+                    if axis_label == "Horizontal"
+                    else uncertainty_run["vertical_um"]
+                )
+                uncertainty_displacement_um = (
+                    uncertainty_position_um - np.mean(uncertainty_position_um)
+                )
+
+                if experimental_plot_seconds is None:
+                    uncertainty_mask = np.ones_like(uncertainty_time_s, dtype=bool)
+                else:
+                    uncertainty_mask = uncertainty_time_s <= experimental_plot_seconds
+
+                if np.count_nonzero(uncertainty_mask) < 4:
+                    continue
+
+                try:
+                    uncertainty_freqs, uncertainty_psd = (
+                        experimental_comparison_single_record_psd(
+                            uncertainty_time_s[uncertainty_mask],
+                            uncertainty_displacement_um[uncertainty_mask],
+                        )
+                    )
+                except ValueError:
+                    continue
+
+                uncertainty_psd_records.append(
+                    (
+                        uncertainty_freqs,
+                        uncertainty_psd,
+                        uncertainty_run.get(
+                            "uncertainty_group",
+                            uncertainty_run.get("label", "uncertainty case"),
+                        ),
+                    )
+                )
+
         four_panel_psd_records.extend((
             (f"{axis_label} experiment", exp_freqs, exp_psd, "tab:blue"),
             (f"{axis_label} simulation", sim_freqs, sim_psd, "tab:orange"),
@@ -910,12 +2073,41 @@ def plot_experimental_simulation_comparison(
                         "error": str(exc),
                     })
 
+        uncertainty_envelope = simulation_psd_uncertainty_bounds_on_reference(
+            sim_freqs,
+            sim_psd,
+            uncertainty_psd_records,
+        )
+
         ax.loglog(
             exp_freqs,
             exp_psd,
             linewidth=0.9,
             label=f"{experiment_label} PSD",
         )
+        detector_bounds = detector_calibration_psd_bounds(exp_psd)
+        if detector_bounds is not None:
+            detector_low_psd, detector_high_psd = detector_bounds
+            ax.fill_between(
+                exp_freqs,
+                detector_low_psd,
+                detector_high_psd,
+                color="tab:blue",
+                alpha=0.15,
+                linewidth=0.0,
+                label="experiment calibration range",
+            )
+        if uncertainty_envelope is not None and uncertainty_psd_records:
+            lower_psd, upper_psd, envelope_mask = uncertainty_envelope
+            ax.fill_between(
+                sim_freqs[envelope_mask],
+                lower_psd[envelope_mask],
+                upper_psd[envelope_mask],
+                color="tab:orange",
+                alpha=0.22,
+                linewidth=0.0,
+                label="simulation quadrature uncertainty range",
+            )
         ax.loglog(
             sim_freqs,
             sim_psd,
@@ -940,9 +2132,865 @@ def plot_experimental_simulation_comparison(
         print_psd_fit_parameter_table(psd_fit_rows)
 
     psd_axes[-1].set_xlabel("Frequency / Hz")
-    fig_psd.suptitle("Experimental PSD compared with BAOAB simulation PSD")
-    plt.tight_layout()
-    finish_plot()
+    fig_psd.suptitle("Experimental and simulated PSD", y=0.985)
+    fig_psd.tight_layout(rect=(0, 0.04, 1, 0.955), h_pad=1.25)
+    finish_plot(
+        name="experimental_baoab_psd_comparison",
+        fig=fig_psd,
+        output_dir=validation_plot_dir,
+    )
+
+    if plot_experimental_welch_psd_comparison:
+        welch_background_noise = None
+        if plot_simulation_plus_background_noise_psd:
+            try:
+                welch_background_noise = load_background_noise_photodiode_motion()
+            except (OSError, ValueError) as exc:
+                print("Skipping background addition on Welch PSD comparison:", exc)
+
+        fig_welch_psd, welch_psd_axes = plt.subplots(
+            2,
+            1,
+            figsize=experimental_welch_psd_comparison_figsize,
+            sharex=True,
+        )
+        fig_welch_psd.patch.set_facecolor("white")
+        for ax in welch_psd_axes:
+            ax.set_facecolor("white")
+        welch_summary_rows = []
+
+        for ax, (
+            _,
+            axis_label,
+            experiment_time_s,
+            experiment_position_um,
+            simulation_time_values_s,
+            simulation_position_um,
+            experiment_label,
+            simulation_label,
+        ) in zip(welch_psd_axes, comparisons):
+            experiment_displacement_um = (
+                experiment_position_um - np.mean(experiment_position_um)
+            )
+            simulation_displacement_um = (
+                simulation_position_um - np.mean(simulation_position_um)
+            )
+
+            if experimental_plot_seconds is None:
+                experiment_mask = np.ones_like(experiment_time_s, dtype=bool)
+                simulation_mask = np.ones_like(simulation_time_values_s, dtype=bool)
+            else:
+                experiment_mask = experiment_time_s <= experimental_plot_seconds
+                simulation_mask = simulation_time_values_s <= experimental_plot_seconds
+
+            if (
+                np.count_nonzero(experiment_mask) < 4
+                or np.count_nonzero(simulation_mask) < 4
+            ):
+                ax.text(
+                    0.5,
+                    0.5,
+                    "Not enough samples in requested Welch PSD window",
+                    ha="center",
+                    va="center",
+                    transform=ax.transAxes,
+                )
+                ax.set_axis_off()
+                continue
+
+            try:
+                experiment_welch_displacement_um = moving_average_smooth_trace(
+                    experiment_time_s[experiment_mask],
+                    experiment_displacement_um[experiment_mask],
+                    experimental_welch_psd_smoothing_window_seconds,
+                )
+                exp_freqs, exp_psd, exp_nperseg, exp_bin_size = (
+                    experimental_comparison_welch_averaged_psd(
+                        experiment_time_s[experiment_mask],
+                        experiment_welch_displacement_um,
+                    )
+                )
+                sim_freqs, sim_psd, sim_nperseg, sim_bin_size = (
+                    experimental_comparison_welch_averaged_psd(
+                        simulation_time_values_s[simulation_mask],
+                        simulation_displacement_um[simulation_mask],
+                    )
+                )
+            except ValueError as exc:
+                ax.text(
+                    0.5,
+                    0.5,
+                    str(exc),
+                    ha="center",
+                    va="center",
+                    transform=ax.transAxes,
+                )
+                ax.set_axis_off()
+                continue
+
+            sim_plot_freqs = sim_freqs
+            sim_plot_psd = sim_psd
+            simulation_plot_label = f"{simulation_label} Welch PSD"
+            background_freqs = None
+            background_psd = None
+
+            if welch_background_noise is not None:
+                background_time_s = (
+                    welch_background_noise["horizontal_time_s"]
+                    if axis_label == "Horizontal"
+                    else welch_background_noise["vertical_time_s"]
+                )
+                background_position_um = (
+                    welch_background_noise["horizontal_um"]
+                    if axis_label == "Horizontal"
+                    else welch_background_noise["vertical_um"]
+                )
+                background_displacement_um = (
+                    background_position_um - np.mean(background_position_um)
+                )
+
+                try:
+                    background_freqs, background_psd, _, _ = (
+                        experimental_comparison_welch_averaged_psd(
+                            background_time_s,
+                            background_displacement_um,
+                            segment_duration_seconds=(
+                                simulation_plus_background_welch_segment_duration_seconds
+                            ),
+                        )
+                    )
+                    combined_mask, combined_psd = simulation_plus_background_psd(
+                        sim_freqs,
+                        sim_psd,
+                        background_freqs,
+                        background_psd,
+                    )
+                    if combined_mask is not None:
+                        sim_plot_psd = sim_psd.copy()
+                        sim_plot_psd[combined_mask] = combined_psd[combined_mask]
+                        highest_background_frequency_hz = np.max(
+                            sim_freqs[combined_mask]
+                        )
+                        sim_plot_psd[
+                            sim_freqs > highest_background_frequency_hz
+                        ] = np.nan
+                        simulation_plot_label = (
+                            f"{simulation_label} + background Welch PSD"
+                        )
+                except ValueError:
+                    background_freqs = None
+                    background_psd = None
+
+            uncertainty_psd_records = []
+
+            if simulation_uncertainty_include_welch_psd:
+                for uncertainty_run in simulation_uncertainty_runs:
+                    uncertainty_time_s = uncertainty_run["time_s"]
+                    uncertainty_position_um = (
+                        uncertainty_run["horizontal_um"]
+                        if axis_label == "Horizontal"
+                        else uncertainty_run["vertical_um"]
+                    )
+                    uncertainty_displacement_um = (
+                        uncertainty_position_um - np.mean(uncertainty_position_um)
+                    )
+
+                    if experimental_plot_seconds is None:
+                        uncertainty_mask = np.ones_like(
+                            uncertainty_time_s,
+                            dtype=bool,
+                        )
+                    else:
+                        uncertainty_mask = (
+                            uncertainty_time_s <= experimental_plot_seconds
+                        )
+
+                    if np.count_nonzero(uncertainty_mask) < 4:
+                        continue
+
+                    try:
+                        uncertainty_freqs, uncertainty_psd, _, _ = (
+                            experimental_comparison_welch_averaged_psd(
+                                uncertainty_time_s[uncertainty_mask],
+                                uncertainty_displacement_um[uncertainty_mask],
+                            )
+                        )
+                    except ValueError:
+                        continue
+
+                    if background_freqs is not None and background_psd is not None:
+                        combined_uncertainty_mask, combined_uncertainty_psd = (
+                            simulation_plus_background_psd(
+                                uncertainty_freqs,
+                                uncertainty_psd,
+                                background_freqs,
+                                background_psd,
+                            )
+                        )
+                        if combined_uncertainty_mask is None:
+                            continue
+                        uncertainty_psd_with_background = uncertainty_psd.copy()
+                        uncertainty_psd_with_background[
+                            combined_uncertainty_mask
+                        ] = combined_uncertainty_psd[combined_uncertainty_mask]
+                        highest_uncertainty_background_frequency_hz = np.max(
+                            uncertainty_freqs[combined_uncertainty_mask]
+                        )
+                        uncertainty_psd_with_background[
+                            (
+                                uncertainty_freqs
+                                > highest_uncertainty_background_frequency_hz
+                            )
+                        ] = np.nan
+                        uncertainty_psd = uncertainty_psd_with_background
+
+                    uncertainty_psd_records.append(
+                        (
+                            uncertainty_freqs,
+                            uncertainty_psd,
+                            uncertainty_run.get(
+                                "uncertainty_group",
+                                uncertainty_run.get("label", "uncertainty case"),
+                            ),
+                        )
+                    )
+
+            uncertainty_envelope = simulation_psd_uncertainty_bounds_on_reference(
+                sim_plot_freqs,
+                sim_plot_psd,
+                uncertainty_psd_records,
+            )
+
+            ax.loglog(
+                exp_freqs,
+                exp_psd,
+                linewidth=0.9,
+                label=f"{experiment_label} Welch PSD",
+            )
+            detector_bounds = detector_calibration_psd_bounds(exp_psd)
+            if detector_bounds is not None:
+                detector_low_psd, detector_high_psd = detector_bounds
+                ax.fill_between(
+                    exp_freqs,
+                    detector_low_psd,
+                    detector_high_psd,
+                    color="tab:blue",
+                    alpha=0.15,
+                    linewidth=0.0,
+                    label="experiment calibration range",
+                )
+            if uncertainty_envelope is not None and uncertainty_psd_records:
+                lower_psd, upper_psd, envelope_mask = uncertainty_envelope
+                ax.fill_between(
+                    sim_plot_freqs[envelope_mask],
+                    lower_psd[envelope_mask],
+                    upper_psd[envelope_mask],
+                    color="tab:orange",
+                    alpha=0.22,
+                    linewidth=0.0,
+                    label="simulation quadrature uncertainty range",
+                )
+            ax.loglog(
+                sim_freqs,
+                sim_psd,
+                linewidth=0.85,
+                color="tab:red",
+                label=f"{simulation_label} Welch PSD, no background",
+            )
+            valid_sim_plot_mask = (
+                np.isfinite(sim_plot_freqs)
+                & np.isfinite(sim_plot_psd)
+                & (sim_plot_freqs > 0)
+                & (sim_plot_psd > 0)
+            )
+            ax.loglog(
+                sim_plot_freqs[valid_sim_plot_mask],
+                sim_plot_psd[valid_sim_plot_mask],
+                linewidth=0.9,
+                label=simulation_plot_label,
+            )
+            ax.set_ylabel("Welch PSD / micrometre^2 Hz^-1")
+            ax.set_title(f"{axis_label} Welch PSD comparison")
+            ax.legend(loc="lower left")
+            ax.grid(True, which="both", alpha=0.3)
+
+            if experimental_psd_min_value is not None:
+                ax.set_ylim(bottom=experimental_psd_min_value)
+
+            welch_summary_rows.append({
+                "axis": axis_label,
+                "experiment_nperseg": exp_nperseg,
+                "experiment_bin_size": exp_bin_size,
+                "simulation_nperseg": sim_nperseg,
+                "simulation_bin_size": sim_bin_size,
+            })
+
+        if experimental_psd_min_frequency is not None:
+            welch_psd_axes[-1].set_xlim(left=experimental_psd_min_frequency)
+
+        if experimental_psd_max_frequency is not None:
+            welch_psd_axes[-1].set_xlim(right=experimental_psd_max_frequency)
+
+        welch_psd_axes[-1].set_xlabel("Frequency / Hz")
+        fig_welch_psd.suptitle("Welch-averaged PSD comparison", y=0.985)
+        fig_welch_psd.tight_layout(rect=(0, 0.04, 1, 0.955), h_pad=1.25)
+        finish_plot(
+            name="experimental_baoab_welch_psd_comparison",
+            fig=fig_welch_psd,
+            output_dir=validation_plot_dir,
+            transparent=False,
+        )
+
+        for smoothing_window_seconds in (
+            additional_experimental_welch_psd_smoothing_windows_seconds
+        ):
+            smoothing_window_seconds = float(smoothing_window_seconds)
+            smoothing_window_ms = int(round(smoothing_window_seconds * 1000))
+            if smoothing_window_ms <= 0:
+                continue
+
+            fig_smoothed_welch, smoothed_welch_axes = plt.subplots(
+                2,
+                1,
+                figsize=experimental_welch_psd_comparison_figsize,
+                sharex=True,
+            )
+            fig_smoothed_welch.patch.set_facecolor("white")
+            for smoothed_axis in smoothed_welch_axes:
+                smoothed_axis.set_facecolor("white")
+
+            for ax, (
+                _,
+                axis_label,
+                experiment_time_s,
+                experiment_position_um,
+                simulation_time_values_s,
+                simulation_position_um,
+                experiment_label,
+                simulation_label,
+            ) in zip(smoothed_welch_axes, comparisons):
+                experiment_displacement_um = (
+                    experiment_position_um - np.mean(experiment_position_um)
+                )
+                simulation_displacement_um = (
+                    simulation_position_um - np.mean(simulation_position_um)
+                )
+
+                if experimental_plot_seconds is None:
+                    experiment_mask = np.ones_like(experiment_time_s, dtype=bool)
+                    simulation_mask = np.ones_like(
+                        simulation_time_values_s,
+                        dtype=bool,
+                    )
+                else:
+                    experiment_mask = experiment_time_s <= experimental_plot_seconds
+                    simulation_mask = (
+                        simulation_time_values_s <= experimental_plot_seconds
+                    )
+
+                if (
+                    np.count_nonzero(experiment_mask) < 4
+                    or np.count_nonzero(simulation_mask) < 4
+                ):
+                    ax.text(
+                        0.5,
+                        0.5,
+                        "Not enough samples in requested Welch PSD window",
+                        ha="center",
+                        va="center",
+                        transform=ax.transAxes,
+                    )
+                    ax.set_axis_off()
+                    continue
+
+                try:
+                    experiment_welch_displacement_um = moving_average_smooth_trace(
+                        experiment_time_s[experiment_mask],
+                        experiment_displacement_um[experiment_mask],
+                        smoothing_window_seconds,
+                    )
+                    exp_freqs, exp_psd, _, _ = (
+                        experimental_comparison_welch_averaged_psd(
+                            experiment_time_s[experiment_mask],
+                            experiment_welch_displacement_um,
+                        )
+                    )
+                    sim_freqs, sim_psd, _, _ = (
+                        experimental_comparison_welch_averaged_psd(
+                            simulation_time_values_s[simulation_mask],
+                            simulation_displacement_um[simulation_mask],
+                        )
+                    )
+                except ValueError as exc:
+                    ax.text(
+                        0.5,
+                        0.5,
+                        str(exc),
+                        ha="center",
+                        va="center",
+                        transform=ax.transAxes,
+                    )
+                    ax.set_axis_off()
+                    continue
+
+                sim_plot_freqs = sim_freqs
+                sim_plot_psd = sim_psd
+                simulation_plot_label = f"{simulation_label} + background Welch PSD"
+                background_freqs = None
+                background_psd = None
+
+                if welch_background_noise is not None:
+                    background_time_s = (
+                        welch_background_noise["horizontal_time_s"]
+                        if axis_label == "Horizontal"
+                        else welch_background_noise["vertical_time_s"]
+                    )
+                    background_position_um = (
+                        welch_background_noise["horizontal_um"]
+                        if axis_label == "Horizontal"
+                        else welch_background_noise["vertical_um"]
+                    )
+                    background_displacement_um = (
+                        background_position_um - np.mean(background_position_um)
+                    )
+
+                    try:
+                        background_freqs, background_psd, _, _ = (
+                            experimental_comparison_welch_averaged_psd(
+                                background_time_s,
+                                background_displacement_um,
+                                segment_duration_seconds=(
+                                    simulation_plus_background_welch_segment_duration_seconds
+                                ),
+                            )
+                        )
+                        combined_mask, combined_psd = simulation_plus_background_psd(
+                            sim_freqs,
+                            sim_psd,
+                            background_freqs,
+                            background_psd,
+                        )
+                        if combined_mask is not None:
+                            sim_plot_psd = sim_psd.copy()
+                            sim_plot_psd[combined_mask] = combined_psd[
+                                combined_mask
+                            ]
+                            highest_background_frequency_hz = np.max(
+                                sim_freqs[combined_mask]
+                            )
+                            sim_plot_psd[
+                                sim_freqs > highest_background_frequency_hz
+                            ] = np.nan
+                    except ValueError:
+                        background_freqs = None
+                        background_psd = None
+                        simulation_plot_label = f"{simulation_label} Welch PSD"
+                else:
+                    simulation_plot_label = f"{simulation_label} Welch PSD"
+
+                uncertainty_psd_records = []
+                if simulation_uncertainty_include_welch_psd:
+                    for uncertainty_run in simulation_uncertainty_runs:
+                        uncertainty_time_s = uncertainty_run["time_s"]
+                        uncertainty_position_um = (
+                            uncertainty_run["horizontal_um"]
+                            if axis_label == "Horizontal"
+                            else uncertainty_run["vertical_um"]
+                        )
+                        uncertainty_displacement_um = (
+                            uncertainty_position_um
+                            - np.mean(uncertainty_position_um)
+                        )
+
+                        if experimental_plot_seconds is None:
+                            uncertainty_mask = np.ones_like(
+                                uncertainty_time_s,
+                                dtype=bool,
+                            )
+                        else:
+                            uncertainty_mask = (
+                                uncertainty_time_s <= experimental_plot_seconds
+                            )
+
+                        if np.count_nonzero(uncertainty_mask) < 4:
+                            continue
+
+                        try:
+                            uncertainty_freqs, uncertainty_psd, _, _ = (
+                                experimental_comparison_welch_averaged_psd(
+                                    uncertainty_time_s[uncertainty_mask],
+                                    uncertainty_displacement_um[uncertainty_mask],
+                                )
+                            )
+                        except ValueError:
+                            continue
+
+                        if (
+                            background_freqs is not None
+                            and background_psd is not None
+                        ):
+                            (
+                                combined_uncertainty_mask,
+                                combined_uncertainty_psd,
+                            ) = simulation_plus_background_psd(
+                                uncertainty_freqs,
+                                uncertainty_psd,
+                                background_freqs,
+                                background_psd,
+                            )
+                            if combined_uncertainty_mask is None:
+                                continue
+                            uncertainty_psd_with_background = (
+                                uncertainty_psd.copy()
+                            )
+                            uncertainty_psd_with_background[
+                                combined_uncertainty_mask
+                            ] = combined_uncertainty_psd[
+                                combined_uncertainty_mask
+                            ]
+                            highest_uncertainty_background_frequency_hz = np.max(
+                                uncertainty_freqs[combined_uncertainty_mask]
+                            )
+                            uncertainty_psd_with_background[
+                                (
+                                    uncertainty_freqs
+                                    > highest_uncertainty_background_frequency_hz
+                                )
+                            ] = np.nan
+                            uncertainty_psd = uncertainty_psd_with_background
+
+                        uncertainty_psd_records.append(
+                            (
+                                uncertainty_freqs,
+                                uncertainty_psd,
+                                uncertainty_run.get(
+                                    "uncertainty_group",
+                                    uncertainty_run.get(
+                                        "label",
+                                        "uncertainty case",
+                                    ),
+                                ),
+                            )
+                        )
+
+                uncertainty_envelope = simulation_psd_uncertainty_bounds_on_reference(
+                    sim_plot_freqs,
+                    sim_plot_psd,
+                    uncertainty_psd_records,
+                )
+
+                ax.loglog(
+                    exp_freqs,
+                    exp_psd,
+                    linewidth=0.9,
+                    label=(
+                        f"{experiment_label} Welch PSD, "
+                        f"{smoothing_window_ms} ms smoothing"
+                    ),
+                )
+                detector_bounds = detector_calibration_psd_bounds(exp_psd)
+                if detector_bounds is not None:
+                    detector_low_psd, detector_high_psd = detector_bounds
+                    ax.fill_between(
+                        exp_freqs,
+                        detector_low_psd,
+                        detector_high_psd,
+                        color="tab:blue",
+                        alpha=0.15,
+                        linewidth=0.0,
+                        label="experiment calibration range",
+                    )
+                if uncertainty_envelope is not None and uncertainty_psd_records:
+                    lower_psd, upper_psd, envelope_mask = uncertainty_envelope
+                    ax.fill_between(
+                        sim_plot_freqs[envelope_mask],
+                        lower_psd[envelope_mask],
+                        upper_psd[envelope_mask],
+                        color="tab:orange",
+                        alpha=0.22,
+                        linewidth=0.0,
+                        label="simulation quadrature uncertainty range",
+                    )
+                ax.loglog(
+                    sim_freqs,
+                    sim_psd,
+                    linewidth=0.85,
+                    color="tab:red",
+                    label=f"{simulation_label} Welch PSD, no background",
+                )
+                valid_sim_plot_mask = (
+                    np.isfinite(sim_plot_freqs)
+                    & np.isfinite(sim_plot_psd)
+                    & (sim_plot_freqs > 0)
+                    & (sim_plot_psd > 0)
+                )
+                ax.loglog(
+                    sim_plot_freqs[valid_sim_plot_mask],
+                    sim_plot_psd[valid_sim_plot_mask],
+                    linewidth=0.9,
+                    label=simulation_plot_label,
+                )
+                ax.set_ylabel("Welch PSD / micrometre^2 Hz^-1")
+                ax.set_title(
+                    f"{axis_label} Welch PSD comparison "
+                    f"({smoothing_window_ms} ms smoothed experiment)"
+                )
+                ax.legend(loc="lower left")
+                ax.grid(True, which="both", alpha=0.3)
+
+                if experimental_psd_min_value is not None:
+                    ax.set_ylim(bottom=experimental_psd_min_value)
+
+            if experimental_psd_min_frequency is not None:
+                smoothed_welch_axes[-1].set_xlim(
+                    left=experimental_psd_min_frequency
+                )
+
+            if experimental_psd_max_frequency is not None:
+                smoothed_welch_axes[-1].set_xlim(
+                    right=experimental_psd_max_frequency
+                )
+
+            smoothed_welch_axes[-1].set_xlabel("Frequency / Hz")
+            fig_smoothed_welch.suptitle(
+                (
+                    "Welch-averaged PSD comparison "
+                    f"({smoothing_window_ms} ms smoothed experiment)"
+                ),
+                y=0.985,
+            )
+            fig_smoothed_welch.tight_layout(
+                rect=(0, 0.04, 1, 0.955),
+                h_pad=1.25,
+            )
+            finish_plot(
+                name=(
+                    "experimental_baoab_welch_psd_comparison_"
+                    f"smoothed_{smoothing_window_ms}ms"
+                ),
+                fig=fig_smoothed_welch,
+                output_dir=validation_plot_dir,
+                transparent=False,
+            )
+
+        if plot_simulation_plus_background_noise_psd:
+            try:
+                background_noise = load_background_noise_photodiode_motion()
+            except (OSError, ValueError) as exc:
+                print("Skipping simulation + background PSD plot:", exc)
+            else:
+                fig_background_psd, background_psd_axes = plt.subplots(
+                    2,
+                    1,
+                    figsize=experimental_welch_psd_comparison_figsize,
+                    sharex=True,
+                )
+                fig_background_psd.patch.set_facecolor("white")
+                for background_axis in background_psd_axes:
+                    background_axis.set_facecolor("white")
+                background_summary_rows = []
+
+                for ax, (
+                    _,
+                    axis_label,
+                    experiment_time_s,
+                    experiment_position_um,
+                    simulation_time_values_s,
+                    simulation_position_um,
+                    experiment_label,
+                    simulation_label,
+                ) in zip(background_psd_axes, comparisons):
+                    experiment_displacement_um = (
+                        experiment_position_um - np.mean(experiment_position_um)
+                    )
+                    simulation_displacement_um = (
+                        simulation_position_um - np.mean(simulation_position_um)
+                    )
+                    background_time_s = (
+                        background_noise["horizontal_time_s"]
+                        if axis_label == "Horizontal"
+                        else background_noise["vertical_time_s"]
+                    )
+                    background_position_um = (
+                        background_noise["horizontal_um"]
+                        if axis_label == "Horizontal"
+                        else background_noise["vertical_um"]
+                    )
+                    background_displacement_um = (
+                        background_position_um - np.mean(background_position_um)
+                    )
+
+                    if experimental_plot_seconds is None:
+                        experiment_mask = np.ones_like(experiment_time_s, dtype=bool)
+                        simulation_mask = np.ones_like(
+                            simulation_time_values_s,
+                            dtype=bool,
+                        )
+                    else:
+                        experiment_mask = experiment_time_s <= experimental_plot_seconds
+                        simulation_mask = (
+                            simulation_time_values_s <= experimental_plot_seconds
+                        )
+
+                    if (
+                        np.count_nonzero(experiment_mask) < 4
+                        or np.count_nonzero(simulation_mask) < 4
+                        or len(background_time_s) < 4
+                    ):
+                        ax.text(
+                            0.5,
+                            0.5,
+                            "Not enough samples for background PSD comparison",
+                            ha="center",
+                            va="center",
+                            transform=ax.transAxes,
+                        )
+                        ax.set_axis_off()
+                        continue
+
+                    try:
+                        exp_freqs, exp_psd, _, _ = (
+                            experimental_comparison_welch_averaged_psd(
+                                experiment_time_s[experiment_mask],
+                                experiment_displacement_um[experiment_mask],
+                                segment_duration_seconds=(
+                                    simulation_plus_background_welch_segment_duration_seconds
+                                ),
+                            )
+                        )
+                        sim_freqs, sim_psd, _, _ = (
+                            experimental_comparison_welch_averaged_psd(
+                                simulation_time_values_s[simulation_mask],
+                                simulation_displacement_um[simulation_mask],
+                                segment_duration_seconds=(
+                                    simulation_plus_background_welch_segment_duration_seconds
+                                ),
+                            )
+                        )
+                        background_freqs, background_psd, _, background_bin_size = (
+                            experimental_comparison_welch_averaged_psd(
+                                background_time_s,
+                                background_displacement_um,
+                                segment_duration_seconds=(
+                                    simulation_plus_background_welch_segment_duration_seconds
+                                ),
+                            )
+                        )
+                    except ValueError as exc:
+                        ax.text(
+                            0.5,
+                            0.5,
+                            str(exc),
+                            ha="center",
+                            va="center",
+                            transform=ax.transAxes,
+                        )
+                        ax.set_axis_off()
+                        continue
+
+                    combined_mask, combined_psd = simulation_plus_background_psd(
+                        sim_freqs,
+                        sim_psd,
+                        background_freqs,
+                        background_psd,
+                    )
+
+                    ax.loglog(
+                        exp_freqs,
+                        exp_psd,
+                        linewidth=1.1,
+                        color="tab:blue",
+                        label=f"{experiment_label} Welch PSD",
+                    )
+
+                    if combined_mask is not None:
+                        ax.loglog(
+                            sim_freqs[combined_mask],
+                            combined_psd[combined_mask],
+                            linewidth=1.15,
+                            color="tab:orange",
+                            label="simulation + background PSD",
+                        )
+
+                    ax.set_ylabel("Welch PSD / micrometre^2 Hz^-1")
+                    ax.set_title(f"{axis_label} PSD comparison")
+                    ax.legend()
+                    ax.grid(True, which="both", alpha=0.3)
+
+                    if experimental_psd_min_value is not None:
+                        ax.set_ylim(bottom=experimental_psd_min_value)
+
+                    background_summary_rows.append({
+                        "axis": axis_label,
+                        "background_rms_um": np.std(background_displacement_um),
+                        "background_duration_s": (
+                            background_time_s[-1] - background_time_s[0]
+                        ),
+                        "background_bin_size": background_bin_size,
+                    })
+
+                if experimental_psd_min_frequency is not None:
+                    background_psd_axes[-1].set_xlim(
+                        left=experimental_psd_min_frequency
+                    )
+
+                if experimental_psd_max_frequency is not None:
+                    background_psd_axes[-1].set_xlim(
+                        right=experimental_psd_max_frequency
+                    )
+
+                background_psd_axes[-1].set_xlabel("Frequency / Hz")
+                fig_background_psd.suptitle(
+                    "PSD with measured background added",
+                    y=0.985,
+                )
+                fig_background_psd.tight_layout(
+                    rect=(0, 0.04, 1, 0.955),
+                    h_pad=1.25,
+                )
+                finish_plot(
+                    name=(
+                        "experimental_baoab_welch_psd_"
+                        "simulation_plus_background_noise"
+                    ),
+                    fig=fig_background_psd,
+                    output_dir=validation_plot_dir,
+                    transparent=False,
+                )
+
+                if background_summary_rows:
+                    print("\nMeasured background noise used for PSD addition")
+                    print(
+                        f"{'axis':<12} "
+                        f"{'RMS / um':>12} "
+                        f"{'duration / s':>14} "
+                        f"{'df / Hz':>12}"
+                    )
+                    for row in background_summary_rows:
+                        print(
+                            f"{row['axis']:<12} "
+                            f"{row['background_rms_um']:>12.5g} "
+                            f"{row['background_duration_s']:>14.5g} "
+                            f"{row['background_bin_size']:>12.5g}"
+                        )
+
+        if welch_summary_rows:
+            print("\nWelch experimental/simulation PSD settings")
+            print(
+                f"{'axis':<12} "
+                f"{'exp nperseg':>12} "
+                f"{'exp df / Hz':>12} "
+                f"{'sim nperseg':>12} "
+                f"{'sim df / Hz':>12}"
+            )
+            for row in welch_summary_rows:
+                print(
+                    f"{row['axis']:<12} "
+                    f"{row['experiment_nperseg']:>12} "
+                    f"{row['experiment_bin_size']:>12.5g} "
+                    f"{row['simulation_nperseg']:>12} "
+                    f"{row['simulation_bin_size']:>12.5g}"
+                )
 
     if plot_experimental_psd_four_panel and four_panel_psd_records:
         fig_psd_four, four_axes = plt.subplots(
@@ -983,7 +3031,11 @@ def plot_experimental_simulation_comparison(
 
         fig_psd_four.suptitle("Individual experimental and simulation PSDs")
         plt.tight_layout()
-        finish_plot()
+        finish_plot(
+            name="experimental_baoab_psd_four_panel",
+            fig=fig_psd_four,
+            output_dir=validation_plot_dir,
+        )
 
 
 # ****************************************************************************************************************************************************
@@ -1624,6 +3676,8 @@ def F_photo_2d(x, z, power_factor=1.0):
 def F_optical_2d_direct(x, z, power_factor=1.0):
     
     Fx_ray, Fz_ray = F_beam_2d(x, z, power_factor)
+    Fx_ray *= optical_force_scale
+    Fz_ray *= optical_force_scale
     Fx_photo, Fz_photo = F_photo_2d(x, z, power_factor)
 
     Fx = Fx_ray + Fx_photo
@@ -2259,6 +4313,7 @@ b_cunningham = damping_coefficient_stokes_cunningham(p)
 b_epstein = damping_coefficient_epstein(p)
 
 b, drag_model_used = damping_coefficient(p, drag_model)
+b *= effective_damping_scale
 print("damping coef = ", b)
 
 #b=b/40
@@ -2359,7 +4414,7 @@ if (
     fig, axes = plt.subplots(
         2,
         1,
-        figsize=(8, 6),
+        figsize=publication_figsize,
         sharex=True,
         gridspec_kw={"height_ratios": [3, 1]},
     )
@@ -2759,11 +4814,14 @@ rng = np.random.default_rng(seed=brownian_seed)
 laser_rng = np.random.default_rng(seed=laser_noise_seed)
 
 laser_noise_model_normalised = laser_noise_model.strip().lower()
+laser_noise_metadata = {}
 
 if use_laser_power_noise and laser_noise_model_normalised in {
     "synthetic",
     "synthetic_step",
-    "step"
+    "step",
+    "square",
+    "square_wave"
 }:
     laser_noise_model_normalised = "synthetic_step"
     laser_noise_plot_style = "step"
@@ -2836,9 +4894,57 @@ elif use_laser_power_noise and laser_noise_model_normalised in {
             laser_allowed_power_factors[-1],
             max(2, int(measured_laser_noise_equilibrium_points))
         )
+elif use_laser_power_noise and laser_noise_model_normalised in {
+    "psd",
+    "psd_matched",
+    "psd-matched",
+    "synthetic_psd",
+    "matched_psd"
+}:
+    laser_noise_model_normalised = "psd_matched"
+    laser_noise_plot_style = "line"
+    laser_noise_description = "PSD-matched synthetic laser noise"
+    laser_noise_plot_title = "PSD-matched synthetic laser-power noise"
+    (
+        laser_power_factor,
+        measured_laser_noise_time_s,
+        measured_laser_noise_power_w,
+        laser_noise_metadata
+    ) = psd_matched_laser_power_factor_from_trace(
+        t_baoab,
+        measured_laser_noise_csv,
+        laser_rng,
+        welch_segment_duration_s=psd_matched_laser_noise_welch_duration,
+        target_peak_fraction=psd_matched_laser_noise_peak_fraction,
+        match_input_mean=measured_laser_noise_match_input_mean
+    )
+    measured_laser_noise_dt_s = 1.0 / laser_noise_metadata[
+        "measured_sampling_frequency_hz"
+    ]
+    laser_step_samples = max(1, int(round(measured_laser_noise_dt_s / dt_baoab)))
+    laser_step_duration_actual = laser_step_samples * dt_baoab
+    laser_step_power_factors = laser_power_factor
+    laser_allowed_power_factors = np.array(
+        [
+            np.min(laser_power_factor),
+            np.mean(laser_power_factor),
+            np.max(laser_power_factor)
+        ]
+    )
+    laser_factor_span = laser_allowed_power_factors[-1] - laser_allowed_power_factors[0]
+
+    if np.isclose(laser_factor_span, 0.0):
+        laser_equilibrium_power_factors = np.array([laser_allowed_power_factors[1]])
+    else:
+        laser_equilibrium_power_factors = np.linspace(
+            laser_allowed_power_factors[0],
+            laser_allowed_power_factors[-1],
+            max(2, int(measured_laser_noise_equilibrium_points))
+        )
 elif use_laser_power_noise:
     raise ValueError(
-        "laser_noise_model must be 'synthetic_step' or 'measured_csv', got "
+        "laser_noise_model must be 'synthetic_step', 'measured_csv' or "
+        "'psd_matched', got "
         f"{laser_noise_model!r}."
     )
 else:
@@ -2855,8 +4961,26 @@ else:
 laser_power_time = P_laser * laser_power_factor
 
 print("Laser noise model =", laser_noise_description)
-if use_laser_power_noise and laser_noise_model_normalised == "measured_csv":
+if use_laser_power_noise and laser_noise_model_normalised in {"measured_csv", "psd_matched"}:
     print("Measured laser-noise CSV =", measured_laser_noise_csv)
+if use_laser_power_noise and laser_noise_model_normalised == "psd_matched":
+    print(
+        "PSD-matched laser-noise sampling/Nyquist =",
+        laser_noise_metadata["measured_sampling_frequency_hz"],
+        "/",
+        laser_noise_metadata["measured_nyquist_frequency_hz"],
+        "Hz"
+    )
+    print(
+        "PSD-matched measured/synthetic relative RMS =",
+        laser_noise_metadata["measured_relative_rms"],
+        "/",
+        laser_noise_metadata["synthetic_relative_rms"]
+    )
+    print(
+        "PSD-matched positive peak above mean =",
+        laser_noise_metadata["synthetic_positive_peak"]
+    )
 print("Laser power mean =", np.mean(laser_power_time), "W")
 print("Laser power fractional RMS =", np.std(laser_power_factor), "relative to mean")
 print(
@@ -3147,6 +5271,612 @@ def solve_baoab_3d_fast_with_power(
         brownian_normals_z,
         run_label
     )
+
+
+SIMULATION_UNCERTAINTY_STATE_NAMES = (
+    "radius",
+    "n_particle",
+    "w0",
+    "P_laser",
+    "absorption_fraction",
+    "optical_force_scale",
+    "effective_damping_scale",
+    "volume",
+    "m",
+    "rho_g",
+    "lambda_mfp",
+    "Kn",
+    "zR_m2",
+    "zR",
+    "I0",
+    "u_values",
+    "v_values",
+    "du",
+    "dv",
+    "dA",
+    "U",
+    "V",
+    "rho",
+    "ray_mask",
+    "U_hit",
+    "V_hit",
+    "rho_hit",
+    "sin_theta_i",
+    "theta_i",
+    "sin_theta_r",
+    "theta_r",
+    "cos_i",
+    "cos_r",
+    "Rs",
+    "Rp",
+    "Q_s_s_pol",
+    "Q_g_s_pol",
+    "Q_s_p_pol",
+    "Q_g_p_pol",
+    "Q_s",
+    "Q_g",
+    "rho_safe",
+    "u_hat",
+    "mie_relative_refractive_index",
+    "mie_size_parameter",
+    "mie_q_pr",
+    "z_scan",
+    "F_scan",
+    "roots",
+    "stable_roots",
+    "stable_equilibrium_found",
+    "no_stable_equilibrium_mode",
+    "falling_trajectory_post_truncation",
+    "equilibrium_reference_source",
+    "z_falling_start_reference",
+    "z_falling_stop_reference",
+    "x_eq",
+    "y_eq",
+    "z_eq",
+    "kx",
+    "ky",
+    "kz",
+    "harmonic_validation_available",
+    "omega_x",
+    "omega_y",
+    "omega_z",
+    "x_rms_thermal",
+    "y_rms_thermal",
+    "z_rms_thermal",
+    "b_stokes",
+    "b_cunningham",
+    "b_epstein",
+    "b",
+    "drag_model_used",
+    "x0",
+    "y0",
+    "z0",
+    "Fx_initial",
+    "Fy_initial",
+    "Fz_initial",
+    "ax_initial",
+    "ay_initial",
+    "az_initial",
+    "force_lookup_ready",
+    "force_lookup_r_values",
+    "force_lookup_z_values",
+    "force_lookup_Fr_interpolator",
+    "force_lookup_Fz_interpolator",
+    "force_lookup_Fr_table",
+    "force_lookup_Fz_table",
+    "force_lookup_r_max",
+    "force_lookup_z_half_width",
+    "force_lookup_z_min",
+    "force_lookup_z_max",
+    "trap_loss_radial_limit_auto",
+    "trap_loss_axial_limit_auto",
+    "trap_loss_radial_limit",
+    "trap_loss_axial_limit",
+    "gamma_baoab",
+    "baoab_damping_factor",
+    "baoab_thermal_velocity_scale",
+)
+
+
+def snapshot_simulation_uncertainty_state():
+    state = {}
+
+    for name in SIMULATION_UNCERTAINTY_STATE_NAMES:
+        if name not in globals():
+            continue
+
+        value = globals()[name]
+        if isinstance(value, np.ndarray):
+            value = value.copy()
+        elif isinstance(value, list):
+            value = list(value)
+        elif isinstance(value, dict):
+            value = dict(value)
+
+        state[name] = value
+
+    return state
+
+
+def restore_simulation_uncertainty_state(state):
+    globals().update(state)
+
+
+def refresh_ray_sampling_for_current_radius():
+    values = {}
+    values["u_values"] = np.linspace(-radius, radius, ray_grid_points)
+    values["v_values"] = np.linspace(-radius, radius, ray_grid_points)
+    values["du"] = values["u_values"][1] - values["u_values"][0]
+    values["dv"] = values["v_values"][1] - values["v_values"][0]
+    values["dA"] = values["du"] * values["dv"]
+    values["U"], values["V"] = np.meshgrid(
+        values["u_values"],
+        values["v_values"],
+        indexing="ij",
+    )
+    values["rho"] = np.sqrt(values["U"]**2 + values["V"]**2)
+    values["ray_mask"] = values["rho"] < radius
+    values["U_hit"] = values["U"][values["ray_mask"]]
+    values["V_hit"] = values["V"][values["ray_mask"]]
+    values["rho_hit"] = values["rho"][values["ray_mask"]]
+    values["sin_theta_i"] = values["rho_hit"] / radius
+    values["theta_i"] = np.arcsin(np.clip(values["sin_theta_i"], 0.0, 1.0))
+    values["sin_theta_r"] = (
+        (n_medium / n_particle) * values["sin_theta_i"]
+    )
+    values["theta_r"] = np.arcsin(np.clip(values["sin_theta_r"], 0.0, 1.0))
+    values["cos_i"] = np.cos(values["theta_i"])
+    values["cos_r"] = np.cos(values["theta_r"])
+    values["Rs"] = (
+        (
+            n_medium * values["cos_i"] - n_particle * values["cos_r"]
+        )
+        / (
+            n_medium * values["cos_i"] + n_particle * values["cos_r"]
+        )
+    )**2
+    values["Rp"] = (
+        (
+            n_medium * values["cos_r"] - n_particle * values["cos_i"]
+        )
+        / (
+            n_medium * values["cos_r"] + n_particle * values["cos_i"]
+        )
+    )**2
+
+    globals().update(values)
+
+    values["Q_s_s_pol"], values["Q_g_s_pol"] = (
+        ashkin_efficiencies_from_reflectance(Rs)
+    )
+    values["Q_s_p_pol"], values["Q_g_p_pol"] = (
+        ashkin_efficiencies_from_reflectance(Rp)
+    )
+    values["Q_s"] = 0.5 * (values["Q_s_s_pol"] + values["Q_s_p_pol"])
+    values["Q_g"] = 0.5 * (values["Q_g_s_pol"] + values["Q_g_p_pol"])
+    values["rho_safe"] = np.where(values["rho_hit"] > 0, values["rho_hit"], 1.0)
+    values["u_hat"] = values["U_hit"] / values["rho_safe"]
+
+    globals().update(values)
+
+
+def recompute_derived_quantities_for_uncertainty_case():
+    values = {}
+    values["volume"] = (4 / 3) * np.pi * radius**3
+    values["m"] = density * values["volume"]
+    values["rho_g"] = p * M_air / (R * T)
+    values["lambda_mfp"] = kB * T / (np.sqrt(2) * np.pi * d_air**2 * p)
+    values["Kn"] = values["lambda_mfp"] / radius
+    values["zR_m2"] = np.pi * w0**2 / (M2 * wavelength)
+    values["zR"] = values["zR_m2"] if use_m2_rayleigh_range else zR_manual
+    values["I0"] = 2 * P_laser / (np.pi * w0**2)
+    globals().update(values)
+
+    refresh_ray_sampling_for_current_radius()
+
+    globals()["mie_relative_refractive_index"] = n_particle / n_medium
+    globals()["mie_size_parameter"] = 2 * np.pi * n_medium * radius / wavelength
+    globals()["mie_q_pr"] = mie_radiation_pressure_efficiency(
+        mie_relative_refractive_index,
+        mie_size_parameter,
+    )
+
+
+def select_stable_equilibrium_for_uncertainty_case():
+    globals()["z_scan"] = np.linspace(
+        equilibrium_z_min,
+        equilibrium_z_max,
+        equilibrium_scan_points,
+    )
+    globals()["F_scan"] = Fz_net_on_axis(z_scan)
+
+    roots_current = []
+    for i in range(len(z_scan) - 1):
+        if F_scan[i] * F_scan[i + 1] < 0:
+            roots_current.append(
+                brentq(
+                    Fz_net_on_axis,
+                    z_scan[i],
+                    z_scan[i + 1],
+                    xtol=root_finding_xtol,
+                    rtol=root_finding_rtol,
+                )
+            )
+
+    stable_roots_current = []
+    for root in roots_current:
+        slope = numerical_derivative_1d(Fz_net_on_axis, root)
+        if slope < 0:
+            stable_roots_current.append(root)
+
+    if not stable_roots_current:
+        raise ValueError("no stable on-axis equilibrium found")
+
+    if not -len(stable_roots_current) <= equilibrium_root_index < len(stable_roots_current):
+        raise IndexError(
+            "equilibrium_root_index is outside the stable root list "
+            f"for this uncertainty case ({len(stable_roots_current)} roots)."
+        )
+
+    globals()["roots"] = roots_current
+    globals()["stable_roots"] = stable_roots_current
+    globals()["stable_equilibrium_found"] = True
+    globals()["no_stable_equilibrium_mode"] = False
+    globals()["falling_trajectory_post_truncation"] = False
+    globals()["equilibrium_reference_source"] = "uncertainty-case stable equilibrium"
+    globals()["z_falling_start_reference"] = None
+    globals()["z_falling_stop_reference"] = None
+    globals()["x_eq"] = x_equilibrium
+    globals()["y_eq"] = y_equilibrium
+    globals()["z_eq"] = stable_roots_current[equilibrium_root_index]
+
+
+def update_linearised_dynamics_for_uncertainty_case(use_lookup_force=False):
+    if use_lookup_force:
+        def Fx_current_at_x(x):
+            Fx, _, _ = F_optical_3d_lookup(x, y_eq, z_eq)
+            return Fx
+
+        def Fy_current_at_y(y):
+            _, Fy, _ = F_optical_3d_lookup(x_eq, y, z_eq)
+            return Fy
+
+        def Fz_current_net_at_z(z):
+            _, _, Fz = F_optical_3d_lookup(x_eq, y_eq, z)
+            return Fz - m*g
+    else:
+        def Fx_current_at_x(x):
+            Fx, _ = F_optical_2d(x, z_eq)
+            return Fx
+
+        def Fy_current_at_y(y):
+            _, Fy, _ = F_optical_3d(x_eq, y, z_eq)
+            return Fy
+
+        def Fz_current_net_at_z(z):
+            _, Fz = F_optical_2d(x_eq, z)
+            return Fz - m*g
+
+    globals()["kx"] = -numerical_derivative_1d(Fx_current_at_x, x_eq)
+    globals()["ky"] = -numerical_derivative_1d(Fy_current_at_y, y_eq)
+    globals()["kz"] = -numerical_derivative_1d(Fz_current_net_at_z, z_eq)
+    globals()["harmonic_validation_available"] = kx > 0 and ky > 0 and kz > 0
+    globals()["omega_x"] = np.sqrt(kx / m) if kx > 0 else np.nan
+    globals()["omega_y"] = np.sqrt(ky / m) if ky > 0 else np.nan
+    globals()["omega_z"] = np.sqrt(kz / m) if kz > 0 else np.nan
+    globals()["x_rms_thermal"] = np.sqrt(kB * T / kx) if kx > 0 else np.nan
+    globals()["y_rms_thermal"] = np.sqrt(kB * T / ky) if ky > 0 else np.nan
+    globals()["z_rms_thermal"] = np.sqrt(kB * T / kz) if kz > 0 else np.nan
+
+
+def rebuild_force_lookup_for_uncertainty_case():
+    globals()["force_lookup_ready"] = False
+
+    x_lookup_thermal_extent = x_rms_thermal if np.isfinite(x_rms_thermal) else 0.0
+    z_lookup_thermal_extent = z_rms_thermal if np.isfinite(z_rms_thermal) else 0.0
+    lookup_r_max = max(
+        force_lookup_r_base_max,
+        force_lookup_r_displacement_factor
+        * np.sqrt(x_displacement**2 + y_displacement**2),
+        force_lookup_r_thermal_factor * x_lookup_thermal_extent,
+    )
+    lookup_z_half_width = max(
+        force_lookup_z_base_half_width,
+        force_lookup_z_displacement_factor * abs(z_displacement),
+        force_lookup_z_thermal_factor * z_lookup_thermal_extent,
+    )
+    lookup_r_min = force_lookup_r_min
+    lookup_z_min = z_eq - lookup_z_half_width
+    lookup_z_max = z_eq + lookup_z_half_width
+
+    if optical_force_model == "external_lookup":
+        lookup_r_min = max(lookup_r_min, external_optical_force_r_values[0])
+        lookup_r_max = min(lookup_r_max, external_optical_force_r_values[-1])
+        lookup_z_min = max(lookup_z_min, external_optical_force_z_values[0])
+        lookup_z_max = min(lookup_z_max, external_optical_force_z_values[-1])
+        lookup_z_half_width = min(z_eq - lookup_z_min, lookup_z_max - z_eq)
+
+    globals()["force_lookup_r_max"] = lookup_r_max
+    globals()["force_lookup_z_half_width"] = lookup_z_half_width
+    globals()["force_lookup_z_min"] = lookup_z_min
+    globals()["force_lookup_z_max"] = lookup_z_max
+
+    if use_force_lookup_table:
+        build_force_lookup_table(
+            lookup_r_min,
+            lookup_r_max,
+            lookup_z_min,
+            lookup_z_max,
+        )
+        update_linearised_dynamics_for_uncertainty_case(use_lookup_force=True)
+
+
+def refresh_baoab_state_for_uncertainty_case():
+    globals()["b_stokes"] = damping_coefficient_stokes()
+    globals()["b_cunningham"] = damping_coefficient_stokes_cunningham(p)
+    globals()["b_epstein"] = damping_coefficient_epstein(p)
+    globals()["b"], globals()["drag_model_used"] = damping_coefficient(p, drag_model)
+    globals()["b"] *= effective_damping_scale
+    globals()["x0"] = x_eq + x_displacement
+    globals()["y0"] = y_eq + y_displacement
+    globals()["z0"] = z_eq + z_displacement
+
+    Fx_value, Fy_value, Fz_value = F_optical_3d(x0, y0, z0)
+    globals()["Fx_initial"] = Fx_value
+    globals()["Fy_initial"] = Fy_value
+    globals()["Fz_initial"] = Fz_value
+    globals()["ax_initial"] = Fx_value / m
+    globals()["ay_initial"] = Fy_value / m
+    globals()["az_initial"] = (Fz_value - m*g) / m
+
+    radial_limit_auto = trap_loss_radial_beam_waists * w0
+    axial_limit_auto = trap_loss_axial_rayleigh_ranges * zR
+
+    if use_force_lookup_table:
+        radial_limit_auto = max(radial_limit_auto, force_lookup_r_max)
+        axial_limit_auto = max(axial_limit_auto, force_lookup_z_half_width)
+
+    globals()["trap_loss_radial_limit_auto"] = radial_limit_auto
+    globals()["trap_loss_axial_limit_auto"] = axial_limit_auto
+    globals()["trap_loss_radial_limit"] = (
+        radial_limit_auto
+        if trap_loss_radial_limit_manual is None
+        else trap_loss_radial_limit_manual
+    )
+    globals()["trap_loss_axial_limit"] = (
+        axial_limit_auto
+        if trap_loss_axial_limit_manual is None
+        else trap_loss_axial_limit_manual
+    )
+    globals()["gamma_baoab"] = b / m
+    globals()["baoab_damping_factor"] = np.exp(-gamma_baoab * dt_baoab)
+    globals()["baoab_thermal_velocity_scale"] = np.sqrt(
+        (kB * T / m)
+        * (1 - baoab_damping_factor**2)
+    )
+
+
+def refresh_full_model_for_uncertainty_case():
+    recompute_derived_quantities_for_uncertainty_case()
+    globals()["force_lookup_ready"] = False
+    select_stable_equilibrium_for_uncertainty_case()
+    update_linearised_dynamics_for_uncertainty_case(use_lookup_force=False)
+    rebuild_force_lookup_for_uncertainty_case()
+    refresh_baoab_state_for_uncertainty_case()
+
+
+def configured_simulation_uncertainty_cases():
+    cases = []
+
+    if simulation_uncertainty_optical_force_scale_bounds is not None:
+        low_scale, high_scale = simulation_uncertainty_optical_force_scale_bounds
+        if low_scale > 0 and high_scale > 0:
+            cases.extend(
+                [
+                    (
+                        "optical force scale low",
+                        {"optical_force_scale": float(low_scale)},
+                    ),
+                    (
+                        "optical force scale high",
+                        {"optical_force_scale": float(high_scale)},
+                    ),
+                ]
+            )
+
+    if simulation_uncertainty_effective_damping_scale_bounds is not None:
+        low_scale, high_scale = simulation_uncertainty_effective_damping_scale_bounds
+        if low_scale > 0 and high_scale > 0:
+            cases.extend(
+                [
+                    (
+                        "effective damping low",
+                        {"effective_damping_scale": float(low_scale)},
+                    ),
+                    (
+                        "effective damping high",
+                        {"effective_damping_scale": float(high_scale)},
+                    ),
+                ]
+            )
+
+    if simulation_uncertainty_refractive_index_bounds is not None:
+        low_index, high_index = simulation_uncertainty_refractive_index_bounds
+        if low_index > n_medium and high_index > n_medium:
+            cases.extend(
+                [
+                    ("refractive index low", {"n_particle": float(low_index)}),
+                    ("refractive index high", {"n_particle": float(high_index)}),
+                ]
+            )
+
+    if simulation_uncertainty_laser_noise_amplitude_scales is not None:
+        for scale in simulation_uncertainty_laser_noise_amplitude_scales:
+            scale = float(scale)
+            if scale < 0 or np.isclose(scale, 1.0):
+                continue
+
+            cases.append(
+                (
+                    f"laser noise amplitude {scale:g}x",
+                    {"laser_noise_amplitude_scale": scale},
+                )
+            )
+
+    diameter_uncertainty = simulation_uncertainty_particle_diameter_uncertainty_m
+    if diameter_uncertainty is not None and diameter_uncertainty > 0:
+        radius_delta = 0.5 * diameter_uncertainty
+        cases.extend(
+            [
+                (
+                    "diameter low",
+                    {"radius": max(radius - radius_delta, np.finfo(float).tiny)},
+                ),
+                ("diameter high", {"radius": radius + radius_delta}),
+            ]
+        )
+
+    if simulation_uncertainty_beam_waist_relative_delta is not None:
+        waist_delta = float(simulation_uncertainty_beam_waist_relative_delta)
+        if waist_delta > 0:
+            cases.extend(
+                [
+                    ("beam waist low", {"w0": w0 * (1 - waist_delta)}),
+                    ("beam waist high", {"w0": w0 * (1 + waist_delta)}),
+                ]
+            )
+
+    if simulation_uncertainty_laser_power_relative_delta is not None:
+        power_delta = float(simulation_uncertainty_laser_power_relative_delta)
+        if power_delta > 0:
+            cases.extend(
+                [
+                    ("laser power low", {"P_laser": P_laser * (1 - power_delta)}),
+                    ("laser power high", {"P_laser": P_laser * (1 + power_delta)}),
+                ]
+            )
+
+    if simulation_uncertainty_absorption_fraction_factor_bounds is not None:
+        low_factor, high_factor = simulation_uncertainty_absorption_fraction_factor_bounds
+        if low_factor > 0 and high_factor > 0:
+            cases.extend(
+                [
+                    (
+                        "absorption low",
+                        {"absorption_fraction": absorption_fraction * low_factor},
+                    ),
+                    (
+                        "absorption high",
+                        {"absorption_fraction": absorption_fraction * high_factor},
+                    ),
+                ]
+            )
+
+    return cases
+
+
+def scaled_laser_noise_power_factor(power_factor_time, amplitude_scale):
+    if amplitude_scale is None:
+        return power_factor_time
+
+    power_factor_time = np.asarray(power_factor_time, dtype=float)
+    mean_power_factor = np.mean(power_factor_time)
+    scaled_power_factor = (
+        mean_power_factor
+        + amplitude_scale * (power_factor_time - mean_power_factor)
+    )
+
+    if np.any(scaled_power_factor <= 0):
+        scaled_power_factor = np.maximum(scaled_power_factor, np.finfo(float).tiny)
+        scaled_power_factor *= mean_power_factor / np.mean(scaled_power_factor)
+
+    return scaled_power_factor
+
+
+def run_simulation_uncertainty_sweep():
+    if not plot_simulation_uncertainty_band:
+        return []
+
+    cases = configured_simulation_uncertainty_cases()
+    if not cases:
+        return []
+
+    nominal_state = snapshot_simulation_uncertainty_state()
+    uncertainty_runs = []
+
+    print()
+    print("Running simulation uncertainty sensitivity cases:")
+
+    try:
+        for label, updates in cases:
+            restore_simulation_uncertainty_state(nominal_state)
+            updates = dict(updates)
+            laser_noise_amplitude_scale = updates.pop(
+                "laser_noise_amplitude_scale",
+                None,
+            )
+            globals().update(updates)
+
+            try:
+                refresh_full_model_for_uncertainty_case()
+                case_laser_power_factor = scaled_laser_noise_power_factor(
+                    laser_power_factor,
+                    laser_noise_amplitude_scale,
+                )
+                (
+                    x_case,
+                    y_case,
+                    z_case,
+                    _vx_case,
+                    _vy_case,
+                    _vz_case,
+                ) = solve_baoab_3d_fast_with_power(
+                    case_laser_power_factor,
+                    brownian_normals_x,
+                    brownian_normals_y,
+                    brownian_normals_z,
+                    f"BAOAB uncertainty case: {label}",
+                )
+            except (ValueError, RuntimeError, FloatingPointError) as exc:
+                print(f"  {label}: skipped ({exc})")
+                continue
+
+            case_time_s = t_baoab[:len(x_case)]
+            case_parameters = dict(updates)
+            if laser_noise_amplitude_scale is not None:
+                case_parameters["laser_noise_amplitude_scale"] = (
+                    laser_noise_amplitude_scale
+                )
+            uncertainty_group = simulation_uncertainty_group(label, case_parameters)
+            uncertainty_runs.append(
+                {
+                    "label": label,
+                    "uncertainty_group": uncertainty_group,
+                    "time_s": case_time_s,
+                    "horizontal_m": x_case,
+                    "vertical_m": z_case,
+                    "parameters": case_parameters,
+                }
+            )
+            print(
+                f"  {label}: kept "
+                f"(kx={kx:.3e} N/m, kz={kz:.3e} N/m, "
+                f"fx={omega_x / (2 * np.pi):.3g} Hz, "
+                f"fz={omega_z / (2 * np.pi):.3g} Hz)"
+            )
+    finally:
+        restore_simulation_uncertainty_state(nominal_state)
+
+    if uncertainty_runs:
+        print(
+            "Simulation uncertainty band combines "
+            f"{len(uncertainty_runs)} one-at-a-time sensitivity trajectories "
+            f"using {simulation_uncertainty_combination} errors."
+        )
+    else:
+        print("No simulation uncertainty cases were available for the PSD band.")
+
+    return uncertainty_runs
 
 
 def measure_z_position_for_feedback(z_actual, feedback_rng):
@@ -3839,84 +6569,84 @@ def plot_damped_harmonic_small_perturbation_comparison():
             np.max(comparison_power_factor)
         )
 
-    fig, axes = plt.subplots(3, 1, figsize=time_trace_figsize, sharex=True)
+    # fig, axes = plt.subplots(3, 1, figsize=time_trace_figsize, sharex=True)
 
-    for axis_index, ax in enumerate(axes):
-        axis_label = axis_labels[axis_index]
-        omega_0 = angular_frequencies[axis_index]
-        equilibrium_position = equilibrium_positions[axis_index]
-        analytic_displacement = analytic_damped_harmonic_displacement(
-            comparison_time,
-            initial_displacements[axis_index],
-            initial_velocities[axis_index],
-            omega_0,
-            gamma_baoab
-        )
-        no_noise_displacement = no_noise_positions[axis_index] - equilibrium_position
-        no_noise_residual = no_noise_displacement - analytic_displacement
-        no_noise_max_residual_nm = np.nanmax(np.abs(no_noise_residual)) * 1e9
-        frequency_hz = omega_0 / (2 * np.pi)
-        damping_ratio = gamma_baoab / (2 * omega_0)
+    # for axis_index, ax in enumerate(axes):
+    #     axis_label = axis_labels[axis_index]
+    #     omega_0 = angular_frequencies[axis_index]
+    #     equilibrium_position = equilibrium_positions[axis_index]
+    #     analytic_displacement = analytic_damped_harmonic_displacement(
+    #         comparison_time,
+    #         initial_displacements[axis_index],
+    #         initial_velocities[axis_index],
+    #         omega_0,
+    #         gamma_baoab
+    #     )
+    #     no_noise_displacement = no_noise_positions[axis_index] - equilibrium_position
+    #     no_noise_residual = no_noise_displacement - analytic_displacement
+    #     no_noise_max_residual_nm = np.nanmax(np.abs(no_noise_residual)) * 1e9
+    #     frequency_hz = omega_0 / (2 * np.pi)
+    #     damping_ratio = gamma_baoab / (2 * omega_0)
 
-        title_parts = [
-            f"{axis_label}: f0 = {frequency_hz:.3g} Hz",
-            f"damping ratio = {damping_ratio:.3g}",
-            f"no-noise diff = {no_noise_max_residual_nm:.3g} nm"
-        ]
+    #     title_parts = [
+    #         f"{axis_label}: f0 = {frequency_hz:.3g} Hz",
+    #         f"damping ratio = {damping_ratio:.3g}",
+    #         f"no-noise diff = {no_noise_max_residual_nm:.3g} nm"
+    #     ]
 
-        ax.plot(
-            comparison_time,
-            analytic_displacement * 1e6,
-            color="black",
-            linewidth=1.6,
-            label="analytic small-displacement solution"
-        )
-        ax.plot(
-            comparison_time,
-            no_noise_displacement * 1e6,
-            color=axis_colours[axis_index],
-            linestyle="--",
-            linewidth=1.2,
-            label="simulation, no noise"
-        )
+    #     ax.plot(
+    #         comparison_time,
+    #         analytic_displacement * 1e6,
+    #         color="black",
+    #         linewidth=1.6,
+    #         label="analytic small-displacement solution"
+    #     )
+    #     ax.plot(
+    #         comparison_time,
+    #         no_noise_displacement * 1e6,
+    #         color=axis_colours[axis_index],
+    #         linestyle="--",
+    #         linewidth=1.2,
+    #         label="simulation, no noise"
+    #     )
 
-        if noise_positions is not None:
-            noise_displacement = noise_positions[axis_index] - equilibrium_position
-            noise_residual = noise_displacement - analytic_displacement
-            noise_max_residual_nm = np.nanmax(np.abs(noise_residual)) * 1e9
-            title_parts.append(f"noise diff = {noise_max_residual_nm:.3g} nm")
-            ax.plot(
-                comparison_time,
-                noise_displacement * 1e6,
-                color="tab:red",
-                linestyle=":",
-                linewidth=1.3,
-                label="simulation with " + " + ".join(enabled_noise_labels)
-            )
-            print(
-                f"Damped-harmonic {axis_label} noise-overlay max difference = "
-                f"{noise_max_residual_nm:.6g} nm"
-            )
+    #     if noise_positions is not None:
+    #         noise_displacement = noise_positions[axis_index] - equilibrium_position
+    #         noise_residual = noise_displacement - analytic_displacement
+    #         noise_max_residual_nm = np.nanmax(np.abs(noise_residual)) * 1e9
+    #         title_parts.append(f"noise diff = {noise_max_residual_nm:.3g} nm")
+    #         ax.plot(
+    #             comparison_time,
+    #             noise_displacement * 1e6,
+    #             color="tab:red",
+    #             linestyle=":",
+    #             linewidth=1.3,
+    #             label="simulation with " + " + ".join(enabled_noise_labels)
+    #         )
+    #         print(
+    #             f"Damped-harmonic {axis_label} noise-overlay max difference = "
+    #             f"{noise_max_residual_nm:.6g} nm"
+    #         )
 
-        ax.axhline(0.0, color="0.35", linestyle=":", linewidth=0.8)
-        ax.set_ylabel(f"{axis_label} / micrometres")
-        ax.set_title(", ".join(title_parts))
-        ax.legend(fontsize=8)
-        ax.grid(True)
+    #     ax.axhline(0.0, color="0.35", linestyle=":", linewidth=0.8)
+    #     ax.set_ylabel(f"{axis_label} / micrometres")
+    #     ax.set_title(", ".join(title_parts))
+    #     ax.legend(fontsize=8)
+    #     ax.grid(True)
 
-        print(
-            f"Damped-harmonic {axis_label} no-noise max difference = "
-            f"{no_noise_max_residual_nm:.6g} nm"
-        )
+        # print(
+        #     f"Damped-harmonic {axis_label} no-noise max difference = "
+        #     f"{no_noise_max_residual_nm:.6g} nm"
+        # )
 
-    axes[-1].set_xlabel("Time / s")
-    fig.suptitle("Current-parameter damped harmonic oscillator comparison")
-    plt.tight_layout()
+    # axes[-1].set_xlabel("Time / s")
+    # fig.suptitle("Current-parameter damped harmonic oscillator comparison")
+    # plt.tight_layout()
 
-    if save_damped_harmonic_comparison_plot:
-        save_validation_plot("damped_harmonic_current_parameter_comparison.png")
+    # if save_damped_harmonic_comparison_plot:
+    #     save_validation_plot("damped_harmonic_current_parameter_comparison.png")
 
-    finish_plot()
+    # finish_plot()
 
 
 if plot_damped_harmonic_comparison:
@@ -4040,7 +6770,7 @@ if run_multiple_seed_validation:
             f"std = {std_ratio:.5f}"
         )
 
-    fig, ax = plt.subplots(figsize=(8, 4.8))
+    fig, ax = plt.subplots(figsize=publication_figsize)
     for coordinate_index, (coordinate_label, colour) in enumerate(
         zip(coordinate_labels, coordinate_colours)
     ):
@@ -4434,12 +7164,15 @@ z_brownian_difference = z_baoab - z_baoab_no_brownian
 # print("BAOAB total runtime =", baoab_total_runtime, "s")
 print("Total calculation runtime, excluding graph-viewing time =", perf_counter() - script_start_time, "s")
 
+simulation_uncertainty_runs = run_simulation_uncertainty_sweep()
+
 plot_experimental_simulation_comparison(
     t_baoab,
     x_baoab,
     z_baoab,
     "simulation x",
     "simulation z",
+    simulation_uncertainty_runs=simulation_uncertainty_runs,
 )
 
 equipartition_burn_in_fraction = 0.10
@@ -4578,7 +7311,7 @@ if harmonic_validation_available and use_brownian_noise:
             
         )
 
-        fig, axes = plt.subplots(1, 3, figsize=(12, 3.8), sharey=True)
+        fig, axes = plt.subplots(1, 3, figsize=publication_figsize, sharey=True)
 
         print()
         print("Thermal displacement distribution check")
@@ -5227,7 +7960,22 @@ baoab_x_freqs, baoab_x_psd = positive_psd(x_baoab - x_eq, t_baoab)
 baoab_y_freqs, baoab_y_psd = positive_psd(y_baoab - y_eq, t_baoab)
 baoab_z_freqs, baoab_z_psd = positive_psd(z_baoab - z_eq, t_baoab)
 
-minimum_resolvable_frequency = baoab_x_freqs[0]
+positive_frequency_sets = [
+    frequencies
+    for frequencies in (baoab_x_freqs, baoab_y_freqs, baoab_z_freqs)
+    if len(frequencies) > 0
+]
+
+if not positive_frequency_sets:
+    print()
+    print("Skipping BAOAB PSD plots because the simulated trajectories have no positive PSD power.")
+    print("Enable Brownian noise, laser-power noise, or a non-zero initial displacement to generate a simulated PSD.")
+    sys.exit(0)
+
+minimum_resolvable_frequency = min(
+    frequencies[0]
+    for frequencies in positive_frequency_sets
+)
 minimum_plot_frequency = psd_min_frequency_factor * minimum_resolvable_frequency
 
 # print("Minimum resolvable non-zero frequency =", minimum_resolvable_frequency, "Hz")
@@ -5378,7 +8126,7 @@ if run_psd_normalisation_validation and not welch_averaging_only:
     fig, axes = plt.subplots(
         1,
         2,
-        figsize=(9, 4.2),
+        figsize=publication_figsize,
         gridspec_kw={"width_ratios": [1.15, 1.0]},
     )
     ax_variance, ax_ratio = axes
@@ -5496,7 +8244,7 @@ if run_welch_averaging_validation:
         else None
     )
 
-    fig, ax_psd = plt.subplots(figsize=(8, 5))
+    fig, ax_psd = plt.subplots(figsize=publication_figsize)
 
     ax_psd.loglog(
         raw_z_freqs,
@@ -5504,7 +8252,7 @@ if run_welch_averaging_validation:
         color="0.65",
         linewidth=0.9,
         alpha=0.8,
-        label="single-record PSD",
+        label="single-record periodogram",
     )
     ax_psd.loglog(
         constant_z_welch_freqs,
@@ -5533,10 +8281,8 @@ if run_welch_averaging_validation:
 
     ax_psd.set_ylabel("PSD / m^2 Hz^-1")
     ax_psd.set_xlabel("Frequency / Hz")
-    ax_psd.set_title(
-        "Welch averaging reduces PSD scatter while preserving the spectrum"
-    )
-    ax_psd.legend(fontsize=8)
+    ax_psd.set_title("Effect of Welch averaging on the PSD estimate")
+    ax_psd.legend(fontsize=7)
     ax_psd.grid(True, which="both", alpha=0.35)
     fig.tight_layout()
     save_validation_plot("welch_averaging_psd_comparison.png")
@@ -5665,7 +8411,7 @@ if include_z_detector_resolution_psd:
     fig, axes = plt.subplots(
         2,
         1,
-        figsize=(spectrum_figsize[0], 1.6 * spectrum_figsize[1]),
+        figsize=publication_figsize,
         sharex=False
     )
 

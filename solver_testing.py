@@ -1,10 +1,52 @@
+import csv
 import time
 from pathlib import Path
 
 import numpy as np
+import matplotlib as mpl
+mpl.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.ticker import FixedLocator, FuncFormatter, LogLocator
 from scipy.integrate import solve_ivp
+
+# --- Publication style ---
+fontsize = 7
+mpl.rcParams.update({
+
+    # Figure
+    "figure.figsize": (3.4, 2.6),  # single column
+    "figure.dpi": 300,
+
+    # Font
+    "font.family": "sans-serif",
+    "font.sans-serif": ["Arial"],
+    "font.size": fontsize,
+    "axes.labelsize": fontsize + 2,
+    "axes.titlesize": fontsize,
+    "xtick.labelsize": fontsize - 1,
+    "ytick.labelsize": fontsize - 1,
+    "legend.fontsize": fontsize - 1,
+
+    # Lines
+    "lines.linewidth": 1.5,
+    "lines.markersize": 4,
+
+    # Axes
+    "axes.linewidth": 0.8,
+    "xtick.direction": "in",
+    "ytick.direction": "in",
+    "xtick.top": True,
+    "ytick.right": True,
+
+    # Grid
+    "grid.linestyle": ":",
+    "grid.linewidth": 0.5,
+    "grid.alpha": 0.6,
+
+    # Remove top/right spine? (optional)
+    # "axes.spines.top": False,
+    # "axes.spines.right": False,
+})
 
 
 # ---------------------------------------------------------------------
@@ -25,6 +67,7 @@ t_eval = np.linspace(t_start, t_end, 5000)
 
 output_dir = Path("/Users/josephwhitfield/Documents/optical levitation/solver_validation_plots")
 output_dir.mkdir(parents=True, exist_ok=True)
+accuracy_runtime_csv = output_dir / "deterministic_solver_accuracy_vs_runtime.csv"
 
 
 def format_decimal_tick(value, _position):
@@ -42,6 +85,188 @@ def use_more_numeric_log_x_ticks(ax, fixed_ticks=None):
     ax.xaxis.set_major_formatter(FuncFormatter(format_decimal_tick))
     ax.xaxis.set_minor_locator(LogLocator(base=10.0, subs=np.arange(1, 10), numticks=50))
     ax.tick_params(axis="x", which="major", labelrotation=0)
+
+
+def read_accuracy_runtime_rows(path):
+    rows = []
+
+    with path.open("r", newline="") as file:
+        reader = csv.DictReader(file)
+
+        for row in reader:
+            rows.append(
+                {
+                    "solver": row["solver"],
+                    "rtol": float(row["rtol"]),
+                    "runtime_s": float(row["runtime_s"]),
+                    "max_error_nm": float(row["max_error_nm"]),
+                }
+            )
+
+    return rows
+
+
+def plot_accuracy_runtime_from_csv(path, rows, accuracy_target_nm=10.0):
+    fig, ax = plt.subplots()
+    markers = {
+        "RK45": "o",
+        "DOP853": "s",
+        "Radau": "^",
+        "BDF": "D",
+        "LSODA": "P",
+    }
+
+    for solver, marker in markers.items():
+        solver_rows = sorted(
+            [row for row in rows if row["solver"] == solver],
+            key=lambda row: row["rtol"],
+            reverse=True,
+        )
+
+        if not solver_rows:
+            continue
+
+        ax.plot(
+            [row["runtime_s"] for row in solver_rows],
+            [row["max_error_nm"] for row in solver_rows],
+            marker=marker,
+            label=solver,
+        )
+
+    ax.axhline(
+        accuracy_target_nm,
+        color="0.35",
+        linestyle="--",
+        label=f"{accuracy_target_nm:g} nm requirement",
+    )
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlabel("Runtime / s")
+    ax.set_ylabel("Maximum position error / nm")
+    ax.set_title("Deterministic solver accuracy-runtime trade-off")
+    ax.grid(True, which="both")
+    ax.legend(
+        loc="center left",
+        bbox_to_anchor=(1.02, 0.5),
+        frameon=False
+    )
+    fig.tight_layout()
+    fig.savefig(path, bbox_inches="tight")
+    fig.savefig(path.with_suffix(".pdf"), bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_combined_solver_validation(
+    path,
+    energy_results,
+    energy_time_s,
+    accuracy_runtime_rows,
+    accuracy_target_nm=10.0
+):
+    fig, (ax_energy, ax_accuracy) = plt.subplots(
+        1,
+        2,
+        figsize=(6.8, 2.6),
+        gridspec_kw={"wspace": 0.42}
+    )
+    markers = {
+        "RK45": "o",
+        "DOP853": "s",
+        "Radau": "^",
+        "BDF": "D",
+        "LSODA": "P",
+    }
+    colours = {
+        method: f"C{index}"
+        for index, method in enumerate(markers)
+    }
+    legend_handles = []
+    legend_labels = []
+
+    for method in markers:
+        if method not in energy_results:
+            continue
+
+        line, = ax_energy.plot(
+            energy_time_s,
+            energy_results[method]["relative_energy_error"],
+            color=colours[method],
+            label=method,
+        )
+        legend_handles.append(line)
+        legend_labels.append(method)
+
+    ax_energy.set_xlabel("Time / s")
+    ax_energy.set_ylabel("Relative energy change")
+    ax_energy.set_ylim(-5e-8, 3.4e-8)
+    ax_energy.grid(True)
+
+    for method, marker in markers.items():
+        solver_rows = sorted(
+            [row for row in accuracy_runtime_rows if row["solver"] == method],
+            key=lambda row: row["rtol"],
+            reverse=True,
+        )
+
+        if not solver_rows:
+            continue
+
+        ax_accuracy.plot(
+            [row["runtime_s"] for row in solver_rows],
+            [row["max_error_nm"] for row in solver_rows],
+            marker=marker,
+            color=colours[method],
+            label=method,
+        )
+
+    requirement_line = ax_accuracy.axhline(
+        accuracy_target_nm,
+        color="0.35",
+        linestyle="--",
+        label=f"{accuracy_target_nm:g} nm requirement",
+    )
+    legend_handles.append(requirement_line)
+    legend_labels.append(f"{accuracy_target_nm:g} nm requirement")
+    ax_accuracy.set_xscale("log")
+    ax_accuracy.set_yscale("log")
+    ax_accuracy.set_xlabel("Runtime / s")
+    ax_accuracy.set_ylabel("Maximum position error / nm")
+    ax_accuracy.grid(True, which="both")
+    use_more_numeric_log_x_ticks(ax_accuracy)
+
+    ax_energy.text(
+        -0.16,
+        1.05,
+        "(a)",
+        transform=ax_energy.transAxes,
+        fontsize=fontsize + 3,
+        ha="left",
+        va="bottom",
+    )
+    ax_accuracy.text(
+        -0.16,
+        1.05,
+        "(b)",
+        transform=ax_accuracy.transAxes,
+        fontsize=fontsize + 3,
+        ha="left",
+        va="bottom",
+    )
+
+    fig.legend(
+        legend_handles,
+        legend_labels,
+        loc="lower center",
+        bbox_to_anchor=(0.5, 0.93),
+        ncol=len(legend_labels),
+        columnspacing=1.2,
+        handlelength=2.2,
+        frameon=False,
+    )
+    fig.subplots_adjust(left=0.095, right=0.985, bottom=0.20, top=0.84)
+    fig.savefig(path, bbox_inches="tight")
+    fig.savefig(path.with_suffix(".pdf"), bbox_inches="tight")
+    plt.close(fig)
 
 
 # ---------------------------------------------------------------------
@@ -223,7 +448,7 @@ for method, data in step_results.items():
 # ---------------------------------------------------------------------
 # Plot displacement comparison
 # ---------------------------------------------------------------------
-plt.figure(figsize=(9, 5))
+plt.figure()
 plt.plot(t_eval, x_exact, color="black", linewidth=2, label="analytic")
 
 for method, data in results.items():
@@ -240,7 +465,7 @@ plt.show()
 # ---------------------------------------------------------------------
 # Plot absolute error as a function of time
 # ---------------------------------------------------------------------
-plt.figure(figsize=(9, 5))
+plt.figure()
 
 for method, data in results.items():
     plt.semilogy(t_eval, data["x_error"], label=method)
@@ -318,7 +543,7 @@ for method, data in energy_results.items():
     )
 
 
-plt.figure(figsize=(9, 5))
+plt.figure()
 
 for method, data in energy_results.items():
     plt.plot(t_eval, data["relative_energy_error"], label=method)
@@ -326,12 +551,16 @@ for method, data in energy_results.items():
 plt.xlabel("Time / s")
 plt.ylabel("(E(t) - E(0)) / E(0)")
 plt.title("Relative energy drift, undamped oscillator")
-plt.legend()
+plt.ylim(-5e-8, 3.4e-8)
+plt.legend(loc="upper left")
 plt.grid()
+plt.tight_layout()
+plt.savefig(output_dir / "relative_energy_drift_publication.png")
+plt.savefig(output_dir / "relative_energy_drift_publication.pdf")
 plt.show()
 
 
-plt.figure(figsize=(9, 5))
+plt.figure()
 
 for method, data in energy_results.items():
     plt.semilogy(
@@ -467,7 +696,7 @@ for method, data in convergence_results.items():
         f"{data['max_error'][min_dt_index]:>18.5e}"
     )
 
-plt.figure(figsize=(9, 5))
+plt.figure()
 
 for method, data in convergence_results.items():
     if len(data["dt"]) == 0:
@@ -485,43 +714,38 @@ for method, data in convergence_results.items():
 plt.xlabel("Maximum solver timestep / s")
 plt.ylabel("Normalised RMS displacement error")
 plt.title("Deterministic solver convergence")
-plt.legend(fontsize=8)
+plt.legend()
 plt.grid(True, which="both")
 use_more_numeric_log_x_ticks(
     plt.gca(),
     fixed_ticks=np.array([0.003, 0.004, 0.006, 0.008, 0.01, 0.02, 0.03, 0.05]),
 )
 plt.tight_layout()
-plt.savefig(output_dir / "deterministic_solver_convergence_error_vs_timestep.png", dpi=220)
+plt.savefig(output_dir / "deterministic_solver_convergence_error_vs_timestep.png")
 plt.show()
 
-plt.figure(figsize=(9, 5))
-
-for method, data in convergence_results.items():
-    if len(data["runtime"]) == 0:
-        continue
-    plt.loglog(
-        data["runtime"],
-        data["rms_error"],
-        "o-",
-        label=method,
+if accuracy_runtime_csv.exists():
+    accuracy_runtime_rows = read_accuracy_runtime_rows(accuracy_runtime_csv)
+    plot_accuracy_runtime_from_csv(
+        output_dir / "deterministic_solver_accuracy_vs_runtime_publication.png",
+        accuracy_runtime_rows,
+        accuracy_target_nm=10.0
     )
-
-plt.xlabel("Runtime / s")
-plt.ylabel("Normalised RMS displacement error")
-plt.title("Deterministic solver accuracy vs runtime")
-plt.legend(fontsize=8)
-plt.grid(True, which="both")
-use_more_numeric_log_x_ticks(plt.gca())
-plt.tight_layout()
-plt.savefig(output_dir / "deterministic_solver_accuracy_vs_runtime.png", dpi=220)
-plt.show()
+    plot_combined_solver_validation(
+        output_dir / "combined_solver_validation_publication.png",
+        energy_results,
+        t_eval,
+        accuracy_runtime_rows,
+        accuracy_target_nm=10.0
+    )
+else:
+    print("Accuracy-runtime CSV not found:", accuracy_runtime_csv)
 
 
 # ---------------------------------------------------------------------
 # Plot cumulative maximum displacement error
 # ---------------------------------------------------------------------
-plt.figure(figsize=(9, 5))
+plt.figure()
 
 for method, data in results.items():
     plt.semilogy(t_eval, data["x_cummax_error"], label=method)
@@ -537,7 +761,7 @@ plt.show()
 # ---------------------------------------------------------------------
 # Plot adaptive internal timestep for each solver
 # ---------------------------------------------------------------------
-plt.figure(figsize=(9, 5))
+plt.figure()
 
 for method, data in step_results.items():
     plt.semilogy(data["t"][:-1], data["steps"], label=method)
@@ -553,7 +777,7 @@ plt.show()
 # ---------------------------------------------------------------------
 # Plot histogram of accepted internal timesteps
 # ---------------------------------------------------------------------
-plt.figure(figsize=(9, 5))
+plt.figure()
 
 for method, data in step_results.items():
     plt.hist(
@@ -575,7 +799,7 @@ plt.show()
 # ---------------------------------------------------------------------
 # Plot velocity error as a function of time
 # ---------------------------------------------------------------------
-plt.figure(figsize=(9, 5))
+plt.figure()
 
 for method, data in results.items():
     plt.semilogy(t_eval, data["v_error"], label=method)

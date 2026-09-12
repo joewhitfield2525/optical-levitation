@@ -547,6 +547,147 @@ print("Expected x thermal RMS =", x_rms_thermal * 1e6, "micrometres")
 print("Expected z thermal RMS =", z_rms_thermal * 1e6, "micrometres")
 
 # ****************************************************************************************************************************************************
+# Harmonic approximation range in x and z
+# ****************************************************************************************************************************************************
+# Compare the full nonlinear restoring force with the local harmonic model:
+#
+#     Fx ~= -kx (x - x_eq)
+#     Fz_net ~= -kz (z - z_eq)
+#
+# The percentage error is normalised by max(|F|, mg), matching the 1D
+# validation plot and avoiding artificial spikes at the force-balance root.
+def centred_valid_half_width(displacements, percent_error, threshold_percent):
+    # Return the largest symmetric half-width around zero displacement for
+    # which every sampled point remains below the requested threshold.
+    centre_index = int(np.argmin(np.abs(displacements)))
+
+    if percent_error[centre_index] > threshold_percent:
+        return 0.0
+
+    left_index = centre_index
+    while left_index > 0 and percent_error[left_index - 1] <= threshold_percent:
+        left_index -= 1
+
+    right_index = centre_index
+    while right_index < len(displacements) - 1 and percent_error[right_index + 1] <= threshold_percent:
+        right_index += 1
+
+    return min(abs(displacements[left_index]), abs(displacements[right_index]))
+
+
+x_harmonic_half_width = max(80e-6, 12 * x_rms_thermal)
+z_harmonic_half_width = max(150e-6, 12 * z_rms_thermal)
+
+x_displacements = np.linspace(-x_harmonic_half_width, x_harmonic_half_width, 1201)
+z_displacements = np.linspace(-z_harmonic_half_width, z_harmonic_half_width, 1201)
+
+Fx_nonlinear_values = np.array([
+    F_optical_2d_direct(x_eq + x_i, z_eq)[0]
+    for x_i in x_displacements
+])
+Fx_harmonic_values = -kx * x_displacements
+
+Fz_net_nonlinear_values = np.array([
+    F_optical_2d_direct(x_eq, z_eq + z_i)[1] - m * g
+    for z_i in z_displacements
+])
+Fz_harmonic_values = -kz * z_displacements
+
+Fx_percent_error = 100 * np.abs(Fx_nonlinear_values - Fx_harmonic_values) / np.maximum(np.abs(Fx_nonlinear_values), m * g)
+Fz_percent_error = 100 * np.abs(Fz_net_nonlinear_values - Fz_harmonic_values) / np.maximum(np.abs(Fz_net_nonlinear_values), m * g)
+
+error_thresholds = (1, 5, 10)
+x_valid_ranges = {
+    threshold: centred_valid_half_width(x_displacements, Fx_percent_error, threshold)
+    for threshold in error_thresholds
+}
+z_valid_ranges = {
+    threshold: centred_valid_half_width(z_displacements, Fz_percent_error, threshold)
+    for threshold in error_thresholds
+}
+
+print("Harmonic approximation valid ranges:")
+print("| Direction | 1% valid range | 5% valid range | 10% valid range | Theoretical Brownian RMS displacement |")
+print("|---|---:|---:|---:|---:|")
+print(
+    f"| x | +/- {x_valid_ranges[1] * 1e6:.2f} um | "
+    f"+/- {x_valid_ranges[5] * 1e6:.2f} um | "
+    f"+/- {x_valid_ranges[10] * 1e6:.2f} um | "
+    f"{x_rms_thermal * 1e6:.3f} um |"
+)
+print(
+    f"| z | +/- {z_valid_ranges[1] * 1e6:.2f} um | "
+    f"+/- {z_valid_ranges[5] * 1e6:.2f} um | "
+    f"+/- {z_valid_ranges[10] * 1e6:.2f} um | "
+    f"{z_rms_thermal * 1e6:.3f} um |"
+)
+
+fig, axes = plt.subplots(2, 1, figsize=(8, 7))
+axes[0].plot(x_displacements * 1e6, Fx_nonlinear_values, label="Nonlinear Fx")
+axes[0].plot(x_displacements * 1e6, Fx_harmonic_values, "--", label="-kx x")
+axes[0].axhline(0, color="black", linewidth=0.8)
+axes[0].axvline(0, color="black", linestyle=":", linewidth=0.9, label="equilibrium")
+axes[0].set_xlabel("Horizontal displacement, x - x_eq / micrometres")
+axes[0].set_ylabel("Fx / N")
+axes[0].set_title("Transverse nonlinear force compared with harmonic approximation")
+axes[0].legend()
+axes[0].grid(True)
+
+axes[1].plot(z_displacements * 1e6, Fz_net_nonlinear_values, label="Nonlinear Fz_net")
+axes[1].plot(z_displacements * 1e6, Fz_harmonic_values, "--", label="-kz dz")
+axes[1].axhline(0, color="black", linewidth=0.8)
+axes[1].axvline(0, color="black", linestyle=":", linewidth=0.9, label="equilibrium")
+axes[1].set_xlabel("Axial displacement, z - z_eq / micrometres")
+axes[1].set_ylabel("Fz_net / N")
+axes[1].set_title("Axial nonlinear force compared with harmonic approximation")
+axes[1].legend()
+axes[1].grid(True)
+
+fig.tight_layout()
+plt.show()
+
+fig, axes = plt.subplots(2, 1, figsize=(8, 7), sharey=True)
+
+axes[0].plot(x_displacements * 1e6, Fx_percent_error, color="tab:purple", label="Fx error")
+# for threshold, colour in [(1, "0.4"), (5, "tab:orange"), (10, "tab:red")]:
+#     axes[0].axhline(threshold, color=colour, linestyle="-", linewidth=0.9, label=f"{threshold}%")
+axes[0].axvline(0, color="black", linestyle=":", linewidth=0.9)
+axes[0].axvspan(
+    -x_valid_ranges[5] * 1e6,
+    x_valid_ranges[5] * 1e6,
+    color="tab:green",
+    alpha=0.12,
+    label=f"<=5% for |x| <= {x_valid_ranges[5] * 1e6:.1f} um"
+)
+axes[0].set_xlabel("Horizontal displacement, x - x_eq / micrometres")
+axes[0].set_ylabel("Force error / %")
+axes[0].set_title("Transverse harmonic-approximation error")
+axes[0].set_yscale("log")
+axes[0].legend()
+axes[0].grid(True, which="both")
+
+axes[1].plot(z_displacements * 1e6, Fz_percent_error, color="tab:purple", label="Fz_net error")
+# for threshold, colour in [(1, "0.4"), (5, "tab:orange"), (10, "tab:red")]:
+#     axes[1].axhline(threshold, color=colour, linestyle="-", linewidth=0.9, label=f"{threshold}%")
+axes[1].axvline(0, color="black", linestyle=":", linewidth=0.9)
+axes[1].axvspan(
+    -z_valid_ranges[5] * 1e6,
+    z_valid_ranges[5] * 1e6,
+    color="tab:green",
+    alpha=0.12,
+    label=f"<=5% for |dz| <= {z_valid_ranges[5] * 1e6:.1f} um"
+)
+axes[1].set_xlabel("Axial displacement, z - z_eq / micrometres")
+axes[1].set_ylabel("Force error / %")
+axes[1].set_title("Axial harmonic-approximation error")
+axes[1].set_yscale("log")
+axes[1].legend()
+axes[1].grid(True, which="both")
+
+fig.tight_layout()
+plt.show()
+
+# ****************************************************************************************************************************************************
 # Damping
 # ****************************************************************************************************************************************************
 drag_model = "auto"
@@ -920,6 +1061,13 @@ baoab_total_runtime = baoab_constant_power_runtime + baoab_laser_noise_runtime
 x_laser_noise_difference = x_baoab - x_baoab_constant_power
 z_laser_noise_difference = z_baoab - z_baoab_constant_power
 
+x_constant_power_rms = np.std(x_baoab_constant_power - x_eq)
+z_constant_power_rms = np.std(z_baoab_constant_power - z_eq)
+x_laser_noise_rms = np.std(x_laser_noise_difference)
+z_laser_noise_rms = np.std(z_laser_noise_difference)
+x_laser_noise_max = np.max(np.abs(x_laser_noise_difference))
+z_laser_noise_max = np.max(np.abs(z_laser_noise_difference))
+
 print("BAOAB constant-power runtime =", baoab_constant_power_runtime, "s")
 print("BAOAB laser-noise runtime =", baoab_laser_noise_runtime, "s")
 print("BAOAB total runtime =", baoab_total_runtime, "s")
@@ -927,33 +1075,54 @@ print("Total calculation runtime, excluding graph-viewing time =", perf_counter(
 
 print(
     "BAOAB constant-power RMS x from equilibrium =",
-    np.std(x_baoab_constant_power - x_eq) * 1e6,
+    x_constant_power_rms * 1e6,
     "micrometres"
 )
 print(
     "BAOAB constant-power RMS z from equilibrium =",
-    np.std(z_baoab_constant_power - z_eq) * 1e6,
+    z_constant_power_rms * 1e6,
     "micrometres"
 )
 print(
     "RMS isolated laser-noise effect in x =",
-    np.std(x_laser_noise_difference) * 1e9,
+    x_laser_noise_rms * 1e9,
     "nm"
 )
 print(
     "RMS isolated laser-noise effect in z =",
-    np.std(z_laser_noise_difference) * 1e9,
+    z_laser_noise_rms * 1e9,
     "nm"
 )
 print(
     "Max isolated laser-noise effect in x =",
-    np.max(np.abs(x_laser_noise_difference)) * 1e9,
+    x_laser_noise_max * 1e9,
     "nm"
 )
 print(
     "Max isolated laser-noise effect in z =",
-    np.max(np.abs(z_laser_noise_difference)) * 1e9,
+    z_laser_noise_max * 1e9,
     "nm"
+)
+
+print("Harmonic approximation valid ranges with stochastic displacement scales:")
+print(
+    "| Direction | 1% valid range | 5% valid range | 10% valid range | "
+    "Theoretical Brownian RMS displacement | Laser-noise-only RMS displacement |"
+)
+print("|---|---:|---:|---:|---:|---:|")
+print(
+    f"| x | +/- {x_valid_ranges[1] * 1e6:.2f} um | "
+    f"+/- {x_valid_ranges[5] * 1e6:.2f} um | "
+    f"+/- {x_valid_ranges[10] * 1e6:.2f} um | "
+    f"{x_rms_thermal * 1e6:.3f} um | "
+    f"{x_laser_noise_rms * 1e6:.3f} um |"
+)
+print(
+    f"| z | +/- {z_valid_ranges[1] * 1e6:.2f} um | "
+    f"+/- {z_valid_ranges[5] * 1e6:.2f} um | "
+    f"+/- {z_valid_ranges[10] * 1e6:.2f} um | "
+    f"{z_rms_thermal * 1e6:.3f} um | "
+    f"{z_laser_noise_rms * 1e6:.3f} um |"
 )
 
 # ****************************************************************************************************************************************************

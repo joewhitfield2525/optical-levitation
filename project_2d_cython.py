@@ -1,8 +1,10 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.interpolate import RegularGridInterpolator
+from scipy.integrate import solve_ivp
 from scipy.optimize import brentq
-from scipy.signal import welch
+from scipy.signal import find_peaks, welch
+from pathlib import Path
 from time import perf_counter
 
 try:
@@ -686,6 +688,178 @@ print("Epstein damping b =", b_epstein, "kg/s")
 print("Selected pressure-dependent damping b =", b, "kg/s")
 print("Damping ratio x =", b / (2 * np.sqrt(m * kx)))
 print("Damping ratio z =", b / (2 * np.sqrt(m * kz)))
+
+# ****************************************************************************************************************************************************
+# Damped harmonic oscillator validation
+# ****************************************************************************************************************************************************
+run_damped_oscillator_validation = True
+validation_plot_dir = Path(
+    "/Users/josephwhitfield/Documents/optical levitation/validation_plots"
+)
+validation_plot_dir.mkdir(parents=True, exist_ok=True)
+
+
+def damped_harmonic_rhs(t, state, spring_constant, damping_coefficient_value):
+    displacement, velocity = state
+    return [
+        velocity,
+        -(damping_coefficient_value / m) * velocity
+        - (spring_constant / m) * displacement,
+    ]
+
+
+def damped_harmonic_displacement(t, x_initial, v_initial, omega_0, gamma):
+    if gamma < 2.0 * omega_0:
+        omega_d = np.sqrt(omega_0**2 - (0.5 * gamma)**2)
+        return np.exp(-0.5 * gamma * t) * (
+            x_initial * np.cos(omega_d * t)
+            + ((v_initial + 0.5 * gamma * x_initial) / omega_d) * np.sin(omega_d * t)
+        )
+
+    roots = np.roots([1.0, gamma, omega_0**2])
+    matrix = np.array([[1.0, 1.0], [roots[0], roots[1]]], dtype=float)
+    c0, c1 = np.linalg.solve(matrix, np.array([x_initial, v_initial], dtype=float))
+    return c0 * np.exp(roots[0] * t) + c1 * np.exp(roots[1] * t)
+
+
+if run_damped_oscillator_validation:
+    validation_spring_constant = kx
+    validation_omega_0 = np.sqrt(validation_spring_constant / m)
+    validation_gamma = b / m
+    validation_x0 = min(1.0e-6, 0.25 * x_rms_thermal)
+    validation_v0 = 0.0
+    validation_period = 2.0 * np.pi / validation_omega_0
+    validation_t_end = max(
+        40.0 * validation_period,
+        8.0 / validation_gamma if validation_gamma > 0.0 else 40.0 * validation_period,
+    )
+    validation_t_eval = np.linspace(0.0, validation_t_end, 6000)
+
+    validation_solution = solve_ivp(
+        damped_harmonic_rhs,
+        (0.0, validation_t_end),
+        [validation_x0, validation_v0],
+        t_eval=validation_t_eval,
+        args=(validation_spring_constant, b),
+        method="DOP853",
+        rtol=1.0e-10,
+        atol=1.0e-14,
+    )
+
+    if not validation_solution.success:
+        raise RuntimeError(
+            "Damped oscillator validation failed: "
+            + validation_solution.message
+        )
+
+    validation_t = validation_solution.t
+    validation_x = validation_solution.y[0]
+    validation_analytic_x = damped_harmonic_displacement(
+        validation_t,
+        validation_x0,
+        validation_v0,
+        validation_omega_0,
+        validation_gamma,
+    )
+    validation_envelope = abs(validation_x0) * np.exp(-0.5 * validation_gamma * validation_t)
+    validation_error = validation_x - validation_analytic_x
+    validation_relative_error = np.max(np.abs(validation_error)) / max(abs(validation_x0), 1.0e-30)
+
+    peak_indices, _ = find_peaks(np.abs(validation_x))
+    peak_indices = peak_indices[validation_t[peak_indices] > 0.0]
+
+    if len(peak_indices) >= 3:
+        peak_times = validation_t[peak_indices]
+        peak_amplitudes = np.abs(validation_x[peak_indices])
+        finite_peak_mask = peak_amplitudes > 0.0
+        peak_times = peak_times[finite_peak_mask]
+        peak_amplitudes = peak_amplitudes[finite_peak_mask]
+        peak_fit_slope, peak_fit_intercept = np.polyfit(
+            peak_times,
+            np.log(peak_amplitudes),
+            1,
+        )
+        fitted_gamma = -2.0 * peak_fit_slope
+        fitted_gamma_relative_error = abs(fitted_gamma - validation_gamma) / validation_gamma
+    else:
+        peak_times = np.array([])
+        peak_amplitudes = np.array([])
+        peak_fit_slope = np.nan
+        peak_fit_intercept = np.nan
+        fitted_gamma = np.nan
+        fitted_gamma_relative_error = np.nan
+
+    print("Damped oscillator validation:")
+    print("  gamma input =", validation_gamma, "s^-1")
+    print("  analytic envelope slope =", -0.5 * validation_gamma, "s^-1")
+    print("  fitted gamma =", fitted_gamma, "s^-1")
+    print("  fitted gamma relative error =", fitted_gamma_relative_error)
+    print("  max displacement relative error =", validation_relative_error)
+
+    plt.figure(figsize=(8, 5))
+    plt.plot(validation_t, validation_x * 1.0e6, label="simulated damped oscillator")
+    plt.plot(
+        validation_t,
+        validation_analytic_x * 1.0e6,
+        linestyle="--",
+        label="analytic solution",
+    )
+    plt.plot(
+        validation_t,
+        validation_envelope * 1.0e6,
+        color="black",
+        linestyle=":",
+        label=r"$\pm A_0 e^{-\Gamma t/2}$ envelope",
+    )
+    plt.plot(
+        validation_t,
+        -validation_envelope * 1.0e6,
+        color="black",
+        linestyle=":",
+    )
+    plt.xlabel("Time / s")
+    plt.ylabel("x displacement / micrometres")
+    plt.title("Damped oscillator validation")
+    plt.legend()
+    plt.grid()
+    plt.tight_layout()
+    plt.savefig(
+        validation_plot_dir / "damped_oscillator_envelope_validation.png",
+        dpi=220,
+    )
+    plt.show()
+
+    if len(peak_times) >= 3:
+        plt.figure(figsize=(8, 5))
+        plt.plot(
+            peak_times,
+            np.log(peak_amplitudes),
+            "o",
+            markersize=3,
+            label="simulated peak amplitudes",
+        )
+        plt.plot(
+            peak_times,
+            peak_fit_intercept + peak_fit_slope * peak_times,
+            label=rf"fit slope = {peak_fit_slope:.3g} s$^{{-1}}$",
+        )
+        plt.plot(
+            peak_times,
+            np.log(abs(validation_x0)) - 0.5 * validation_gamma * peak_times,
+            linestyle="--",
+            label=rf"analytic slope = {-0.5 * validation_gamma:.3g} s$^{{-1}}$",
+        )
+        plt.xlabel("Time / s")
+        plt.ylabel("log peak amplitude / log(m)")
+        plt.title("Damped oscillator exponential decay rate")
+        plt.legend()
+        plt.grid()
+        plt.tight_layout()
+        plt.savefig(
+            validation_plot_dir / "damped_oscillator_decay_rate_validation.png",
+            dpi=220,
+        )
+        plt.show()
 
 # ****************************************************************************************************************************************************
 # Initial conditions

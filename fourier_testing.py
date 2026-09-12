@@ -1,9 +1,78 @@
+import os
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+os.environ.setdefault("MPLCONFIGDIR", str(SCRIPT_DIR / ".matplotlib_cache"))
+
+try:
+    os.makedirs(os.environ["MPLCONFIGDIR"], exist_ok=True)
+except OSError:
+    pass
+
 import numpy as np
 
 try:
+    import matplotlib as mpl
     import matplotlib.pyplot as plt
 except ModuleNotFoundError:
+    mpl = None
     plt = None
+
+
+# -------------------------------------------------------------------------
+# House plotting style
+# -------------------------------------------------------------------------
+save_path = SCRIPT_DIR / "Figures"
+save_figures = True
+display_plots = False
+
+if plt is not None:
+    os.makedirs(save_path, exist_ok=True)
+
+    fontsize = 7
+    mpl.rcParams.update({
+        "figure.figsize": (3.4, 2.6),
+        "figure.dpi": 300,
+        "figure.facecolor": "white",
+        "savefig.facecolor": "white",
+        "savefig.edgecolor": "white",
+        "savefig.transparent": False,
+        "font.family": "sans-serif",
+        "font.size": fontsize,
+        "axes.labelsize": fontsize,
+        "axes.titlesize": fontsize,
+        "xtick.labelsize": fontsize - 1,
+        "ytick.labelsize": fontsize - 1,
+        "legend.fontsize": fontsize - 1,
+        "lines.linewidth": 1.1,
+        "lines.markersize": 4,
+        "axes.linewidth": 0.8,
+        "xtick.direction": "in",
+        "ytick.direction": "in",
+        "xtick.top": True,
+        "ytick.right": True,
+        "grid.linestyle": ":",
+        "grid.linewidth": 0.5,
+        "grid.alpha": 0.6,
+    })
+
+
+def finish_plot(name=None, fig=None):
+    if plt is None:
+        return
+
+    target_fig = fig if fig is not None else plt.gcf()
+    target_fig.tight_layout()
+
+    if name is not None and save_figures:
+        target_fig.savefig(save_path / f"{name}.png", bbox_inches="tight")
+        target_fig.savefig(save_path / f"{name}.pdf", bbox_inches="tight")
+        print("Wrote", save_path / f"{name}.png")
+
+    if display_plots:
+        plt.show()
+    else:
+        plt.close(target_fig)
 
 
 # -------------------------------------------------------------------------
@@ -24,10 +93,25 @@ except ModuleNotFoundError:
 
 
 # -------------------------------------------------------------------------
-# Sampling parameters
+# User-adjustable parameters
 # -------------------------------------------------------------------------
-fs = 2000.0          # sampling frequency / Hz
-t_end = 5.0          # signal length / s
+fs = 2000.0
+t_end = 5.0
+f_bin_centred = 50.0
+f_not_bin_centred = 50.37
+
+plot_window_shape_comparison = False
+plot_bin_centred_spectra = False
+plot_non_bin_centred_spectra = True
+plot_linear_spectra = False
+
+fft_plot_half_width_hz = 20.0
+fft_plot_ylim_db = (-120.0, 5.0)
+
+
+# -------------------------------------------------------------------------
+# Sampling setup
+# -------------------------------------------------------------------------
 dt = 1.0 / fs
 t = np.arange(0.0, t_end, dt)
 N = len(t)
@@ -35,15 +119,6 @@ N = len(t)
 df = fs / N
 print("Number of samples N =", N)
 print("Frequency resolution df =", df, "Hz")
-
-
-# -------------------------------------------------------------------------
-# Test frequencies
-# -------------------------------------------------------------------------
-# With t_end = 5 s, df = 0.2 Hz. 50.0 Hz is exactly bin-centred.
-# 50.37 Hz is deliberately not bin-centred, so it causes spectral leakage.
-f_bin_centred = 50.0
-f_not_bin_centred = 50.37
 
 
 # -------------------------------------------------------------------------
@@ -93,9 +168,7 @@ def analyse_window(signal, f0, window_name, window):
     peak_amp = amp[peak_index]
 
     # A simple leakage metric: compare all power outside +/- 3 bins around the
-    # strongest peak with the total spectral power. This is not a perfect
-    # universal metric because windows have different main-lobe widths, but it
-    # is useful for a quick comparison.
+    # strongest peak with the total spectral power.
     main_lobe_half_width_bins = 3
     keep = np.zeros_like(amp, dtype=bool)
     lo = max(0, peak_index - main_lobe_half_width_bins)
@@ -139,7 +212,7 @@ def plot_window_shapes():
     if plt is None:
         return
 
-    fig, axes = plt.subplots(2, 1, figsize=(9, 7), sharex=False)
+    fig, axes = plt.subplots(2, 1, figsize=(3.4, 3.2), sharex=False)
 
     for name, window in windows.items():
         axes[0].plot(t, window, label=name)
@@ -148,62 +221,71 @@ def plot_window_shapes():
     axes[0].set_xlim(0, t_end)
     axes[0].set_xlabel("Time / s")
     axes[0].set_ylabel("Window value")
-    axes[0].set_title("Window functions over the full time record")
-    axes[0].legend()
+    axes[0].set_title("FFT window functions")
+    axes[0].legend(frameon=False)
     axes[0].grid()
 
     axes[1].set_xlim(0, min(0.15, t_end))
     axes[1].set_xlabel("Time / s")
     axes[1].set_ylabel("Window value")
-    axes[1].set_title("Zoom near the start of the time record")
+    axes[1].set_title("Window start")
     axes[1].grid()
 
-    plt.tight_layout()
+    finish_plot("fft_window_shapes", fig)
 
 
-def plot_spectra(signal, f0, title):
+def plot_spectra(signal, f0, title, output_name):
     if plt is None:
         return
 
-    plt.figure(figsize=(9, 5))
+    fig, ax = plt.subplots(figsize=(3.4, 2.6))
 
     for name, window in windows.items():
         freqs, amp = fft_amplitude(signal, window)
-
-        # Normalize each spectrum to its own peak so the plot compares leakage
-        # shape rather than absolute amplitude.
         amp_db = 20 * np.log10(amp / np.max(amp) + 1e-15)
-        plt.plot(freqs, amp_db, label=name)
+        ax.plot(freqs, amp_db, label=name)
 
-    plt.axvline(f0, color="black", linestyle="--", linewidth=1.0, label="true frequency")
-    plt.xlim(f0 - 20, f0 + 20)
-    plt.ylim(-120, 5)
-    plt.xlabel("Frequency / Hz")
-    plt.ylabel("Amplitude / dB, normalized to peak")
-    plt.title(title)
-    plt.legend()
-    plt.grid()
-    plt.tight_layout()
+    ax.axvline(
+        f0,
+        color="black",
+        linestyle="--",
+        linewidth=0.8,
+        label="true frequency",
+    )
+    ax.set_xlim(f0 - fft_plot_half_width_hz, f0 + fft_plot_half_width_hz)
+    ax.set_ylim(*fft_plot_ylim_db)
+    ax.set_xlabel("Frequency / Hz")
+    ax.set_ylabel("Amplitude / dB, normalized to peak")
+    ax.set_title(title)
+    ax.legend(loc="upper right", frameon=False)
+    ax.grid()
+    finish_plot(output_name, fig)
 
 
-def plot_spectra_linear(signal, f0, title):
+def plot_spectra_linear(signal, f0, title, output_name):
     if plt is None:
         return
 
-    plt.figure(figsize=(9, 5))
+    fig, ax = plt.subplots(figsize=(3.4, 2.6))
 
     for name, window in windows.items():
         freqs, amp = fft_amplitude(signal, window)
-        plt.plot(freqs, amp / np.max(amp), label=name)
+        ax.plot(freqs, amp / np.max(amp), label=name)
 
-    plt.axvline(f0, color="black", linestyle="--", linewidth=1.0, label="true frequency")
-    plt.xlim(f0 - 5, f0 + 5)
-    plt.xlabel("Frequency / Hz")
-    plt.ylabel("Normalized amplitude")
-    plt.title(title)
-    plt.legend()
-    plt.grid()
-    plt.tight_layout()
+    ax.axvline(
+        f0,
+        color="black",
+        linestyle="--",
+        linewidth=0.8,
+        label="true frequency",
+    )
+    ax.set_xlim(f0 - 5, f0 + 5)
+    ax.set_xlabel("Frequency / Hz")
+    ax.set_ylabel("Normalized amplitude")
+    ax.set_title(title)
+    ax.legend(frameon=False)
+    ax.grid()
+    finish_plot(output_name, fig)
 
 
 def main():
@@ -213,36 +295,43 @@ def main():
     print_summary(signal_bin, f_bin_centred, "Bin-centred sine wave")
     print_summary(signal_off_bin, f_not_bin_centred, "Non-bin-centred sine wave")
 
-    plot_window_shapes()
+    if plot_window_shape_comparison:
+        plot_window_shapes()
 
-    plot_spectra_linear(
-        signal_bin,
-        f_bin_centred,
-        "Linear FFT spectrum: bin-centred sine wave",
-    )
-    plot_spectra(
-        signal_bin,
-        f_bin_centred,
-        "Log FFT spectrum: bin-centred sine wave",
-    )
+    if plot_bin_centred_spectra:
+        if plot_linear_spectra:
+            plot_spectra_linear(
+                signal_bin,
+                f_bin_centred,
+                "Linear FFT spectrum: bin-centred sine wave",
+                "fft_spectrum_bin_centred_linear",
+            )
+        plot_spectra(
+            signal_bin,
+            f_bin_centred,
+            "Log FFT spectrum: bin-centred sine wave",
+            "fft_spectrum_bin_centred_log",
+        )
 
-    plot_spectra_linear(
-        signal_off_bin,
-        f_not_bin_centred,
-        "Linear FFT spectrum: non-bin-centred sine wave",
-    )
-    plot_spectra(
-        signal_off_bin,
-        f_not_bin_centred,
-        "Log FFT spectrum: non-bin-centred sine wave",
-    )
+    if plot_non_bin_centred_spectra:
+        if plot_linear_spectra:
+            plot_spectra_linear(
+                signal_off_bin,
+                f_not_bin_centred,
+                "Linear FFT spectrum: non-bin-centred sine wave",
+                "fft_spectrum_non_bin_centred_linear",
+            )
+        plot_spectra(
+            signal_off_bin,
+            f_not_bin_centred,
+            "Log FFT spectrum: non-bin-centred sine wave",
+            "fft_spectrum_non_bin_centred_log",
+        )
 
     if plt is None:
         print()
         print("matplotlib is not installed in this Python environment, so plots were skipped.")
         print("Install/use matplotlib to see the comparison figures.")
-    else:
-        plt.show()
 
 
 if __name__ == "__main__":

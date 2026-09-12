@@ -1,4 +1,6 @@
+import csv
 import numpy as np
+import matplotlib as mpl
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 from scipy.interpolate import RegularGridInterpolator
@@ -8,9 +10,46 @@ from scipy.special import spherical_jn, spherical_yn
 from time import perf_counter
 
 from pathlib import Path
+import os
 import sys
 
+# --- Publication style ---
+fontsize = 7
+mpl.rcParams.update({
+    "figure.figsize": (4.0, 2.6),  # single column
+    "figure.dpi": 300,
+    "figure.facecolor": "none",
+    "axes.facecolor": "none",
+    "savefig.facecolor": "none",
+    "savefig.edgecolor": "none",
+    "savefig.transparent": True,
+    "font.family": "sans-serif",
+    "font.size": fontsize,
+    "axes.labelsize": fontsize,
+    "axes.titlesize": fontsize,
+    "xtick.labelsize": fontsize - 1,
+    "ytick.labelsize": fontsize - 1,
+    "legend.fontsize": fontsize - 1,
+    "legend.frameon": False,
+    "legend.framealpha": 0.0,
+    "legend.facecolor": "none",
+    "legend.edgecolor": "none",
+    "lines.linewidth": 1.5,
+    "lines.markersize": 4,
+    "axes.linewidth": 0.8,
+    "xtick.direction": "in",
+    "ytick.direction": "in",
+    "xtick.top": True,
+    "ytick.right": True,
+    "grid.linestyle": ":",
+    "grid.linewidth": 0.5,
+    "grid.alpha": 0.6,
+})
+
 CYTHON_DIR = Path(__file__).resolve().parent
+save_path = CYTHON_DIR / "power_ramp"
+os.makedirs(save_path, exist_ok=True)
+
 sys.path.insert(0, str(CYTHON_DIR))
 
 try:
@@ -71,13 +110,13 @@ kB = 1.38e-23
 d_air = 3.7e-10
 
 # Laser / force parameters
-w0 = 1.75e-6        # beam waist, m
+w0 = 2.97e-6        # beam waist, m
 wavelength = 532e-9
 M2 = 1.2
 use_m2_rayleigh_range = True
 zR_manual = 100e-6
 power_ramp_start = 0.225        # W
-power_ramp_end = 0.04           # W
+power_ramp_end = 0.05          # W
 power_ramp_profile = "linear"
 P_laser = power_ramp_start      # W; force table is built at ramp-start power
 use_laser_power_noise = False
@@ -155,8 +194,8 @@ vz0 = 0.0
 t_start = 0
 t_end = 2000.0
 dt_baoab = 1 / 20000
-brownian_seed = 9
-laser_noise_seed = 12
+brownian_seed = 945
+laser_noise_seed = 12234
 
 # Trap-loss termination
 # The automatic limits are intentionally wider than the thermal motion but
@@ -190,7 +229,7 @@ radial_zero_tolerance = 1e-30
 near_axis_tolerance = 1e-12
 
 # Plotting and diagnostic ranges
-display_plots = True
+display_plots = False
 max_plot_points = 200000
 include_power_ramp_stability_plot = True
 stability_rms_window_seconds = 100.0
@@ -221,16 +260,98 @@ force_field_quiver_scale = 55
 on_axis_check_z_min = -200e-6
 on_axis_check_z_max = 300e-6
 on_axis_check_points = 1000
-time_trace_figsize = (8, 8)
-single_diagnostic_figsize = (8, 4)
-spectrum_figsize = (8, 5)
-trajectory_3d_figsize = (8, 6)
-trajectory_projection_figsize = (13, 4)
-force_check_figsize = (8, 5)
-force_field_figsize = (8, 6)
+time_trace_figsize = (4.0, 2.6)
+single_diagnostic_figsize = (4.0, 2.6)
+spectrum_figsize = (4.0, 2.6)
+trajectory_3d_figsize = (4.0, 2.6)
+trajectory_projection_figsize = (4.0, 2.6)
+force_check_figsize = (4.0, 2.6)
+force_field_figsize = (4.0, 2.6)
+
+
+plot_data_counter = 0
+
+
+def save_plot_data_csv(fig, csv_path):
+    rows = []
+
+    for axis_index, axis in enumerate(fig.axes):
+        axis_name = axis.get_ylabel() or axis.get_xlabel() or f"axis_{axis_index}"
+
+        for line_index, line in enumerate(axis.get_lines()):
+            x_data = np.asarray(line.get_xdata())
+            y_data = np.asarray(line.get_ydata())
+            label = line.get_label()
+
+            if label.startswith("_"):
+                label = f"line_{line_index}"
+
+            for x_value, y_value in zip(x_data, y_data):
+                rows.append((axis_index, axis_name, label, x_value, y_value))
+
+    with open(csv_path, "w", newline="") as csv_file:
+        writer = csv.writer(csv_file)
+        writer.writerow(["axis_index", "axis_name", "line_label", "x", "y"])
+        writer.writerows(rows)
+
+
+def make_legends_transparent(fig):
+    for axis in fig.axes:
+        legend = axis.get_legend()
+        if legend is not None:
+            legend.set_frame_on(False)
+            frame = legend.get_frame()
+            frame.set_facecolor("none")
+            frame.set_edgecolor("none")
+            frame.set_alpha(0.0)
+            frame.set_linewidth(0.0)
+
+    for legend in fig.legends:
+        legend.set_frame_on(False)
+        frame = legend.get_frame()
+        frame.set_facecolor("none")
+        frame.set_edgecolor("none")
+        frame.set_alpha(0.0)
+        frame.set_linewidth(0.0)
+
+
+def figure_title_slug(fig):
+    title = ""
+    if fig._suptitle is not None:
+        title = fig._suptitle.get_text()
+    if not title:
+        for axis in fig.axes:
+            title = axis.get_title()
+            if title:
+                break
+    if not title:
+        title = "plot"
+
+    slug = "".join(
+        character.lower() if character.isalnum() else "_"
+        for character in title
+    )
+    slug = "_".join(part for part in slug.split("_") if part)
+    return slug[:80] or "plot"
 
 
 def finish_plot():
+    global plot_data_counter
+
+    plot_data_counter += 1
+    target_fig = plt.gcf()
+    make_legends_transparent(target_fig)
+    plot_stem = f"plot_{plot_data_counter:03d}_{figure_title_slug(target_fig)}"
+    target_fig.savefig(
+        save_path / f"{plot_stem}.png",
+        dpi=300,
+        bbox_inches="tight"
+    )
+    save_plot_data_csv(
+        target_fig,
+        os.path.join(save_path, f"plot_data_{plot_data_counter:03d}.csv")
+    )
+
     if display_plots:
         plt.show()
     else:
@@ -1903,13 +2024,9 @@ else:
     laser_step_duration_actual = t_baoab[-1] - t_baoab[0]
     laser_allowed_power_factors = np.array([1.0])
     laser_step_power_factors = np.array([1.0])
-    laser_power_factor = None
+    laser_power_factor = np.ones_like(t_baoab)
 
-laser_power_time = (
-    P_laser * laser_power_factor
-    if use_laser_power_noise
-    else None
-)
+laser_power_time = P_laser * laser_power_factor
 
 instantaneous_z_equilibrium_by_power_factor = {}
 
@@ -1964,7 +2081,11 @@ if use_laser_power_noise:
         ]
     )
 else:
-    z_eq_laser_noise_time = None
+    z_eq_laser_noise_time = np.full_like(
+        t_baoab,
+        instantaneous_z_equilibrium_by_power_factor[1.0],
+        dtype=float
+    )
 
 gamma_baoab = b / m
 baoab_damping_factor = np.exp(-gamma_baoab * dt_baoab)
@@ -2706,6 +2827,7 @@ def solve_baoab_3d_fast_with_pd_feedback(
 brownian_normals_x = rng.normal(size=len(t_baoab) - 1)
 brownian_normals_y = rng.normal(size=len(t_baoab) - 1)
 brownian_normals_z = rng.normal(size=len(t_baoab) - 1)
+zero_brownian_normals = np.zeros(len(t_baoab) - 1)
 constant_power_factor = np.ones_like(t_baoab)
 power_time = power_ramp(t_baoab)
 power_factor_time = power_time / P_laser
@@ -2862,6 +2984,58 @@ position_axis.legend(
 fig.tight_layout()
 finish_plot()
 
+fig, position_axis = plt.subplots(figsize=time_trace_figsize)
+
+trajectory_power_plot_mw = power_time[trusted_slice][plot_slice] * 1e3
+position_axis.plot(
+    trajectory_power_plot_mw,
+    x_baoab_power_ramp[trusted_slice][plot_slice] * 1e6,
+    linewidth=0.8,
+    label="x position"
+)
+position_axis.plot(
+    trajectory_power_plot_mw,
+    y_baoab_power_ramp[trusted_slice][plot_slice] * 1e6,
+    linewidth=0.8,
+    label="y position"
+)
+position_axis.plot(
+    trajectory_power_plot_mw,
+    z_baoab_power_ramp[trusted_slice][plot_slice] * 1e6,
+    linewidth=0.8,
+    label="z position"
+)
+position_axis.scatter(
+    [power_time[trusted_slice][0] * 1e3],
+    [z_baoab_power_ramp[trusted_slice][0] * 1e6],
+    color="tab:orange",
+    s=18,
+    zorder=3,
+    label="start"
+)
+position_axis.scatter(
+    [power_time[trusted_slice][-1] * 1e3],
+    [z_baoab_power_ramp[trusted_slice][-1] * 1e6],
+    color="black",
+    s=18,
+    zorder=3,
+    label="end"
+)
+position_axis.axhline(
+    0.0,
+    color="0.35",
+    linestyle=":",
+    linewidth=0.9,
+    label="laser focus"
+)
+position_axis.set_xlabel("laser power (mW)")
+position_axis.set_ylabel("particle position relative to laser focus (micrometres)")
+position_axis.set_title("Trajectory as laser power changes")
+position_axis.legend(loc="best")
+position_axis.grid(True, alpha=0.3)
+fig.tight_layout()
+finish_plot()
+
 if include_power_ramp_stability_plot:
     print(
         "Computing rolling stability RMS with",
@@ -2912,6 +3086,71 @@ if include_power_ramp_stability_plot:
             "Warning: no stable instantaneous z equilibrium was found for "
             "the power-ramp stability plot."
         )
+
+    equilibrium_power_mw = equilibrium_power_factor_time * P_laser * 1e3
+    finite_equilibrium_mask = np.isfinite(z_eq_sample_time)
+
+    if np.count_nonzero(finite_equilibrium_mask) > 0:
+        fig, equilibrium_axis = plt.subplots(figsize=single_diagnostic_figsize)
+        equilibrium_axis.plot(
+            equilibrium_power_mw[finite_equilibrium_mask],
+            z_eq_sample_time[finite_equilibrium_mask] * 1e6,
+            marker="o",
+            linewidth=1.0,
+            label="stable z equilibrium"
+        )
+        equilibrium_axis.axhline(
+            0.0,
+            color="0.35",
+            linestyle=":",
+            linewidth=0.9,
+            label="laser focus"
+        )
+        equilibrium_axis.set_xlabel("laser power (mW)")
+        equilibrium_axis.set_ylabel("equilibrium z position (micrometres)")
+        equilibrium_axis.set_title("Equilibrium position vs laser power")
+        equilibrium_axis.legend(loc="best")
+        equilibrium_axis.grid(True, alpha=0.3)
+        fig.tight_layout()
+        finish_plot()
+
+    finite_stiffness_mask = (
+        np.isfinite(kx_sample_time)
+        & np.isfinite(ky_sample_time)
+        & np.isfinite(kz_sample_time)
+    )
+
+    if np.count_nonzero(finite_stiffness_mask) > 0:
+        fig, stiffness_axis = plt.subplots(figsize=single_diagnostic_figsize)
+        stiffness_axis.plot(
+            equilibrium_power_mw[finite_stiffness_mask],
+            kx_sample_time[finite_stiffness_mask],
+            marker="o",
+            linewidth=1.0,
+            label="kx radial"
+        )
+        stiffness_axis.plot(
+            equilibrium_power_mw[finite_stiffness_mask],
+            ky_sample_time[finite_stiffness_mask],
+            marker="s",
+            linewidth=1.0,
+            alpha=0.6,
+            label="ky radial"
+        )
+        stiffness_axis.plot(
+            equilibrium_power_mw[finite_stiffness_mask],
+            kz_sample_time[finite_stiffness_mask],
+            marker="^",
+            linewidth=1.0,
+            label="kz axial"
+        )
+        stiffness_axis.set_xlabel("laser power (mW)")
+        stiffness_axis.set_ylabel("trap stiffness (N/m)")
+        stiffness_axis.set_title("Trap stiffness vs laser power")
+        stiffness_axis.legend(loc="best")
+        stiffness_axis.grid(True, alpha=0.3)
+        fig.tight_layout()
+        finish_plot()
 
     z_eq_time = interpolate_finite_values(
         equilibrium_sample_times,
@@ -3043,12 +3282,14 @@ if include_power_ramp_stability_plot:
     rms_axis.legend(
         rms_lines + power_lines,
         rms_labels + power_labels,
-        loc="best"
+        loc="best",
+        frameon=False,
+        facecolor="none",
+        framealpha=0.0,
+        edgecolor="none"
     )
     fig.tight_layout()
     finish_plot()
-
-raise SystemExit
 
 baoab_constant_power_start_time = perf_counter()
 (
