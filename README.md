@@ -1,31 +1,205 @@
-READ.ME WORD FILE ATTACHED. MOST CURRENT VERSION: Project_3d_cython_new.py / BAOAB_3d_cython.pyx / Setup_3d_cython.py
+# 3D Optical Levitation Simulation
 
-Project_3d_cython.py simulates 3D optical levitation using an Ashkin-style ray-optics force model with cylindrical r-z lookup tables. Optical forces come from ray-bundle calculations using Fresnel reflection/transmission, scattering-like efficiency, and gradient-like efficiency, then cylindrical symmetry converts radial and axial forces into x, y, and z components. The photophoretic force is modelled using a Rohatschek-style pressure-dependent photophoretic model, based on absorbed intensity and gas/thermal accommodation parameters. Gas damping is modelled with Stokes, Cunningham-corrected Stokes, Epstein, or automatic Knudsen-based drag selection. Brownian motion is generated with BAOAB Langevin dynamics using the fluctuation-dissipation relation. The code plots x/y/z motion, laser-power noise, equilibrium shifts, isolated Brownian and laser-noise effects, standard and Welch PSDs, detector-resolution PSD comparisons, 3D trajectories, force breakdowns, and force-field maps. This also compares trajectories and PSD to experimental data 
-Project1d.py
+This folder contains a numerical model for simulating a micron-scale particle held in an optical levitation trap. The main script is:
 
-Project1d.py models 1D vertical optical levitation of a silica sphere using phenomenological optical forces rather than a full ray-optics calculation. The scattering force is treated as a radiation-pressure-like upward force, the gradient force is a simplified restoring force toward the laser focus, and the photophoretic force is a phenomenological heating-in-gas force. Gravity is subtracted to form the net force, and stable equilibria are found where the net force crosses zero with negative slope. Gas drag is compared using Stokes drag, Cunningham-corrected Stokes drag, and Epstein drag, with an automatic regime choice based on Knudsen number. The code plots nonlinear motion against a linear SHM approximation, individual force curves, linearised net force near equilibrium, and Fourier spectra.
-Project_1dnoise.py
+```text
+project_3d_cython.py
+```
 
-Project_1dnoise.py extends the 1D model by adding Brownian motion and PSD analysis. The optical forces are still phenomenological: radiation-pressure/scattering force, axial gradient force, and photophoretic force, balanced against gravity with buoyancy included. Damping is calculated using Stokes, Cunningham-corrected Stokes, Epstein, or automatic Knudsen-based drag selection. Brownian motion is added with a BAOAB Langevin integrator, using the fluctuation-dissipation relation so that the random thermal kicks are consistent with gas damping and temperature. The code plots deterministic motion, Brownian trajectories, position histograms compared with a thermal Gaussian, semilog histogram tails, Fourier/PSD plots, and the theoretical damped-harmonic-oscillator thermal PSD.
-Project_1d_lasernoise.py
-Project_1d_lasernoise.py adds stepwise laser-power noise to the 1D Brownian levitation simulation. The scattering and gradient forces are phenomenological, with fixed strength parameters such as Q_pr for radiation pressure and a chosen gradient-force scale. The photophoretic force uses a Rohatschek-style pressure-dependent model, so the force depends on gas pressure and absorbed laser intensity. Gas damping is modelled using Stokes, Cunningham-corrected Stokes, Epstein, or automatic Knudsen-number selection. Brownian noise is added through BAOAB Langevin dynamics using fluctuation-dissipation-consistent velocity kicks. The code plots Brownian histograms, laser power versus time, isolated laser-noise displacement, nonlinear and BAOAB trajectories, and raw plus Welch-averaged PSDs.
-Project_1d_noise_feedback.py
-Project_1d_noise_feedback.py adds PD feedback to the noisy 1D levitation model. The force model includes phenomenological scattering/radiation pressure, phenomenological gradient force, Rohatschek-style photophoretic force, gravity, buoyancy, and gas damping. Drag is calculated using Stokes, Cunningham-corrected Stokes, Epstein, or automatic Knudsen-regime selection. Brownian motion is generated using a BAOAB Langevin scheme with fluctuation-dissipation-consistent thermal kicks. The feedback model uses delayed measured position, filtered velocity estimation, proportional and derivative gains, and laser-power correction limits. It plots laser power, feedback command, isolated Brownian and laser-noise displacement, Brownian histograms, feedback trajectory comparisons, and Fourier/PSD plots including Welch-averaged PSDs.
-Project_2d.py
-Project_2d.py simulates 2D optical levitation in the x-z plane using a simplified phenomenological Gaussian-beam force model. The transverse and axial gradient forces are calculated from intensity gradients, the scattering force is an upward radiation-pressure-like force proportional to local intensity, and the photophoretic force is an upward gas-heating force. Gravity and gas damping are included, with damping mainly treated using Cunningham-corrected Stokes drag for low-pressure correction. Brownian motion is added using random thermal kicks, representing fluctuation-dissipation-style thermal forcing. The code plots x and z trajectories, Fourier spectra, the 2D trajectory, and a force-field map over the beam intensity.
-Project_2d_improved.py
-Project_2d_improved.py replaces the simplified optical force model with an Ashkin-style ray-optics model. The particle is sampled by ray bundles, and each ray uses Fresnel reflection/transmission, incident and refracted angles, and scattering-like and gradient-like efficiency factors to calculate optical force components. A separate photophoretic force is included, based on absorbed intensity and gas/particle thermal parameters. Gravity is included, and gas damping is calculated using Stokes, Cunningham-corrected Stokes, Epstein, or automatic Knudsen-number selection. The code plots nonlinear x/z motion, Fourier spectra, the 2D trajectory, axial force breakdowns, restoring-force checks, and a force-field map.
-Project_2d_noise.py
-Project_2d_noise.py adds Brownian motion, laser-power noise, lookup tables, and PSD analysis to the 2D Ashkin-style ray-optics simulation. Optical forces are calculated from ray-optics scattering-like and gradient-like components using Fresnel coefficients, while photophoretic force is modelled from absorbed intensity and gas/thermal parameters. Gravity and gas damping are included, with damping chosen from Stokes, Cunningham-corrected Stokes, Epstein, or automatic Knudsen-regime selection. Brownian motion is simulated with BAOAB Langevin dynamics using fluctuation-dissipation-consistent random velocity kicks. The code plots BAOAB motion, laser-power noise, equilibrium shifts, isolated laser-noise displacement, 2D trajectories, force maps, and PSDs with and without Welch averaging.
-Project_2d_cython.py / BAOAB_2d_cython.pyx / Setup_2d_cython.py
-These are the Cython-accelerated versions of Project_2d_noise.py. The physical model is the same: Ashkin-style ray-optics scattering and gradient forces, photophoretic force from absorbed intensity, gravity, gas damping using Stokes/Cunningham/Epstein options, and Brownian forcing through fluctuation-dissipation-consistent BAOAB Langevin dynamics. The main difference is computational: the optical force is precomputed on lookup tables and interpolated during the Cython BAOAB loop. The plots are the same as the Python version, including trajectories, laser-noise effects, force maps, and PSDs with and without Welch averaging.
-Project_3d_cython.py / BAOAB_3d_cython.pyx / Setup_3d_cython.py
-Project_3d_cython.py simulates 3D optical levitation using an Ashkin-style ray-optics force model with cylindrical r-z lookup tables. Optical forces come from ray-bundle calculations using Fresnel reflection/transmission, scattering-like efficiency, and gradient-like efficiency, then cylindrical symmetry converts radial and axial forces into x, y, and z components. The photophoretic force is modelled using a Rohatschek-style pressure-dependent photophoretic model, based on absorbed intensity and gas/thermal accommodation parameters. Gas damping is modelled with Stokes, Cunningham-corrected Stokes, Epstein, or automatic Knudsen-based drag selection. Brownian motion is generated with BAOAB Langevin dynamics using the fluctuation-dissipation relation. The code plots x/y/z motion, laser-power noise, equilibrium shifts, isolated Brownian and laser-noise effects, standard and Welch PSDs, detector-resolution PSD comparisons, 3D trajectories, force breakdowns, and force-field maps. This also compares trajectories and PSD to experimental data 
-Project_3d_no_cython.py
-Project_3d_no_cython.py uses the same physical models as the Cython 3D version but runs the BAOAB integration in Python rather than Cython. It uses Ashkin-style ray-optics forces, photophoretic force, gravity, gas damping from Stokes/Cunningham/Epstein options, and fluctuation-dissipation-consistent Brownian Langevin noise. Its main purpose is comparison and validation against the faster Cython lookup-table version, using the same trajectory and PSD-style plots.
-Project_3d_cython_pressure_sweep.py / BAOAB_3d_cython.pyx / Setup_3d_cython.py
-Project_3d_cython_power_sweep.py / BAOAB_3d_cython.pyx / Setup_3d_cython.py
-Project_3d_cython_heating_sweep.py / BAOAB_3d_cython.pyx / Setup_3d_cython.py
+This is the main 3D simulation script. Most settings are changed near the top of the file under `User-adjustable parameters`, then the script is run directly.
+
+## What The Code Does
+
+The simulation calculates the forces on a trapped particle, finds the trap equilibrium, and then evolves the particle motion in time using a BAOAB Langevin integrator. It includes optical forces, gravity, buoyancy, gas damping, Brownian motion, photophoretic force, laser-power noise, and an optional delayed PD feedback loop.
+
+The code then saves diagnostic plots and data products such as trajectories, power spectral densities, force checks, trap-frequency comparisons, and 3D trajectory projections.
+
+## Main Files
+
+```text
+project_3d_cython.py                 main 3D simulation script
+baoab_3d_cython.pyx                  Cython source for the fast solver
+baoab_3d_cython.cpython-312-darwin.so compiled Cython solver used when available
+setup_baoab_3d.py                    build script for the Cython extension
+
+```
 
 
+## Script Guide
 
+The files in this folder are related variants of the same core 3D optical levitation model. In most cases, `project_3d_cython.py` is the best starting point. The other scripts keep the same force model and BAOAB simulation structure, but focus on a specific experiment, diagnostic or parameter sweep.
+
+| Script | Purpose | Typical outputs |
+| --- | --- | --- |
+| `project_3d_cython.py` | Main 3D BAOAB simulation. Use this for ordinary trajectory, PSD, force, and trap-frequency calculations. | `cython_outputs/` |
+| `project_3d_cython_experimental_comparion.py` | Compares to experimental data | `Figures/` |
+| `project_3d_cython_driven_dynamics.py` | Drives the trap by deliberately modulating laser power. Used for step response, sine/square modulation, frequency response, and resonance tests. | `driven dynamics/` |
+| `project_3d_cython_laser_feedback.py` | Tests delayed PD feedback where measured axial position is used to vary laser power. Includes feedback prediction and history-length sweeps. | `Figures/` |
+| `project_3d_cython_benchmarking.py` | Times the main parts of the simulation to identify slow sections and compare solver performance. | `plots/` plus terminal timing table |
+| `project_3d_cython_particle_loading.py` | Studies particle capture/loading, including phase-space capture maps and trap-loss boundaries. | phase-space plots/CSVs, depending on enabled switches |
+| `particle_loading_batch.py` | Batch version of the particle-loading study. Produces large phase-space maps and optional bottle-loading Monte Carlo results. | `Phase_space/` |
+| `particle_moving_trap_velocity_sweep.py` | Tests how fast the trap can be moved before the particle is lost, including pressure-dependent maximum velocity scans. | `Moving_trap_velocity/` |
+| `project_3d_linewidth_sweep_backup3.py` | Uses simulated PSD linewidths to recover Brownian/surface temperature and test pressure/temperature fitting accuracy. | linewidth, pressure, and surface-temperature recovery plots |
+| `project_3d_cython_power_ramp.py` | Simulates a laser-power ramp and tracks how the equilibrium position, stability, trajectory, and PSD change during the ramp. | `power_ramp/` |
+| `project_3d_cython_pressure_ramp.py` | Simulates a pressure ramp, including pressure-dependent damping, Brownian forcing, and photophoretic force changes. | `pressure_ramp/` |
+
+## Choosing A Script
+
+Use this rough guide:
+
+```text
+ordinary 3D trajectory or PSD      -> project_3d_cython.py
+laser modulation / driven response -> project_3d_cython_driven_dynamics.py
+feedback control                   -> project_3d_cython_laser_feedback.py
+runtime profiling                  -> project_3d_cython_benchmarking.py
+capture / loading maps             -> project_3d_cython_particle_loading.py or particle_loading_batch.py
+moving trap speed limit            -> particle_moving_trap_velocity_sweep.py
+surface-temperature recovery       -> project_3d_linewidth_sweep_backup3.py
+power ramp                         -> project_3d_cython_power_ramp.py
+pressure ramp                      -> project_3d_cython_pressure_ramp.py
+improved force/noise validation    -> project_3d_cython_new.py
+```
+
+
+## Requirements
+
+The script uses Python 3 with:
+
+```text
+numpy
+scipy
+matplotlib
+```
+
+The Cython extension is optional but strongly recommended for long runs. If it is available, the script prints:
+
+```text
+Cython BAOAB solver available = True
+```
+
+## Quick Start
+
+From this folder, run:
+
+```bash
+python3 project_3d_cython.py
+```
+
+By default, plots are saved to:
+
+```text
+cython_outputs/
+```
+
+To change the simulation, edit the values near the top of `project_3d_cython.py` under `User-adjustable parameters`. For example, change `t_end` for simulation length, `p` for pressure, `P_laser` for laser power, and the `use_...` switches for noise, Brownian motion, feedback and scan modes.
+
+To save outputs somewhere else, set the `PROJECT_3D_SAVE_PATH` environment variable before running the script. For example:
+
+```bash
+PROJECT_3D_SAVE_PATH=cython_outputs/test_run python3 project_3d_cython.py
+```
+
+## Main User Settings Inside The Script
+
+Most important settings are near the top of the script under `User-adjustable parameters`. These include:
+
+```text
+radius                         particle radius
+density                        particle density
+p                              gas pressure
+T                              gas temperature
+w0                             laser beam waist
+wavelength                     laser wavelength
+P_laser                        laser power
+use_laser_power_noise          laser noise on/off
+laser_noise_model              square or psd_matched
+use_brownian_motion            Brownian motion on/off
+t_end                          simulation duration
+dt_baoab                       integration time step
+use_pd_feedback                feedback on/off
+run_power_pressure_scan        power/pressure scan mode
+run_diameter_scan              diameter scan mode
+```
+
+## What Happens In Order
+
+1. Imports packages, loads the Cython solver, and applies plot styling.
+2. Defines particle, gas, laser, damping, feedback, and plotting parameters.
+3. Uses the chosen settings from the user-adjustable parameter block.
+4. Runs optional scan modes if selected.
+5. Sets up plot-saving helpers.
+6. Calculates derived quantities such as mass, gas density, mean free path, Knudsen number, Rayleigh range, and peak intensity.
+7. Builds the Gaussian beam model.
+8. Calculates optical forces using an Ashkin-style ray-optics model.
+9. Adds the pressure-dependent photophoretic force.
+10. Builds a 3D force lookup table for faster time stepping.
+11. Finds the stable axial equilibrium position.
+12. Calculates local trap stiffness and expected resonant frequencies.
+13. Saves force-linearity and stiffness diagnostic plots.
+14. Calculates the gas damping coefficient.
+15. Sets the initial particle position and velocity.
+16. Generates laser-power noise if enabled.
+17. Runs the BAOAB trajectory simulation.
+18. Optionally runs the delayed PD feedback simulation.
+19. Compares constant-power, noisy-power, and no-Brownian trajectories.
+20. Saves time-domain trajectory plots.
+21. Saves position histograms if enabled.
+22. Calculates raw and Welch-averaged power spectral densities.
+23. Compares simulated trap frequencies with the linear prediction.
+24. Saves PSD plots for motion, laser power, and laser-noise effects.
+25. Saves 3D trajectory plots, projection plots, and force-field diagnostics.
+
+## Main Outputs
+
+The exact outputs depend on which switches are enabled, but common files include:
+
+```text
+xyz_time_traces.png
+laser_power_noise.png
+xyz_laser_noise_comparison.png
+laser_noise_effect.png
+brownian_effect.png
+psd_x.png
+psd_y.png
+psd_z.png
+psd_xz_welch.png
+psd_laser_noise_effect_welch.png
+trap_frequency_comparison.csv
+trap_frequency_comparison_table.png
+trajectory_3d.png
+trajectory_projections.png
+fx_magnitude_heatmap.png
+```
+
+Plot data are also saved as CSV files for many figures.
+
+
+
+## Additional Validation And Testing Scripts
+
+The main simulation workflow is described above. The folder also contains several supporting scripts that were used while developing, checking and comparing the model. These are included for transparency and reproducibility, but they are not all needed for a standard run of the final 3D simulation.
+
+| File | Purpose |
+| --- | --- |
+| `project_1dnoise.py` | Early 1D Brownian levitation model used to test the basic stochastic dynamics and PSD analysis. |
+| `project_1d_lasernoise.py` | 1D model with laser-power noise included. |
+| `project_1d_noise_feedback.py` | 1D test case for simple feedback cooling ideas. |
+| `project_2d.py` | Early 2D x-z model using a simplified force description. |
+| `project_2d_improved.py` | Improved 2D model using the ray-optics force calculation. |
+| `project_2d_noise.py` | 2D model including Brownian motion, laser-power noise, lookup tables and PSD analysis. |
+| `project_2d_cython.py` | Cython-accelerated version of the 2D model. |
+| `project_3d.py` | Earlier pure-Python 3D model, kept as a reference point for the later Cython version. |
+| `project_3d_cython_backup.py` | Backup copy of an earlier 3D Cython version. |
+| `project_3d_cython_heating.py` | 3D variant used for heating or particle surface-temperature checks. |
+| `project_3d_cython_real_laser_noise.py` | 3D variant using measured laser-power fluctuations rather than generated noise. |
+| `project_3d_cython_driven_dynamics.py` | 3D driven-dynamics version used to study the response to modulated laser power. |
+| `project_3d_linewidth_sweep_backup3.py` | Pressure/linewidth sweep script used for comparison with recovered-temperature or PSD-based measurements. |
+| `brownian_solver_testing.py` | Standalone validation of the Brownian/Langevin solver against expected harmonic-trap behaviour. |
+| `solver_testing.py` | Deterministic solver test using a damped oscillator, mainly for checking accuracy and runtime. |
+| `fourier_testing.py` | Tests of Fourier transforms, windowing and PSD estimation choices. |
+| `photophoresis_testing.py` | Checks of photophoretic force models and heat-source assumptions. |
+| `plot_rohatschek_absorption_sweep.py` | Plotting utility for Rohatschek/absorption parameter sweeps. |
+| `plot_power_csv.py` | Utility for plotting measured laser-power CSV files. |
+| `plot_particle_npy.py` | Utility for plotting experimental particle trajectory `.npy` files. |
+
+The `.npy` files are experimental data files used by the plotting and comparison scripts. The `__pycache__/` folder is created automatically by Python and is not part of the research code.
