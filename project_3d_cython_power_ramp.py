@@ -192,7 +192,7 @@ vz0 = 0.0
 
 # Time integration
 t_start = 0
-t_end = 2000.0
+t_end = 200.0
 dt_baoab = 1 / 20000
 brownian_seed = 945
 laser_noise_seed = 12234
@@ -1293,6 +1293,87 @@ def F_optical_3d_lookup_scalar_clamped(x, y, z, power_factor=1.0):
     return Fx, Fy, Fz, out_of_bounds
 
 
+def F_optical_3d_lookup_scalar_clamped_pressure_scaled(
+    x,
+    y,
+    z,
+    power_factor=1.0,
+    photo_pressure_factor=1.0,
+):
+    """
+    Scalar force lookup with pressure-scaled photophoresis.
+
+    The lookup table stores the axial ray-optics and photophoretic components
+    separately so the power ramp can reuse the same table while applying the
+    current pressure-dependent photophoretic scale factor.
+    """
+    r = np.sqrt(x**2 + y**2)
+
+    r_min = force_lookup_r_values[0]
+    r_max = force_lookup_r_values[-1]
+    z_min = force_lookup_z_values[0]
+    z_max = force_lookup_z_values[-1]
+
+    r_lookup = min(max(r, r_min), r_max)
+    z_lookup = min(max(z, z_min), z_max)
+    out_of_bounds = r_lookup != r or z_lookup != z
+
+    n_r = len(force_lookup_r_values)
+    n_z = len(force_lookup_z_values)
+
+    if n_r < 2 or n_z < 2:
+        raise ValueError("Force lookup table needs at least two grid points per axis.")
+
+    dr = (r_max - r_min) / (n_r - 1)
+    dz = (z_max - z_min) / (n_z - 1)
+
+    r_grid_position = (r_lookup - r_min) / dr
+    z_grid_position = (z_lookup - z_min) / dz
+
+    ir = int(r_grid_position)
+    iz = int(z_grid_position)
+
+    if ir >= n_r - 1:
+        ir = n_r - 2
+        r_weight = 1.0
+    else:
+        r_weight = r_grid_position - ir
+
+    if iz >= n_z - 1:
+        iz = n_z - 2
+        z_weight = 1.0
+    else:
+        z_weight = z_grid_position - iz
+
+    def bilinear(table):
+        value00 = table[ir, iz]
+        value10 = table[ir + 1, iz]
+        value01 = table[ir, iz + 1]
+        value11 = table[ir + 1, iz + 1]
+        return (
+            (1 - r_weight) * (1 - z_weight) * value00
+            + r_weight * (1 - z_weight) * value10
+            + (1 - r_weight) * z_weight * value01
+            + r_weight * z_weight * value11
+        )
+
+    Fr_nominal = bilinear(force_lookup_Fr_table)
+    Fz_ray_nominal = bilinear(force_lookup_Fz_ray_table)
+    Fz_photo_nominal = bilinear(force_lookup_Fz_photo_base_table)
+
+    Fr = power_factor * Fr_nominal
+    Fz = power_factor * (Fz_ray_nominal + photo_pressure_factor * Fz_photo_nominal)
+
+    if r > radial_zero_tolerance:
+        Fx = Fr * x / r
+        Fy = Fr * y / r
+    else:
+        Fx = 0.0
+        Fy = 0.0
+
+    return Fx, Fy, Fz, out_of_bounds
+
+
 def F_optical_3d(x, y, z, power_factor=1.0):
     if use_force_lookup_table and force_lookup_ready:
         return F_optical_3d_lookup(x, y, z, power_factor)
@@ -2303,75 +2384,143 @@ def solve_baoab_3d_fast_with_pressure_ramp(
     brownian_normals_z,
 ):
     """
-    Cython-backed BAOAB loop for a time-varying gas pressure.
+    BAOAB loop for a power/pressure-dependent force table.
 
-    The pressure ramp affects photophoretic force, gas damping, and Brownian
-    thermal kicks. This dedicated copy intentionally requires the compiled
-    Cython module because the 1000 s trajectory is too large for the
-    pure-Python loop to be practical.
+    Uses the Cython pressure-ramp solver when available. If that local Cython
+    extension has not been built, falls back to a slower pure-Python loop so the
+    script remains runnable without changing the Cython file.
     """
     if terminate_on_trap_loss:
         raise RuntimeError(
             "Pressure-ramp mode requires terminate_on_trap_loss=False so the "
-            "fixed-length Cython loop can be used."
+            "fixed-length loop can be used."
         )
     if not (
-        cython_pressure_baoab_available
-        and use_force_lookup_table
+        use_force_lookup_table
         and force_lookup_ready
         and force_lookup_Fz_ray_table is not None
         and force_lookup_Fz_photo_base_table is not None
     ):
         raise RuntimeError(
-            "Pressure-ramp mode requires a local Cython extension to expose "
-            "solve_baoab_3d_pressure_lookup_cython."
+            "Power-ramp mode requires use_force_lookup_table=True and a force "
+            "lookup table with separate ray and photophoretic axial terms."
         )
 
-    result = solve_baoab_3d_pressure_lookup_cython(
-        np.ascontiguousarray(force_lookup_r_values, dtype=np.float64),
-        np.ascontiguousarray(force_lookup_z_values, dtype=np.float64),
-        np.ascontiguousarray(force_lookup_Fr_table, dtype=np.float64),
-        np.ascontiguousarray(force_lookup_Fz_ray_table, dtype=np.float64),
-        np.ascontiguousarray(force_lookup_Fz_photo_base_table, dtype=np.float64),
-        np.ascontiguousarray(power_factor_time, dtype=np.float64),
-        np.ascontiguousarray(photo_pressure_factor_time, dtype=np.float64),
-        np.ascontiguousarray(brownian_normals_x, dtype=np.float64),
-        np.ascontiguousarray(brownian_normals_y, dtype=np.float64),
-        np.ascontiguousarray(brownian_normals_z, dtype=np.float64),
-        dt_baoab,
-        m,
-        m * g,
-        np.ascontiguousarray(damping_factor_time, dtype=np.float64),
-        np.ascontiguousarray(thermal_velocity_scale_time, dtype=np.float64),
-        x0,
-        y0,
-        z0,
-        vx0,
-        vy0,
-        vz0,
-        radial_zero_tolerance,
+    if cython_pressure_baoab_available:
+        result = solve_baoab_3d_pressure_lookup_cython(
+            np.ascontiguousarray(force_lookup_r_values, dtype=np.float64),
+            np.ascontiguousarray(force_lookup_z_values, dtype=np.float64),
+            np.ascontiguousarray(force_lookup_Fr_table, dtype=np.float64),
+            np.ascontiguousarray(force_lookup_Fz_ray_table, dtype=np.float64),
+            np.ascontiguousarray(force_lookup_Fz_photo_base_table, dtype=np.float64),
+            np.ascontiguousarray(power_factor_time, dtype=np.float64),
+            np.ascontiguousarray(photo_pressure_factor_time, dtype=np.float64),
+            np.ascontiguousarray(brownian_normals_x, dtype=np.float64),
+            np.ascontiguousarray(brownian_normals_y, dtype=np.float64),
+            np.ascontiguousarray(brownian_normals_z, dtype=np.float64),
+            dt_baoab,
+            m,
+            m * g,
+            np.ascontiguousarray(damping_factor_time, dtype=np.float64),
+            np.ascontiguousarray(thermal_velocity_scale_time, dtype=np.float64),
+            x0,
+            y0,
+            z0,
+            vx0,
+            vy0,
+            vz0,
+            radial_zero_tolerance,
+        )
+
+        (
+            x_out,
+            y_out,
+            z_out,
+            vx_out,
+            vy_out,
+            vz_out,
+            out_of_bounds_count,
+        ) = result
+
+        return x_out, y_out, z_out, vx_out, vy_out, vz_out, out_of_bounds_count
+
+    print(
+        "Cython pressure-ramp solver unavailable; using slower Python "
+        "power-ramp loop."
     )
 
-    (
-        x_out,
-        y_out,
-        z_out,
-        vx_out,
-        vy_out,
-        vz_out,
-        out_of_bounds_count,
-    ) = result
+    x_out = np.zeros_like(t_baoab)
+    y_out = np.zeros_like(t_baoab)
+    z_out = np.zeros_like(t_baoab)
+    vx_out = np.zeros_like(t_baoab)
+    vy_out = np.zeros_like(t_baoab)
+    vz_out = np.zeros_like(t_baoab)
 
-    if out_of_bounds_count > 0:
-        pass
-        # print(
-        #     "Warning: Cython pressure-ramp BAOAB clamped",
-        #     out_of_bounds_count,
-        #     "force lookups to the edge of the lookup table.",
-        # )
+    x_out[0] = x0
+    y_out[0] = y0
+    z_out[0] = z0
+    vx_out[0] = vx0
+    vy_out[0] = vy0
+    vz_out[0] = vz0
+
+    out_of_bounds_count = 0
+
+    for i in range(len(t_baoab) - 1):
+        x_i = x_out[i]
+        y_i = y_out[i]
+        z_i = z_out[i]
+        vx_i = vx_out[i]
+        vy_i = vy_out[i]
+        vz_i = vz_out[i]
+
+        Fx_i, Fy_i, Fz_i, force_was_clamped = F_optical_3d_lookup_scalar_clamped_pressure_scaled(
+            x_i,
+            y_i,
+            z_i,
+            power_factor_time[i],
+            photo_pressure_factor_time[i],
+        )
+        out_of_bounds_count += int(force_was_clamped)
+        Fz_i -= m * g
+
+        vx_i += 0.5 * dt_baoab * Fx_i / m
+        vy_i += 0.5 * dt_baoab * Fy_i / m
+        vz_i += 0.5 * dt_baoab * Fz_i / m
+
+        x_i += 0.5 * dt_baoab * vx_i
+        y_i += 0.5 * dt_baoab * vy_i
+        z_i += 0.5 * dt_baoab * vz_i
+
+        vx_i = damping_factor_time[i] * vx_i + thermal_velocity_scale_time[i] * brownian_normals_x[i]
+        vy_i = damping_factor_time[i] * vy_i + thermal_velocity_scale_time[i] * brownian_normals_y[i]
+        vz_i = damping_factor_time[i] * vz_i + thermal_velocity_scale_time[i] * brownian_normals_z[i]
+
+        x_i += 0.5 * dt_baoab * vx_i
+        y_i += 0.5 * dt_baoab * vy_i
+        z_i += 0.5 * dt_baoab * vz_i
+
+        Fx_i, Fy_i, Fz_i, force_was_clamped = F_optical_3d_lookup_scalar_clamped_pressure_scaled(
+            x_i,
+            y_i,
+            z_i,
+            power_factor_time[i],
+            photo_pressure_factor_time[i],
+        )
+        out_of_bounds_count += int(force_was_clamped)
+        Fz_i -= m * g
+
+        vx_i += 0.5 * dt_baoab * Fx_i / m
+        vy_i += 0.5 * dt_baoab * Fy_i / m
+        vz_i += 0.5 * dt_baoab * Fz_i / m
+
+        x_out[i + 1] = x_i
+        y_out[i + 1] = y_i
+        z_out[i + 1] = z_i
+        vx_out[i + 1] = vx_i
+        vy_out[i + 1] = vy_i
+        vz_out[i + 1] = vz_i
 
     return x_out, y_out, z_out, vx_out, vy_out, vz_out, out_of_bounds_count
-
 
 def first_force_lookup_exit(x_values, y_values, z_values, chunk_size=1_000_000):
     """

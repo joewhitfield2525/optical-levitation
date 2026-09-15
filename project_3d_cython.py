@@ -1,136 +1,87 @@
+"""
+3D optical levitation simulation with Brownian motion and optional laser-power noise.
+
+Run:
+    python3 project_3d_cython.py
+
+Outputs:
+    Figures and CSV summaries are written to cython_outputs/ beside this script
+    by default. Set PROJECT_3D_SAVE_PATH to override the output folder.
+
+Normal handover workflow:
+    1. Edit the values in USER SETTINGS.
+    2. Run the script.
+    3. Inspect the generated plots and CSV files in the output folder.
+
+Optional inputs:
+    - The Cython solver is used if it can be imported from CYTHON_DIR.
+    - The measured laser-power CSV is only required when laser_noise_model is
+      set to "psd_matched".
+"""
+
 import csv
 import numpy as np
-import matplotlib as mpl
 import matplotlib.pyplot as plt
-from matplotlib.axes import Axes
-from matplotlib.colorbar import Colorbar
-from matplotlib.figure import Figure
-from mpl_toolkits.mplot3d.axes3d import Axes3D
 from scipy.interpolate import RegularGridInterpolator
 from scipy.optimize import brentq
 from scipy.signal import welch
 from time import perf_counter
-import subprocess
-import json
-import re
 
 from pathlib import Path
 import sys
 import os
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-power_pressure_scan_child = os.environ.get("POWER_PRESSURE_SCAN_CHILD") == "1"
-diameter_scan_child = os.environ.get("DIAMETER_SCAN_CHILD") == "1"
+PROJECT_DIR = SCRIPT_DIR.parent
 
-# --- Publication style ---
-fontsize = 13
-axis_label_fontsize = 13
-legend_fontsize = 11
-mpl.rcParams.update({
-    # Figure
-    "figure.figsize": (3.4, 2.6),  # single column poster plot
-    "figure.dpi": 300,
-    "figure.facecolor": "white",
-    "axes.facecolor": "white",
-    "savefig.dpi": 300,
-    "savefig.facecolor": "white",
-    "savefig.edgecolor": "white",
-    "savefig.transparent": False,
-    # Font
-    "font.family": "Arial",
-    "font.sans-serif": ["Arial"],
-    "font.size": fontsize,
-    "axes.labelsize": axis_label_fontsize,
-    "axes.titlesize": axis_label_fontsize,
-    "xtick.labelsize": fontsize,
-    "ytick.labelsize": fontsize,
-    "legend.fontsize": legend_fontsize,
-    "legend.frameon": False,
-    "legend.framealpha": 0.0,
-    "legend.facecolor": "none",
-    "legend.edgecolor": "none",
-    # Lines
-    "lines.linewidth": 1.5,
-    "lines.markersize": 4,
-    # Axes
-    "axes.linewidth": 0.8,
-    "xtick.direction": "in",
-    "ytick.direction": "in",
-    "xtick.top": True,
-    "ytick.right": True,
-    # Grid
-    "grid.linestyle": ":",
-    "grid.linewidth": 0.5,
-    "grid.alpha": 0.6,
-    # Remove top/right spine? (optional)
-    # "axes.spines.top": False,
-    # "axes.spines.right": False,
-})
+# ****************************************************************************************************************************************************
+# USER SETTINGS - edit these values for normal runs
+# ****************************************************************************************************************************************************
 
-_unit_parentheses_pattern = re.compile(r"^(?P<label>.*?)\s+\((?P<unit>[^()]*)\)$")
+# Output folder. Relative paths are resolved beside this script so another user
+# can run the code from any working directory and still find the outputs.
+save_path = Path(os.environ.get("PROJECT_3D_SAVE_PATH", SCRIPT_DIR / "cython_outputs")).expanduser()
+if not save_path.is_absolute():
+    save_path = SCRIPT_DIR / save_path
+
+# Optional Cython extension location. The script falls back to the pure-Python
+# solver if the compiled module is not available here.
+CYTHON_DIR = PROJECT_DIR / "cython"
+
+# Optional measured laser-power trace used only with laser_noise_model =
+# "psd_matched". Keep this as a project-relative path for portability.
+laser_noise_power_csv_path = PROJECT_DIR / "Power_30min.csv"
+
+# Set True to print extra diagnostics while the simulation runs.
+verbose_output = False
 
 
-def capitalise_first_word(label):
-    if not label:
-        return label
 
-    for index, character in enumerate(label):
-        if character.isalpha():
-            return label[:index] + character.upper() + label[index + 1:]
+# ****************************************************************************************************************************************************
+# INTERNAL SETUP
+# ****************************************************************************************************************************************************
 
-    return label
+verbose_output = verbose_output or os.environ.get("PROJECT_3D_VERBOSE", "0").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
-
-def format_axis_label(label):
-    if not isinstance(label, str):
-        return label
-
-    match = _unit_parentheses_pattern.match(label)
-    if match is not None:
-        label = f"{match.group('label')} / {match.group('unit')}"
-
-    return capitalise_first_word(label)
+# Use Matplotlib's default plotting style.  Individual figures below still set
+# their own sizes where a specific output layout is useful.
+plt.style.use("default")
+default_label_fontsize = plt.rcParams["axes.labelsize"]
 
 
-_original_axes_set_xlabel = Axes.set_xlabel
-_original_axes_set_ylabel = Axes.set_ylabel
-_original_axes3d_set_zlabel = Axes3D.set_zlabel
-_original_colorbar_set_label = Colorbar.set_label
+def log(message="", *, verbose=False):
+    if verbose and not verbose_output:
+        return
+    print(message)
 
 
-def set_xlabel_without_unit_parentheses(self, xlabel, *args, **kwargs):
-    return _original_axes_set_xlabel(self, format_axis_label(xlabel), *args, **kwargs)
+save_path.mkdir(parents=True, exist_ok=True)
 
-
-def set_ylabel_without_unit_parentheses(self, ylabel, *args, **kwargs):
-    return _original_axes_set_ylabel(self, format_axis_label(ylabel), *args, **kwargs)
-
-
-def set_zlabel_without_unit_parentheses(self, zlabel, *args, **kwargs):
-    return _original_axes3d_set_zlabel(self, format_axis_label(zlabel), *args, **kwargs)
-
-
-def set_colorbar_label_without_unit_parentheses(self, label, *args, **kwargs):
-    return _original_colorbar_set_label(self, format_axis_label(label), *args, **kwargs)
-
-
-def remove_plot_title(*args, **kwargs):
-    return None
-
-
-Axes.set_xlabel = set_xlabel_without_unit_parentheses
-Axes.set_ylabel = set_ylabel_without_unit_parentheses
-Axes.set_title = remove_plot_title
-Axes3D.set_zlabel = set_zlabel_without_unit_parentheses
-Colorbar.set_label = set_colorbar_label_without_unit_parentheses
-Figure.suptitle = remove_plot_title
-save_path = os.environ.get(
-    "PROJECT_3D_SAVE_PATH",
-    str(SCRIPT_DIR / "cython_outputs")
-)
-os.makedirs(save_path, exist_ok=True)
-
-CYTHON_DIR = Path("/Users/josephwhitfield/Masters/Summer Project/cython")
 sys.path.insert(0, str(CYTHON_DIR))
 
 try:
@@ -153,28 +104,57 @@ except ImportError:
     cython_baoab_available = False
     cython_feedback_baoab_available = False
 
-print("Cython BAOAB solver available =", cython_baoab_available)
-print("Cython feedback BAOAB solver available =", cython_feedback_baoab_available)
+log(f"Cython BAOAB solver available = {cython_baoab_available}", verbose=True)
+log(
+    f"Cython feedback BAOAB solver available = {cython_feedback_baoab_available}",
+    verbose=True,
+)
 
 script_start_time = perf_counter()
 
+
 # ****************************************************************************************************************************************************
-# Constants
+# Main True/False switches for common run modes.
+# ****************************************************************************************************************************************************
+
+use_brownian_motion = True                        # Include random thermal kicks from gas collisions.
+use_laser_power_noise = True                      # Add laser-power fluctuations during the trajectory.
+damping = True                                    # Include gas damping/drag.
+use_pd_feedback = False                           # Enable delayed PD feedback control of laser power.
+terminate_on_trap_loss = False                    # Stop early if the particle leaves the trap region.
+use_force_lookup_table = True                     # Use a precomputed force table for faster force calls.
+display_plots = False                             # Show plots interactively instead of only saving them.
+include_z_detector_resolution_psd = False         # Take into account 100nm resolution on detector
+
+
+# Optional diagnostic plots. These are useful while validating the model, but
+# leave them off for a clean default run.
+
+include_uncoupled_nonlinear_psd = False
+plot_position_histogram_linear_prediction = False
+plot_uncoupled_vertical_histogram = False
+plot_vertical_expected_distribution_comparison = False
+plot_aligned_summary_figure = False
+
+
+
+# ****************************************************************************************************************************************************
+# PHYSICAL CONSTANTS 
 # ****************************************************************************************************************************************************
 g = 9.81
 c_light = 299792458
 
 # ****************************************************************************************************************************************************
-# User-adjustable parameters
+# USER SETTINGS CONTINUED - simulation parameters
 # ****************************************************************************************************************************************************
 # Particle properties
-radius = 6.3e-6          # m
-density = 1100         # kg/m^3
-n_particle = 1.555      # particle refractive index
-n_medium = 1.00027     # surrounding medium refractive index, air
+radius = 6.3e-6       # m
+density = 1100        # kg/m^3
+n_particle = 1.555    # particle refractive index
+n_medium = 1.00027    # surrounding medium refractive index, air
 
 # Gas properties
-p = 100        # pressure, Pa
+p = 100           # pressure, Pa
 T = 300           # impinging/ambient gas temperature, K
 eta = 1.8e-5      # dynamic viscosity of air, Pa s
 M_air = 0.029     # molar mass of air, kg/mol
@@ -183,23 +163,19 @@ kB = 1.38e-23
 d_air = 3.7e-10
 
 # Laser / force parameters
-w0 = 2.97e-6        # beam waist, m
+w0 = 2.97e-6      # beam waist, m
 wavelength = 532e-9
 M2 = 1.2
 use_m2_rayleigh_range = True
 zR_manual = 100e-6
-P_laser = 0.1             # W, example laser power
-use_laser_power_noise = True
+P_laser = 0.1     # W, example laser power
 laser_noise_model = "square"
 # Choose one of:
 #   "square"       original bounded pseudo-square-wave power noise
 #   "psd_matched"  synthetic noise generated from the measured laser-power PSD
 laser_noise_fraction = 0.01
 laser_noise_frequency=300
-laser_noise_step_duration = 1/laser_noise_frequency     # s
-laser_noise_power_csv_path = (
-    Path("/Users/josephwhitfield/Masters/Summer Project/Power_30min.csv")
-)
+laser_noise_step_duration = 1/laser_noise_frequency    # s
 laser_noise_psd_matched_seed = 12345
 laser_noise_equilibrium_grid_points = 21
 
@@ -207,7 +183,7 @@ laser_noise_equilibrium_grid_points = 21
 ray_grid_points = 100
 
 # Photophoretic force parameters
-k_particle = 0.135       # W/(m K)
+k_particle = 0.135    # W/(m K)
 alpha_acc = 1.0
 kappa_t = 1.14
 extinction_coefficient = 3e-6
@@ -218,7 +194,6 @@ absorption_fraction = 1 - np.exp(
 )
 
 # 3D force lookup table
-use_force_lookup_table = True
 force_lookup_grid_points_r = 101
 force_lookup_grid_points_z = 801
 force_lookup_r_min = 0.0
@@ -241,7 +216,6 @@ root_finding_rtol = 1e-15
 numerical_derivative_step = 1e-9
 
 # Damping model
-damping=True
 drag_model = "auto"
 # Choose one of:
 #   "stokes"       continuum Stokes drag, best for Kn << 1
@@ -269,7 +243,6 @@ dt_baoab = 1 / 350000
 
 # Brownian motion
 # Set to False to remove the random thermal kicks while keeping gas damping.
-use_brownian_motion = True
 brownian_seed = 90089
 laser_noise_seed = 789
 
@@ -277,7 +250,6 @@ laser_noise_seed = 789
 # The automatic limits are intentionally wider than the thermal motion but
 # local to the trapped region. Set either manual limit to a number in metres to
 # override the corresponding automatic value.
-terminate_on_trap_loss = False
 trap_loss_check_interval_steps = 1000
 trap_loss_radial_limit_manual = None
 trap_loss_axial_limit_manual = None
@@ -291,18 +263,17 @@ trap_loss_post_loss_plot_time = 3.0
 
 # Optional laser feedback loop
 # Set this to True to add a delayed PD loop that reads z and varies laser power.
-use_pd_feedback = False
-feedback_update_frequency = 20000              # Hz, 50 microsecond updates
+feedback_update_frequency = 20000                              # Hz, 50 microsecond updates
 feedback_noise_seed = 17
 use_feedback_position_noise = True
-feedback_position_noise_rms = 0e-9           # m RMS
+feedback_position_noise_rms = 0e-9                             # m RMS
 feedback_total_loop_frequency=20000
-feedback_total_loop_delay = 1/feedback_total_loop_frequency            # s
-feedback_kp_multiplier = 0.2                  # Kp = this number * axial spring constant kz
-feedback_kd_multiplier = 8.0                  # Kd = this number * gas damping coefficient b
-feedback_power_min_factor = 0.80              # minimum command = this * nominal power
-feedback_power_max_factor = 1.20              # maximum command = this * nominal power
-feedback_velocity_filter_alpha = 0.25         # lower values smooth velocity more
+feedback_total_loop_delay = 1/feedback_total_loop_frequency    # s
+feedback_kp_multiplier = 0.2                                   # Kp = this number * axial spring constant kz
+feedback_kd_multiplier = 8.0                                   # Kd = this number * gas damping coefficient b
+feedback_power_min_factor = 0.80                               # minimum command = this * nominal power
+feedback_power_max_factor = 1.20                               # maximum command = this * nominal power
+feedback_velocity_filter_alpha = 0.25                          # lower values smooth velocity more
 
 # Numerical tolerances
 focus_zero_tolerance = 1e-30
@@ -310,16 +281,6 @@ radial_zero_tolerance = 1e-30
 near_axis_tolerance = 1e-12
 
 # Plotting and diagnostic ranges
-run_power_pressure_scan = False
-power_pressure_scan_powers = [0.005, 0.10]
-power_pressure_scan_pressures = [1.0, 100.0, 100000.0]
-power_pressure_scan_save_path = SCRIPT_DIR / "power and pressure"
-run_diameter_scan = False
-diameter_scan_diameters_um = np.linspace(10.0, 100.0, 10)
-diameter_scan_power = 0.3
-diameter_scan_pressure = 100.0
-diameter_scan_save_path = SCRIPT_DIR / "diamter"
-display_plots = False
 max_plot_points = 200000
 psd_plot_max_frequency_override = None
 psd_min_frequency_factor = 0.95
@@ -331,12 +292,6 @@ welch_average_segment_duration_seconds = 2.0
 psd_segment_samples = None
 psd_overlap_fraction = 0.5
 psd_overlap_samples = None
-include_z_detector_resolution_psd = False
-include_uncoupled_nonlinear_psd = False
-plot_position_histogram_linear_prediction = False
-plot_uncoupled_vertical_histogram = False
-plot_vertical_expected_distribution_comparison = False
-plot_aligned_summary_figure = False
 detector_position_resolution_nm = 100.0
 transverse_force_x_min = -40e-6
 transverse_force_x_max = 40e-6
@@ -372,221 +327,18 @@ trajectory_projection_figsize = poster_wide_figsize
 force_check_figsize = poster_single_figsize
 force_field_figsize = poster_single_figsize
 
-if power_pressure_scan_child:
-    P_laser = float(os.environ.get("POWER_PRESSURE_SCAN_POWER", P_laser))
-    p = float(os.environ.get("POWER_PRESSURE_SCAN_PRESSURE", p))
-    display_plots = False
-    include_z_detector_resolution_psd = False
-    include_uncoupled_nonlinear_psd = False
-    plot_position_histogram_linear_prediction = False
-    plot_uncoupled_vertical_histogram = False
-    plot_vertical_expected_distribution_comparison = False
-    use_pd_feedback = False
+fontsize=11
 
-if diameter_scan_child:
-    radius = 0.5e-6 * float(os.environ.get("DIAMETER_SCAN_DIAMETER_UM", 2 * radius * 1e6))
-    P_laser = float(os.environ.get("DIAMETER_SCAN_POWER", diameter_scan_power))
-    p = float(os.environ.get("DIAMETER_SCAN_PRESSURE", diameter_scan_pressure))
-    display_plots = False
-    include_z_detector_resolution_psd = False
-    include_uncoupled_nonlinear_psd = False
-    plot_position_histogram_linear_prediction = False
-    plot_uncoupled_vertical_histogram = False
-    plot_vertical_expected_distribution_comparison = False
-    use_pd_feedback = False
 
-if run_power_pressure_scan and not power_pressure_scan_child:
-    os.makedirs(power_pressure_scan_save_path, exist_ok=True)
-    print("Running power/pressure scan.")
-    print("Saving plots to:", power_pressure_scan_save_path)
-
-    completed_scan_runs = 0
-
-    for scan_power in power_pressure_scan_powers:
-        for scan_pressure in power_pressure_scan_pressures:
-            print()
-            print(
-                "Running scan point: "
-                f"P = {scan_power:g} W, p = {scan_pressure:g} Pa"
-            )
-            scan_environment = os.environ.copy()
-            scan_environment["POWER_PRESSURE_SCAN_CHILD"] = "1"
-            scan_environment["POWER_PRESSURE_SCAN_POWER"] = str(scan_power)
-            scan_environment["POWER_PRESSURE_SCAN_PRESSURE"] = str(scan_pressure)
-            scan_environment["PROJECT_3D_SAVE_PATH"] = str(power_pressure_scan_save_path)
-
-            scan_result = subprocess.run(
-                [sys.executable, str(SCRIPT_DIR / "project_3d_cython.py")],
-                env=scan_environment,
-                check=False
-            )
-
-            if scan_result.returncode == 0:
-                completed_scan_runs += 1
-            else:
-                print(
-                    "Scan point failed with return code",
-                    scan_result.returncode
-                )
-
-    print()
-    print(
-        "Power/pressure scan complete:",
-        completed_scan_runs,
-        "of",
-        len(power_pressure_scan_powers) * len(power_pressure_scan_pressures),
-        "plots generated."
-    )
-    sys.exit(0)
-
-if run_diameter_scan and not diameter_scan_child:
-    os.makedirs(diameter_scan_save_path, exist_ok=True)
-    print("Running diameter scan.")
-    print("Saving plots to:", diameter_scan_save_path)
-    print("Power =", diameter_scan_power, "W")
-    print("Pressure =", diameter_scan_pressure, "Pa")
-
-    diameter_scan_metrics = []
-
-    for scan_diameter_um in diameter_scan_diameters_um:
-        print()
-        print(f"Running diameter scan point: d = {scan_diameter_um:g} um")
-        scan_environment = os.environ.copy()
-        scan_environment["DIAMETER_SCAN_CHILD"] = "1"
-        scan_environment["DIAMETER_SCAN_DIAMETER_UM"] = str(scan_diameter_um)
-        scan_environment["DIAMETER_SCAN_POWER"] = str(diameter_scan_power)
-        scan_environment["DIAMETER_SCAN_PRESSURE"] = str(diameter_scan_pressure)
-        scan_environment["PROJECT_3D_SAVE_PATH"] = str(diameter_scan_save_path)
-
-        scan_result = subprocess.run(
-            [sys.executable, str(SCRIPT_DIR / "project_3d_cython.py")],
-            env=scan_environment,
-            check=False,
-            capture_output=True,
-            text=True
-        )
-
-        print(scan_result.stdout, end="")
-        if scan_result.stderr:
-            print(scan_result.stderr, end="")
-
-        if scan_result.returncode != 0:
-            print("Diameter scan point failed with return code", scan_result.returncode)
-            continue
-
-        for output_line in scan_result.stdout.splitlines():
-            if output_line.startswith("DIAMETER_SCAN_METRICS "):
-                diameter_scan_metrics.append(
-                    json.loads(output_line.removeprefix("DIAMETER_SCAN_METRICS "))
-                )
-                break
-
-    if diameter_scan_metrics:
-        diameter_scan_metrics.sort(key=lambda row: row["diameter_um"])
-        metrics_csv_path = diameter_scan_save_path / "diameter_scan_summary.csv"
-        with open(metrics_csv_path, "w", newline="") as csv_file:
-            fieldnames = [
-                "diameter_um",
-                "power_W",
-                "pressure_Pa",
-                "equilibrium_z_um",
-                "kx_N_per_m",
-                "kz_N_per_m",
-                "fx_Hz",
-                "fz_Hz",
-                "rms_x_um",
-                "rms_z_um",
-            ]
-            writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(diameter_scan_metrics)
-
-        diameter_values = np.array([row["diameter_um"] for row in diameter_scan_metrics])
-
-        def metric_values(metric_name):
-            return np.array([row[metric_name] for row in diameter_scan_metrics])
-
-        plt.figure(figsize=poster_single_figsize)
-        plt.plot(diameter_values, metric_values("equilibrium_z_um"), marker="o")
-        plt.xlabel("Particle diameter (μm)")
-        plt.ylabel("Equilibrium z position (μm)")
-        plt.title("Equilibrium position vs diameter")
-        plt.grid()
-        plt.tight_layout()
-        plt.savefig(
-            diameter_scan_save_path / "diameter_scan_equilibrium_z.png",
-            bbox_inches="tight",
-            facecolor="white",
-            transparent=False
-        )
-        plt.close()
-
-        plt.figure(figsize=poster_single_figsize)
-        plt.plot(diameter_values, metric_values("kx_N_per_m"), marker="o", label="kx")
-        plt.plot(diameter_values, metric_values("kz_N_per_m"), marker="o", label="kz")
-        plt.xlabel("Particle diameter (μm)")
-        plt.ylabel("Trap stiffness (N m^-1)")
-        plt.title("Trap stiffness vs diameter")
-        plt.legend()
-        plt.grid()
-        plt.tight_layout()
-        plt.savefig(
-            diameter_scan_save_path / "diameter_scan_stiffness.png",
-            bbox_inches="tight",
-            facecolor="white",
-            transparent=False
-        )
-        plt.close()
-
-        plt.figure(figsize=poster_single_figsize)
-        plt.plot(diameter_values, metric_values("fx_Hz"), marker="o", label="x")
-        plt.plot(diameter_values, metric_values("fz_Hz"), marker="o", label="z")
-        plt.xlabel("Particle diameter (μm)")
-        plt.ylabel("Resonant frequency (Hz)")
-        plt.title("Resonant frequency vs diameter")
-        plt.legend()
-        plt.grid()
-        plt.tight_layout()
-        plt.savefig(
-            diameter_scan_save_path / "diameter_scan_resonant_frequency.png",
-            bbox_inches="tight",
-            facecolor="white",
-            transparent=False
-        )
-        plt.close()
-
-        plt.figure(figsize=poster_single_figsize)
-        plt.plot(diameter_values, metric_values("rms_x_um"), marker="o", label="x")
-        plt.plot(diameter_values, metric_values("rms_z_um"), marker="o", label="z")
-        plt.xlabel("Particle diameter (μm)")
-        plt.ylabel("RMS displacement (μm)")
-        plt.title("RMS displacement vs diameter")
-        plt.legend()
-        plt.grid()
-        plt.tight_layout()
-        plt.savefig(
-            diameter_scan_save_path / "diameter_scan_rms.png",
-            bbox_inches="tight",
-            facecolor="white",
-            transparent=False
-        )
-        plt.close()
-
-        print()
-        print("Saved diameter summary CSV:", metrics_csv_path)
-
-    print()
-    print(
-        "Diameter scan complete:",
-        len(diameter_scan_metrics),
-        "of",
-        len(diameter_scan_diameters_um),
-        "scan points completed."
-    )
-    sys.exit(0)
-
+# ****************************************************************************************************************************************************
+# OUTPUT HELPERS - all generated files should go through save_path
+# ****************************************************************************************************************************************************
 
 plot_data_counter = 0
+
+
+def output_path(filename):
+    return save_path / filename
 
 
 def save_plot_data_csv(fig, csv_path):
@@ -613,66 +365,25 @@ def save_plot_data_csv(fig, csv_path):
 
 
 def make_legends_transparent(fig):
-    for axis in fig.axes:
-        legend = axis.get_legend()
-        if legend is not None:
-            legend.set_frame_on(False)
-            frame = legend.get_frame()
-            frame.set_facecolor("none")
-            frame.set_edgecolor("none")
-            frame.set_alpha(0.0)
-            frame.set_linewidth(0.0)
-
-    for legend in fig.legends:
-        legend.set_frame_on(False)
-        frame = legend.get_frame()
-        frame.set_facecolor("none")
-        frame.set_edgecolor("none")
-        frame.set_alpha(0.0)
-        frame.set_linewidth(0.0)
+    return
 
 
 def apply_plot_text_style(fig):
-    for axis in fig.axes:
-        axis.tick_params(axis="both", which="both", labelsize=axis_label_fontsize)
-        if hasattr(axis, "zaxis"):
-            axis.tick_params(axis="z", which="both", labelsize=axis_label_fontsize)
+    return
 
 
 def finish_plot(name=None, fig=None):
     target_fig = fig if fig is not None else plt.gcf()
-    original_name = name
-
-    scan_child = power_pressure_scan_child or diameter_scan_child
-
-    if scan_child and name != "psd_xz_welch":
-        plt.close(target_fig)
-        return
 
     if name is not None:
-        if power_pressure_scan_child and name == "psd_xz_welch":
-            power_text = f"{P_laser:g}".replace(".", "p")
-            pressure_text = f"{p:g}".replace(".", "p")
-            name = f"welch_psd_xz_power_{power_text}W_pressure_{pressure_text}Pa"
-
-        if diameter_scan_child and name == "psd_xz_welch":
-            diameter_um = 2 * radius * 1e6
-            diameter_text = f"{diameter_um:g}".replace(".", "p")
-            power_text = f"{P_laser:g}".replace(".", "p")
-            pressure_text = f"{p:g}".replace(".", "p")
-            name = (
-                f"welch_psd_xz_diameter_{diameter_text}um_"
-                f"power_{power_text}W_pressure_{pressure_text}Pa"
-            )
-
         make_legends_transparent(target_fig)
         apply_plot_text_style(target_fig)
-        target_fig.savefig(os.path.join(save_path, f"{name}.png"), bbox_inches="tight", facecolor="white", transparent=False)
-
-        if scan_child and original_name == "psd_xz_welch":
-            print("Saved scan plot:", os.path.join(save_path, f"{name}.png"))
-            plt.close(target_fig)
-            sys.exit(0)
+        target_fig.savefig(
+            output_path(f"{name}.png"),
+            bbox_inches="tight",
+            facecolor="white",
+            transparent=False,
+        )
 
     if display_plots:
         plt.show()
@@ -681,7 +392,7 @@ def finish_plot(name=None, fig=None):
 
 
 # ****************************************************************************************************************************************************
-# Derived quantities
+# DERIVED QUANTITIES - calculated from the settings above
 # ****************************************************************************************************************************************************
 volume = (4/3) * np.pi * radius**3
 m = density * volume
@@ -693,7 +404,7 @@ Kn = lambda_mfp / radius
 zR_m2 = np.pi * w0**2 / (M2 * wavelength)
 zR = zR_m2 if use_m2_rayleigh_range else zR_manual
 
-I0 = 2 * P_laser / (np.pi * w0**2)   # Gaussian peak intensity, W/m^2
+I0 = 2 * P_laser / (np.pi * w0**2)    # Gaussian peak intensity, W/m^2
 
 
 def buoyancy_force(pressure=None):
@@ -809,24 +520,13 @@ def ashkin_efficiencies_from_reflectance(fresnel_R):
     fresnel_T = 1 - fresnel_R
     denom = 1 + fresnel_R**2 + 2 * fresnel_R * np.cos(2 * theta_r)
 
-    Q_scat = (
-        1
-        + fresnel_R * np.cos(2 * theta_i)
-        - (
-            fresnel_T**2
-            * (np.cos(2 * theta_i - 2 * theta_r) + fresnel_R * np.cos(2 * theta_i))
-            / denom
-        )
-    )
+    cos_2theta_i = np.cos(2 * theta_i)
+    sin_2theta_i = np.sin(2 * theta_i)
+    cos_refracted_angle = np.cos(2 * theta_i - 2 * theta_r)
+    sin_refracted_angle = np.sin(2 * theta_i - 2 * theta_r)
 
-    Q_grad = (
-        fresnel_R * np.sin(2 * theta_i)
-        - (
-            fresnel_T**2
-            * (np.sin(2 * theta_i - 2 * theta_r) + fresnel_R * np.sin(2 * theta_i))
-            / denom
-        )
-    )
+    Q_scat = 1 + fresnel_R * cos_2theta_i - fresnel_T**2 * (cos_refracted_angle + fresnel_R * cos_2theta_i) / denom
+    Q_grad = fresnel_R * sin_2theta_i - fresnel_T**2 * (sin_refracted_angle + fresnel_R * sin_2theta_i) / denom
     return Q_scat, Q_grad
 
 
@@ -983,14 +683,7 @@ def photophoretic_force_magnitude(x, z, power_factor=1.0):
 
     I_abs = absorbed_intensity(x, z, power_factor)
 
-    F_max = (
-        0.5
-        * radius**2
-        * D
-        * np.sqrt(alpha_acc / 2)
-        * I_abs
-        / k_particle
-    )
+    F_max = 0.5 * radius**2 * D * np.sqrt(alpha_acc / 2) * I_abs / k_particle
 
     return 2 * F_max / ((p / p_max_ph) + (p_max_ph / p))
 
@@ -1167,14 +860,8 @@ def F_optical_3d_lookup(x, y, z, power_factor=1.0):
 
     r_arr = np.sqrt(x_arr**2 + y_arr**2)
 
-    r_inside = (
-        np.min(r_arr) >= force_lookup_r_values[0]
-        and np.max(r_arr) <= force_lookup_r_values[-1]
-    )
-    z_inside = (
-        np.min(z_arr) >= force_lookup_z_values[0]
-        and np.max(z_arr) <= force_lookup_z_values[-1]
-    )
+    r_inside = np.min(r_arr) >= force_lookup_r_values[0] and np.max(r_arr) <= force_lookup_r_values[-1]
+    z_inside = np.min(z_arr) >= force_lookup_z_values[0] and np.max(z_arr) <= force_lookup_z_values[-1]
 
     if not (r_inside and z_inside):
         return F_optical_3d_direct(x, y, z, power_factor)
@@ -1256,18 +943,8 @@ def F_optical_3d_lookup_scalar_clamped(x, y, z, power_factor=1.0):
     Fz01 = force_lookup_Fz_table[ir, iz + 1]
     Fz11 = force_lookup_Fz_table[ir + 1, iz + 1]
 
-    Fr_nominal = (
-        (1 - r_weight) * (1 - z_weight) * Fr00
-        + r_weight * (1 - z_weight) * Fr10
-        + (1 - r_weight) * z_weight * Fr01
-        + r_weight * z_weight * Fr11
-    )
-    Fz_nominal = (
-        (1 - r_weight) * (1 - z_weight) * Fz00
-        + r_weight * (1 - z_weight) * Fz10
-        + (1 - r_weight) * z_weight * Fz01
-        + r_weight * z_weight * Fz11
-    )
+    Fr_nominal = (1 - r_weight) * (1 - z_weight) * Fr00 + r_weight * (1 - z_weight) * Fr10 + (1 - r_weight) * z_weight * Fr01 + r_weight * z_weight * Fr11
+    Fz_nominal = (1 - r_weight) * (1 - z_weight) * Fz00 + r_weight * (1 - z_weight) * Fz10 + (1 - r_weight) * z_weight * Fz01 + r_weight * z_weight * Fz11
 
     Fr = power_factor * Fr_nominal
     Fz = power_factor * Fz_nominal
@@ -1405,12 +1082,12 @@ expected_fx = omega_x / (2 * np.pi)
 expected_fy = omega_y / (2 * np.pi)
 expected_fz = omega_z / (2 * np.pi)
 
-print("Effective spring constant kx =", kx, "N/m")
-print("Effective spring constant ky =", ky, "N/m")
-print("Effective spring constant kz =", kz, "N/m")
-print("Expected x resonant frequency =", expected_fx, "Hz")
-print("Expected y resonant frequency =", expected_fy, "Hz")
-print("Expected z resonant frequency =", expected_fz, "Hz")
+log(f"Effective spring constant kx = {kx} N/m", verbose=True)
+log(f"Effective spring constant ky = {ky} N/m", verbose=True)
+log(f"Effective spring constant kz = {kz} N/m", verbose=True)
+log(f"Expected x resonant frequency = {expected_fx} Hz", verbose=True)
+log(f"Expected y resonant frequency = {expected_fy} Hz", verbose=True)
+log(f"Expected z resonant frequency = {expected_fz} Hz", verbose=True)
 
 # ****************************************************************************************************************************************************
 # Nonlinear force compared with the local linear approximation
@@ -1532,11 +1209,7 @@ def print_force_difference_table(axis_label, displacement_offsets_um, nonlinear_
             linear_force,
             displacement_um
         )
-        percentage_text = (
-            "undefined"
-            if percentage_difference is None
-            else f"{percentage_difference:.3g}"
-        )
+        percentage_text = "undefined" if percentage_difference is None else f"{percentage_difference:.3g}"
         print(
             f"{displacement_um:>31.1f} | "
             f"{nonlinear_force:>18.6e} | "
@@ -1557,12 +1230,13 @@ x_table_percentage_differences = percentage_difference_array(
     x_table_nonlinear_forces,
     x_table_linear_forces
 )
-print_force_difference_table(
-    "x",
-    x_table_offsets_um,
-    x_table_nonlinear_forces,
-    x_table_linear_forces
-)
+if verbose_output:
+    print_force_difference_table(
+        "x",
+        x_table_offsets_um,
+        x_table_nonlinear_forces,
+        x_table_linear_forces
+    )
 
 z_table_offsets_um = np.arange(-100.0, 100.0 + 0.5, 20.0)
 z_table_positions = z_eq + z_table_offsets_um * 1e-6
@@ -1576,12 +1250,13 @@ z_table_percentage_differences = percentage_difference_array(
     z_table_nonlinear_forces,
     z_table_linear_forces
 )
-print_force_difference_table(
-    "z",
-    z_table_offsets_um,
-    z_table_nonlinear_forces,
-    z_table_linear_forces
-)
+if verbose_output:
+    print_force_difference_table(
+        "z",
+        z_table_offsets_um,
+        z_table_nonlinear_forces,
+        z_table_linear_forces
+    )
 
 plt.figure(figsize=force_check_figsize)
 plt.plot(
@@ -1683,10 +1358,7 @@ def cunningham_correction(Kn):
     if Kn <= 0:
         return 1.0
 
-    return 1 + Kn * (
-        cunningham_A
-        + cunningham_B * np.exp(-cunningham_C / Kn)
-    )
+    return 1 + Kn * (cunningham_A + cunningham_B * np.exp(-cunningham_C / Kn))
 
 
 def damping_coefficient_stokes():
@@ -1749,10 +1421,7 @@ def transition_blend_weight(
 
     log_Kn = np.log10(Kn)
     log_transition = np.log10(transition_Kn)
-    u = (
-        log_Kn
-        - (log_transition - half_width_decades)
-    ) / (2.0 * half_width_decades)
+    u = (log_Kn - (log_transition - half_width_decades)) / (2.0 * half_width_decades)
 
     return smoothstep(u)
 
@@ -1802,15 +1471,9 @@ def damping_coefficient_auto_smooth(pressure):
     stokes_cunningham_weight = transition_blend_weight(Kn, 0.1)
     cunningham_epstein_weight = transition_blend_weight(Kn, 10.0)
 
-    b_low = (
-        (1.0 - stokes_cunningham_weight) * b_stokes_local
-        + stokes_cunningham_weight * b_cunningham_local
-    )
+    b_low = (1.0 - stokes_cunningham_weight) * b_stokes_local + stokes_cunningham_weight * b_cunningham_local
 
-    return (
-        (1.0 - cunningham_epstein_weight) * b_low
-        + cunningham_epstein_weight * b_epstein_local
-    )
+    return (1.0 - cunningham_epstein_weight) * b_low + cunningham_epstein_weight * b_epstein_local
 
 
 def damping_coefficient(pressure, model="auto"):
@@ -1880,22 +1543,9 @@ az_initial = (Fz_initial - effective_weight_force()) / m
 if use_force_lookup_table:
     # Keep the lookup region local to the trap. If the particle leaves this
     # region, F_optical_3d automatically falls back to the direct ray sum.
-    force_lookup_r_thermal_limit = (
-        force_lookup_r_thermal_factor * x_rms_thermal
-        if np.isfinite(x_rms_thermal)
-        else 0.0
-    )
-    force_lookup_z_thermal_limit = (
-        force_lookup_z_thermal_factor * z_rms_thermal
-        if np.isfinite(z_rms_thermal)
-        else 0.0
-    )
-    force_lookup_r_max = max(
-        force_lookup_r_base_max,
-        force_lookup_r_displacement_factor
-        * np.sqrt(x_displacement**2 + y_displacement**2),
-        force_lookup_r_thermal_limit
-    )
+    force_lookup_r_thermal_limit = force_lookup_r_thermal_factor * x_rms_thermal if np.isfinite(x_rms_thermal) else 0.0
+    force_lookup_z_thermal_limit = force_lookup_z_thermal_factor * z_rms_thermal if np.isfinite(z_rms_thermal) else 0.0
+    force_lookup_r_max = max(force_lookup_r_base_max, force_lookup_r_displacement_factor * np.sqrt(x_displacement**2 + y_displacement**2), force_lookup_r_thermal_limit)
     force_lookup_z_half_width = max(
         force_lookup_z_base_half_width,
         force_lookup_z_displacement_factor * abs(z_displacement),
@@ -1948,16 +1598,8 @@ if use_force_lookup_table:
         force_lookup_z_half_width
     )
 
-trap_loss_radial_limit = (
-    trap_loss_radial_limit_auto
-    if trap_loss_radial_limit_manual is None
-    else trap_loss_radial_limit_manual
-)
-trap_loss_axial_limit = (
-    trap_loss_axial_limit_auto
-    if trap_loss_axial_limit_manual is None
-    else trap_loss_axial_limit_manual
-)
+trap_loss_radial_limit = trap_loss_radial_limit_auto if trap_loss_radial_limit_manual is None else trap_loss_radial_limit_manual
+trap_loss_axial_limit = trap_loss_axial_limit_auto if trap_loss_axial_limit_manual is None else trap_loss_axial_limit_manual
 
 if trap_loss_radial_limit <= 0:
     raise ValueError("trap_loss_radial_limit must be positive.")
@@ -1992,16 +1634,11 @@ def trap_region_metrics(x, y, z):
 
 def is_inside_capture_region(x, y, z, tolerance=1.0):
     radial_displacement, axial_displacement, _, _ = trap_region_metrics(x, y, z)
-    return (
-        radial_displacement <= tolerance * trap_loss_radial_limit
-        and abs(axial_displacement) <= tolerance * trap_loss_axial_limit
-    )
+    return radial_displacement <= tolerance * trap_loss_radial_limit and abs(axial_displacement) <= tolerance * trap_loss_axial_limit
 
 
 def is_reentering_capture_region(x, y, z, vx, vy, vz):
-    radial_displacement, axial_displacement, outside_radial, outside_axial = (
-        trap_region_metrics(x, y, z)
-    )
+    radial_displacement, axial_displacement, outside_radial, outside_axial = trap_region_metrics(x, y, z)
 
     if not (outside_radial or outside_axial):
         return True
@@ -2061,9 +1698,7 @@ def trap_loss_reason(x, y, z, vx, vy, vz, power_factor, sample_index, loss_state
     if not np.all(np.isfinite([x, y, z, vx, vy, vz])):
         return "position or velocity became non-finite"
 
-    radial_displacement, axial_displacement, outside_radial, outside_axial = (
-        trap_region_metrics(x, y, z)
-    )
+    radial_displacement, axial_displacement, outside_radial, outside_axial = trap_region_metrics(x, y, z)
 
     if not (outside_radial or outside_axial):
         loss_state["outside_start_sample"] = None
@@ -2274,6 +1909,14 @@ def generate_square_laser_power_factor(time_values):
 
 
 def generate_psd_matched_laser_power_factor(time_values):
+    if not laser_noise_power_csv_path.exists():
+        raise FileNotFoundError(
+            "PSD-matched laser noise requires a measured power CSV. "
+            f"Expected: {laser_noise_power_csv_path}. "
+            "Either place the file there, update laser_noise_power_csv_path in "
+            "USER SETTINGS, or set laser_noise_model = 'square'."
+        )
+
     measured_time, measured_power = load_laser_power_csv(laser_noise_power_csv_path)
     _, measured_power_uniform, measured_fs = resample_to_uniform_time_grid(
         measured_time,
@@ -2415,17 +2058,11 @@ if laser_noise_model == "psd_matched" and use_laser_power_noise:
     # optical force scales linearly with power, the small equilibrium shift can
     # be estimated from the local axial stiffness.
     z_equilibrium_power_sensitivity = effective_weight_force() / kz
-    z_eq_laser_noise_time = (
-        z_eq + z_equilibrium_power_sensitivity * (laser_power_factor - 1.0)
-    )
+    z_eq_laser_noise_time = z_eq + z_equilibrium_power_sensitivity * (laser_power_factor - 1.0)
     laser_equilibrium_power_factors = np.array(
         [np.min(laser_power_factor), 1.0, np.max(laser_power_factor)]
     )
-    laser_equilibrium_z_values = (
-        z_eq
-        + z_equilibrium_power_sensitivity
-        * (laser_equilibrium_power_factors - 1.0)
-    )
+    laser_equilibrium_z_values = z_eq + z_equilibrium_power_sensitivity * (laser_equilibrium_power_factors - 1.0)
     instantaneous_z_equilibrium_by_power_factor = dict(
         zip(laser_equilibrium_power_factors, laser_equilibrium_z_values)
     )
@@ -2485,42 +2122,43 @@ else:
 
 gamma_baoab = b / m
 baoab_damping_factor = np.exp(-gamma_baoab * dt_baoab)
-baoab_thermal_velocity_scale = np.sqrt(
-    (kB * T / m)
-    * (1 - baoab_damping_factor**2)
-)
+baoab_thermal_velocity_scale = np.sqrt((kB * T / m) * (1 - baoab_damping_factor**2))
 
-print("Brownian bath temperature =", T, "K")
-print("Trajectory damping rate gamma =", gamma_baoab, "s^-1")
-print("Laser power noise enabled =", use_laser_power_noise)
-print("Laser power noise model =", laser_noise_model)
-print(
-    "Laser power factor range =",
-    np.min(laser_power_factor),
-    "to",
-    np.max(laser_power_factor)
+log(f"Brownian bath temperature = {T} K", verbose=True)
+log(f"Trajectory damping rate gamma = {gamma_baoab} s^-1", verbose=True)
+log(f"Laser power noise enabled = {use_laser_power_noise}", verbose=True)
+log(f"Laser power noise model = {laser_noise_model}", verbose=True)
+log(
+    "Laser power factor range = "
+    f"{np.min(laser_power_factor)} to {np.max(laser_power_factor)}",
+    verbose=True,
 )
-print("Laser power factor RMS =", np.std(laser_power_factor - 1.0, ddof=1))
+log(
+    f"Laser power factor RMS = {np.std(laser_power_factor - 1.0, ddof=1)}",
+    verbose=True,
+)
 
 if laser_noise_model == "psd_matched" and use_laser_power_noise:
-    print("PSD-matched laser noise CSV =", laser_noise_power_csv_path)
-    print(
-        "Measured laser-power sampling frequency =",
-        laser_noise_metadata["measured_sampling_frequency"],
-        "Hz"
+    log(f"PSD-matched laser noise CSV = {laser_noise_power_csv_path}", verbose=True)
+    log(
+        "Measured laser-power sampling frequency = "
+        f"{laser_noise_metadata['measured_sampling_frequency']} Hz",
+        verbose=True,
     )
-    print(
-        "Measured laser-power PSD Nyquist limit =",
-        laser_noise_metadata["measured_nyquist_frequency"],
-        "Hz"
+    log(
+        "Measured laser-power PSD Nyquist limit = "
+        f"{laser_noise_metadata['measured_nyquist_frequency']} Hz",
+        verbose=True,
     )
-    print(
-        "Measured laser-power relative RMS =",
-        laser_noise_metadata["measured_relative_rms"]
+    log(
+        "Measured laser-power relative RMS = "
+        f"{laser_noise_metadata['measured_relative_rms']}",
+        verbose=True,
     )
-    print(
-        "Synthetic laser-power relative RMS =",
-        laser_noise_metadata["synthetic_relative_rms"]
+    log(
+        "Synthetic laser-power relative RMS = "
+        f"{laser_noise_metadata['synthetic_relative_rms']}",
+        verbose=True,
     )
 
 # print("BAOAB timestep =", dt_baoab, "s")
@@ -2569,10 +2207,7 @@ def solve_baoab_uncoupled_nonlinear_1d(
         velocity_i += 0.5 * dt_baoab * force_i / m
         position_i += 0.5 * dt_baoab * velocity_i
 
-        velocity_i = (
-            baoab_damping_factor * velocity_i
-            + baoab_thermal_velocity_scale * brownian_normals[i]
-        )
+        velocity_i = baoab_damping_factor * velocity_i + baoab_thermal_velocity_scale * brownian_normals[i]
 
         position_i += 0.5 * dt_baoab * velocity_i
 
@@ -2631,18 +2266,9 @@ def solve_baoab_3d_with_power(
         y_i += 0.5 * dt_baoab * vy_i
         z_i += 0.5 * dt_baoab * vz_i
 
-        vx_i = (
-            baoab_damping_factor * vx_i
-            + baoab_thermal_velocity_scale * brownian_normals_x[i]
-        )
-        vy_i = (
-            baoab_damping_factor * vy_i
-            + baoab_thermal_velocity_scale * brownian_normals_y[i]
-        )
-        vz_i = (
-            baoab_damping_factor * vz_i
-            + baoab_thermal_velocity_scale * brownian_normals_z[i]
-        )
+        vx_i = baoab_damping_factor * vx_i + baoab_thermal_velocity_scale * brownian_normals_x[i]
+        vy_i = baoab_damping_factor * vy_i + baoab_thermal_velocity_scale * brownian_normals_y[i]
+        vz_i = baoab_damping_factor * vz_i + baoab_thermal_velocity_scale * brownian_normals_z[i]
 
         x_i += 0.5 * dt_baoab * vx_i
         y_i += 0.5 * dt_baoab * vy_i
@@ -2921,10 +2547,7 @@ def solve_baoab_3d_with_pd_feedback(
                 z_filtered = z_measured
                 measured_vz = 0.0
             else:
-                z_filtered = (
-                    feedback_velocity_filter_alpha * z_measured
-                    + (1 - feedback_velocity_filter_alpha) * filtered_z_previous
-                )
+                z_filtered = feedback_velocity_filter_alpha * z_measured + (1 - feedback_velocity_filter_alpha) * filtered_z_previous
                 measured_vz = (z_filtered - filtered_z_previous) / dt_control
 
             z_error = z_filtered - z_eq
@@ -2975,18 +2598,9 @@ def solve_baoab_3d_with_pd_feedback(
         y_i += 0.5 * dt_baoab * vy_i
         z_i += 0.5 * dt_baoab * vz_i
 
-        vx_i = (
-            baoab_damping_factor * vx_i
-            + baoab_thermal_velocity_scale * brownian_normals_x[i]
-        )
-        vy_i = (
-            baoab_damping_factor * vy_i
-            + baoab_thermal_velocity_scale * brownian_normals_y[i]
-        )
-        vz_i = (
-            baoab_damping_factor * vz_i
-            + baoab_thermal_velocity_scale * brownian_normals_z[i]
-        )
+        vx_i = baoab_damping_factor * vx_i + baoab_thermal_velocity_scale * brownian_normals_x[i]
+        vy_i = baoab_damping_factor * vy_i + baoab_thermal_velocity_scale * brownian_normals_y[i]
+        vz_i = baoab_damping_factor * vz_i + baoab_thermal_velocity_scale * brownian_normals_z[i]
 
         x_i += 0.5 * dt_baoab * vx_i
         y_i += 0.5 * dt_baoab * vy_i
@@ -3261,9 +2875,7 @@ baoab_laser_noise_without_brownian_start_time = perf_counter()
     zero_brownian_normals,
     "BAOAB laser noise without Brownian motion",
 )
-baoab_laser_noise_without_brownian_runtime = (
-    perf_counter() - baoab_laser_noise_without_brownian_start_time
-)
+baoab_laser_noise_without_brownian_runtime = perf_counter() - baoab_laser_noise_without_brownian_start_time
 
 feedback_result = None
 baoab_feedback_runtime = 0.0
@@ -3298,11 +2910,7 @@ x_uncoupled_nonlinear = None
 z_uncoupled_nonlinear = None
 vx_uncoupled_nonlinear = None
 vz_uncoupled_nonlinear = None
-run_uncoupled_nonlinear = (
-    include_uncoupled_nonlinear_psd
-    or plot_uncoupled_vertical_histogram
-    or plot_aligned_summary_figure
-)
+run_uncoupled_nonlinear = include_uncoupled_nonlinear_psd or plot_uncoupled_vertical_histogram or plot_aligned_summary_figure
 
 if run_uncoupled_nonlinear:
     uncoupled_nonlinear_start_time = perf_counter()
@@ -3319,10 +2927,7 @@ if run_uncoupled_nonlinear:
         brownian_normals_x
     )
     z_uncoupled_nonlinear, vz_uncoupled_nonlinear = solve_baoab_uncoupled_nonlinear_1d(
-        lambda z_position, power_factor: (
-            F_optical_3d(x_eq, y_eq, z_position, power_factor)[2]
-            - effective_weight_force()
-        ),
+        lambda z_position, power_factor: F_optical_3d(x_eq, y_eq, z_position, power_factor)[2] - effective_weight_force(),
         laser_power_factor,
         z0,
         vz0,
@@ -3424,21 +3029,12 @@ if use_pd_feedback:
     ):
         feedback_result[feedback_key] = feedback_result[feedback_key][feedback_control_mask]
 
-baoab_total_runtime = (
-    baoab_constant_power_runtime
-    + baoab_laser_noise_runtime
-    + baoab_laser_noise_without_brownian_runtime
-    + baoab_feedback_runtime
-    + uncoupled_nonlinear_runtime
-)
+baoab_total_runtime = baoab_constant_power_runtime + baoab_laser_noise_runtime + baoab_laser_noise_without_brownian_runtime + baoab_feedback_runtime + uncoupled_nonlinear_runtime
 
 x_laser_noise_difference = x_baoab - x_baoab_constant_power
 y_laser_noise_difference = y_baoab - y_baoab_constant_power
 z_laser_noise_difference = z_baoab - z_baoab_constant_power
-radial_laser_noise_difference = np.sqrt(
-    x_laser_noise_difference**2
-    + y_laser_noise_difference**2
-)
+radial_laser_noise_difference = np.sqrt(x_laser_noise_difference**2 + y_laser_noise_difference**2)
 
 x_brownian_difference = x_baoab - x_baoab_no_brownian
 y_brownian_difference = y_baoab - y_baoab_no_brownian
@@ -3465,49 +3061,51 @@ radial_laser_noise_max_nm = finite_abs_max(radial_laser_noise_difference) * 1e9
 z_laser_noise_rms_nm = finite_rms(z_laser_noise_difference) * 1e9
 z_laser_noise_max_nm = finite_abs_max(z_laser_noise_difference) * 1e9
 
-print("BAOAB constant-power runtime =", baoab_constant_power_runtime, "s")
-print("BAOAB laser-noise runtime =", baoab_laser_noise_runtime, "s")
-print("BAOAB laser-noise without-Brownian runtime =", baoab_laser_noise_without_brownian_runtime, "s")
-print("BAOAB feedback runtime =", baoab_feedback_runtime, "s")
-print("Uncoupled nonlinear reference runtime =", uncoupled_nonlinear_runtime, "s")
-print("BAOAB total runtime =", baoab_total_runtime, "s")
-print("RMS isolated laser-noise effect in x =", finite_rms(x_laser_noise_difference) * 1e9, "nm")
-print("RMS isolated laser-noise effect in y =", finite_rms(y_laser_noise_difference) * 1e9, "nm")
-print("RMS isolated laser-noise effect in radial position =", radial_laser_noise_rms_nm, "nm")
-print("RMS isolated laser-noise effect in z =", z_laser_noise_rms_nm, "nm")
-print("Max isolated laser-noise effect in x =", finite_abs_max(x_laser_noise_difference) * 1e9, "nm")
-print("Max isolated laser-noise effect in y =", finite_abs_max(y_laser_noise_difference) * 1e9, "nm")
-print("Max isolated laser-noise effect in radial position =", radial_laser_noise_max_nm, "nm")
-print("Max isolated laser-noise effect in z =", z_laser_noise_max_nm, "nm")
-if detector_position_resolution_nm > 0:
-    print(
-        "Max isolated radial laser-noise effect / detector resolution =",
-        radial_laser_noise_max_nm / detector_position_resolution_nm
+if verbose_output:
+    log(f"BAOAB constant-power runtime = {baoab_constant_power_runtime} s")
+    log(f"BAOAB laser-noise runtime = {baoab_laser_noise_runtime} s")
+    log(
+        "BAOAB laser-noise without-Brownian runtime = "
+        f"{baoab_laser_noise_without_brownian_runtime} s"
     )
-    print(
-        "Max isolated z laser-noise effect / detector resolution =",
-        z_laser_noise_max_nm / detector_position_resolution_nm
+    log(f"BAOAB feedback runtime = {baoab_feedback_runtime} s")
+    log(f"Uncoupled nonlinear reference runtime = {uncoupled_nonlinear_runtime} s")
+    log(f"BAOAB total runtime = {baoab_total_runtime} s")
+    log(
+        "RMS isolated laser-noise effect in x = "
+        f"{finite_rms(x_laser_noise_difference) * 1e9} nm"
     )
-print("Total calculation runtime, excluding graph-viewing time =", perf_counter() - script_start_time, "s")
-
-if diameter_scan_child:
-    print(
-        "DIAMETER_SCAN_METRICS "
-        + json.dumps(
-            {
-                "diameter_um": 2 * radius * 1e6,
-                "power_W": P_laser,
-                "pressure_Pa": p,
-                "equilibrium_z_um": z_eq * 1e6,
-                "kx_N_per_m": kx,
-                "kz_N_per_m": kz,
-                "fx_Hz": expected_fx,
-                "fz_Hz": expected_fz,
-                "rms_x_um": float(np.std(x_baoab - x_eq) * 1e6),
-                "rms_z_um": float(np.std(z_baoab - z_eq) * 1e6),
-            }
+    log(
+        "RMS isolated laser-noise effect in y = "
+        f"{finite_rms(y_laser_noise_difference) * 1e9} nm"
+    )
+    log(
+        "RMS isolated laser-noise effect in radial position = "
+        f"{radial_laser_noise_rms_nm} nm"
+    )
+    log(f"RMS isolated laser-noise effect in z = {z_laser_noise_rms_nm} nm")
+    log(
+        "Max isolated laser-noise effect in x = "
+        f"{finite_abs_max(x_laser_noise_difference) * 1e9} nm"
+    )
+    log(
+        "Max isolated laser-noise effect in y = "
+        f"{finite_abs_max(y_laser_noise_difference) * 1e9} nm"
+    )
+    log(
+        "Max isolated laser-noise effect in radial position = "
+        f"{radial_laser_noise_max_nm} nm"
+    )
+    log(f"Max isolated laser-noise effect in z = {z_laser_noise_max_nm} nm")
+    if detector_position_resolution_nm > 0:
+        log(
+            "Max isolated radial laser-noise effect / detector resolution = "
+            f"{radial_laser_noise_max_nm / detector_position_resolution_nm}"
         )
-    )
+        log(
+            "Max isolated z laser-noise effect / detector resolution = "
+            f"{z_laser_noise_max_nm / detector_position_resolution_nm}"
+        )
 
 # print(
     # "BAOAB constant-power RMS x from equilibrium =",
@@ -3561,6 +3159,17 @@ t_plot = t_baoab[plot_slice]
 
 # print("Plot stride =", plot_stride)
 # print("Number of plotted time samples =", len(t_plot))
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -3657,21 +3266,8 @@ for axis_label, position_values, equilibrium_position, linear_rms in position_hi
                 distribution_max_um,
                 1000
             )
-            linear_pdf_per_um = (
-                np.exp(
-                    -0.5
-                    * (
-                        (distribution_positions_um - equilibrium_position * 1e6)
-                        / linear_rms_um
-                    )**2
-                )
-                / (linear_rms_um * np.sqrt(2 * np.pi))
-            )
-            linear_expected_counts = (
-                linear_pdf_per_um
-                * len(finite_position_values_um)
-                * bin_width_um
-            )
+            linear_pdf_per_um = np.exp(-0.5 * ((distribution_positions_um - equilibrium_position * 1e6) / linear_rms_um)**2) / (linear_rms_um * np.sqrt(2 * np.pi))
+            linear_expected_counts = linear_pdf_per_um * len(finite_position_values_um) * bin_width_um
             plt.plot(
                 distribution_positions_um,
                 linear_expected_counts,
@@ -3702,16 +3298,11 @@ for axis_label, position_values, equilibrium_position, linear_rms in position_hi
 
 def nonlinear_vertical_probability_density_um(z_grid_m, power_factor):
     force_values = np.array([
-        F_optical_3d(x_eq, y_eq, z_i, power_factor)[2]
-        - effective_weight_force()
+        F_optical_3d(x_eq, y_eq, z_i, power_factor)[2] - effective_weight_force()
         for z_i in z_grid_m
     ])
     potential_values = np.zeros_like(z_grid_m)
-    potential_values[1:] = np.cumsum(
-        -0.5
-        * (force_values[:-1] + force_values[1:])
-        * np.diff(z_grid_m)
-    )
+    potential_values[1:] = np.cumsum(-0.5 * (force_values[:-1] + force_values[1:]) * np.diff(z_grid_m))
 
     exponent = -(potential_values - np.min(potential_values)) / (kB * T)
     probability_density = np.exp(exponent)
@@ -3732,10 +3323,7 @@ def linear_vertical_probability_density_um(z_grid_m):
 
     z_grid_um = z_grid_m * 1e6
     equilibrium_z_um = z_eq * 1e6
-    return (
-        np.exp(-0.5 * ((z_grid_um - equilibrium_z_um) / linear_rms_um)**2)
-        / (linear_rms_um * np.sqrt(2 * np.pi))
-    )
+    return np.exp(-0.5 * ((z_grid_um - equilibrium_z_um) / linear_rms_um)**2) / (linear_rms_um * np.sqrt(2 * np.pi))
 
 
 def laser_power_weighted_uncoupled_z_density_um(z_grid_m):
@@ -4233,11 +3821,7 @@ finish_plot(name="brownian_effect")
 sampling_frequency = 1 / dt_baoab
 nyquist_frequency = sampling_frequency / 2
 frequency_bin_size = 1 / (len(t_baoab) * dt_baoab)
-psd_plot_max_frequency = (
-    nyquist_frequency
-    if psd_plot_max_frequency_override is None
-    else psd_plot_max_frequency_override
-)
+psd_plot_max_frequency = nyquist_frequency if psd_plot_max_frequency_override is None else psd_plot_max_frequency_override
 
 # print("PSD sampling frequency =", sampling_frequency, "Hz")
 # print("PSD Nyquist frequency =", nyquist_frequency, "Hz")
@@ -4482,11 +4066,6 @@ if len(baoab_x_freqs) == 0:
 minimum_resolvable_frequency = baoab_x_freqs[0]
 minimum_plot_frequency = psd_min_frequency_factor * minimum_resolvable_frequency
 
-if power_pressure_scan_child:
-    minimum_plot_frequency = max(minimum_plot_frequency, 1.0)
-if diameter_scan_child:
-    minimum_plot_frequency = max(minimum_plot_frequency, 1.0)
-
 # print("Minimum resolvable non-zero frequency =", minimum_resolvable_frequency, "Hz")
 # print("Lower frequency shown on plot =", minimum_plot_frequency, "Hz")
 
@@ -4567,7 +4146,7 @@ axes[0].text(
     1.03,
     "(a)",
     transform=axes[0].transAxes,
-    fontsize=axis_label_fontsize,
+    fontsize=default_label_fontsize,
     ha="left",
     va="bottom",
 )
@@ -4576,7 +4155,7 @@ axes[1].text(
     1.03,
     "(b)",
     transform=axes[1].transAxes,
-    fontsize=axis_label_fontsize,
+    fontsize=default_label_fontsize,
     ha="left",
     va="bottom",
 )
@@ -4584,14 +4163,14 @@ axes[1].text(
 fig.subplots_adjust(left=0.095, right=0.985, bottom=0.21, top=0.70, wspace=0.62)
 finish_plot(name="laser_power_noise_and_psd", fig=fig)
 
-laser_power_psd_csv_path = os.path.join(save_path, "psd_laser_power.csv")
+laser_power_psd_csv_path = output_path("psd_laser_power.csv")
 save_laser_power_psd_csv(
     laser_power_psd_csv_path,
     laser_power_freqs,
     laser_power_psd,
     laser_relative_power_psd,
 )
-print("Saved laser-power PSD CSV:", laser_power_psd_csv_path)
+log(f"Saved laser-power PSD CSV: {laser_power_psd_csv_path}", verbose=True)
 
 plt.figure(figsize=spectrum_figsize)
 plt.loglog(baoab_x_freqs, baoab_x_psd, label="BAOAB x PSD")
@@ -4625,16 +4204,6 @@ plt.title("Raw x and z PSDs of BAOAB motion")
 plt.legend()
 plt.grid(True, which="both")
 finish_plot(name="psd_xz_raw")
-
-plt.figure(figsize=spectrum_figsize)
-plt.semilogy(baoab_x_freqs, baoab_x_psd, label="x PSD")
-plt.semilogy(baoab_z_freqs, baoab_z_psd, color="tab:orange", label="z PSD")
-add_resonance_harmonic_lines(max_frequency=120.0)
-apply_linear_psd_axes(max_frequency=120.0)
-plt.title("Raw x and z PSDs of BAOAB motion")
-plt.legend()
-plt.grid(True)
-finish_plot(name="psd_xz_raw_linear_0_120Hz")
 
 expected_resonant_frequencies = np.array([expected_fx, expected_fy, expected_fz])
 positive_expected_resonant_frequencies = expected_resonant_frequencies[
@@ -4699,9 +4268,13 @@ baoab_z_welch_freqs, baoab_z_welch_psd, _, _ = positive_welch_averaged_psd(
     t_baoab
 )
 
-print("Welch-averaged PSD segment duration =", welch_average_segment_duration_seconds, "s")
-print("Welch-averaged PSD nperseg =", welch_nperseg)
-print("Welch-averaged PSD frequency bin size =", welch_bin_size, "Hz")
+log(
+    "Welch-averaged PSD segment duration = "
+    f"{welch_average_segment_duration_seconds} s",
+    verbose=True,
+)
+log(f"Welch-averaged PSD nperseg = {welch_nperseg}", verbose=True)
+log(f"Welch-averaged PSD frequency bin size = {welch_bin_size} Hz", verbose=True)
 
 
 def simulated_frequency_from_psd_peak(frequencies, psd, expected_frequency):
@@ -4710,12 +4283,7 @@ def simulated_frequency_from_psd_peak(frequencies, psd, expected_frequency):
 
     frequencies = np.asarray(frequencies)
     psd = np.asarray(psd)
-    peak_mask = (
-        np.isfinite(frequencies)
-        & np.isfinite(psd)
-        & (frequencies >= 0.5 * expected_frequency)
-        & (frequencies <= 1.5 * expected_frequency)
-    )
+    peak_mask = np.isfinite(frequencies) & np.isfinite(psd) & (frequencies >= 0.5 * expected_frequency) & (frequencies <= 1.5 * expected_frequency)
 
     if not np.any(peak_mask):
         return np.nan
@@ -4771,7 +4339,7 @@ trap_frequency_rows = [
     for row in trap_frequency_rows
 ]
 
-trap_frequency_csv_path = os.path.join(save_path, "trap_frequency_comparison.csv")
+trap_frequency_csv_path = output_path("trap_frequency_comparison.csv")
 with open(trap_frequency_csv_path, "w", newline="") as csv_file:
     writer = csv.writer(csv_file)
     writer.writerow(
@@ -4787,42 +4355,14 @@ with open(trap_frequency_csv_path, "w", newline="") as csv_file:
     )
     writer.writerows(trap_frequency_rows)
 
-print()
-print("Trap frequency and RMS comparison")
-print(
-    "Axis | Theoretical f / Hz | Simulated f / Hz | f difference / % | "
-    "Theoretical RMS / um | Simulated RMS / um | RMS difference / %"
-)
-print("-" * 125)
-for (
-    axis_label,
-    theoretical_frequency,
-    simulated_frequency,
-    frequency_difference,
-    theoretical_rms_um,
-    simulated_rms_um,
-    rms_difference,
-) in trap_frequency_rows:
+if verbose_output:
+    print()
+    print("Trap frequency and RMS comparison")
     print(
-        f"{axis_label:>4} | "
-        f"{theoretical_frequency:18.2f} | "
-        f"{simulated_frequency:16.2f} | "
-        f"{frequency_difference:16.2f} | "
-        f"{theoretical_rms_um:20.3f} | "
-        f"{simulated_rms_um:18.3f} | "
-        f"{rms_difference:18.2f}"
+        "Axis | Theoretical f / Hz | Simulated f / Hz | f difference / % | "
+        "Theoretical RMS / um | Simulated RMS / um | RMS difference / %"
     )
-
-trap_frequency_table_text = [
-    [
-        axis_label,
-        f"{theoretical_frequency:.2f}",
-        f"{simulated_frequency:.2f}",
-        f"{frequency_difference:.2f}",
-        f"{theoretical_rms_um:.3f}",
-        f"{simulated_rms_um:.3f}",
-        f"{rms_difference:.2f}",
-    ]
+    print("-" * 125)
     for (
         axis_label,
         theoretical_frequency,
@@ -4831,41 +4371,18 @@ trap_frequency_table_text = [
         theoretical_rms_um,
         simulated_rms_um,
         rms_difference,
-    ) in trap_frequency_rows
-]
+    ) in trap_frequency_rows:
+        print(
+            f"{axis_label:>4} | "
+            f"{theoretical_frequency:18.2f} | "
+            f"{simulated_frequency:16.2f} | "
+            f"{frequency_difference:16.2f} | "
+            f"{theoretical_rms_um:20.3f} | "
+            f"{simulated_rms_um:18.3f} | "
+            f"{rms_difference:18.2f}"
+        )
 
-trap_frequency_table_fig, trap_frequency_table_axis = plt.subplots(
-    figsize=(9.8, 1.35),
-    dpi=300,
-)
-trap_frequency_table_axis.axis("off")
-trap_frequency_table = trap_frequency_table_axis.table(
-    cellText=trap_frequency_table_text,
-    colLabels=[
-        "Axis",
-        "Theoretical trap frequency / Hz",
-        "Simulated trap frequency / Hz",
-        "f difference / %",
-        "Theoretical RMS / μm",
-        "Simulated RMS / μm",
-        "RMS difference / %",
-    ],
-    loc="center",
-    cellLoc="center",
-)
-trap_frequency_table.auto_set_font_size(False)
-trap_frequency_table.set_fontsize(fontsize)
-trap_frequency_table.scale(1.0, 1.45)
-for (row_index, _column_index), cell in trap_frequency_table.get_celld().items():
-    cell.set_edgecolor("black")
-    cell.set_linewidth(0.6)
-    if row_index == 0:
-        cell.set_text_props(weight="bold")
-        cell.set_facecolor("#eaeaea")
-
-trap_frequency_table_fig.tight_layout(pad=0.2)
-finish_plot(name="trap_frequency_comparison_table", fig=trap_frequency_table_fig)
-print("Saved trap-frequency comparison CSV:", trap_frequency_csv_path)
+log(f"Saved trap-frequency comparison CSV: {trap_frequency_csv_path}", verbose=True)
 
 if include_uncoupled_nonlinear_psd:
     uncoupled_x_welch_freqs, uncoupled_x_welch_psd, _, _ = (
@@ -4974,15 +4491,7 @@ plt.loglog(
 )
 add_trap_resonance_lines()
 apply_psd_axes_without_nyquist()
-if power_pressure_scan_child:
-    plt.title(f"Welch PSDs, P = {P_laser:g} W, p = {p:g} Pa")
-elif diameter_scan_child:
-    plt.title(
-        f"Welch PSDs, d = {2 * radius * 1e6:g} μm, "
-        f"P = {P_laser:g} W, p = {p:g} Pa"
-    )
-else:
-    plt.title("Welch-averaged x and z PSDs of BAOAB motion")
+plt.title("Welch-averaged x and z PSDs of BAOAB motion")
 plt.legend()
 plt.grid(True, which="both")
 finish_plot(name="psd_xz_welch")
@@ -4994,7 +4503,7 @@ def add_panel_label(axis, label, x_offset=-0.16, y_offset=1.14):
         y_offset,
         label,
         transform=axis.transAxes,
-        fontsize=axis_label_fontsize,
+        fontsize=default_label_fontsize,
         fontweight="bold",
         ha="left",
         va="bottom",
@@ -5097,16 +4606,8 @@ def plot_histogram_summary_panel(
             distribution_max_um,
             1000,
         )
-        linear_pdf_per_um = (
-            np.exp(
-                -0.5
-                * ((distribution_positions_um - equilibrium_um) / linear_rms_um) ** 2
-            )
-            / (linear_rms_um * np.sqrt(2 * np.pi))
-        )
-        linear_values = (
-            linear_pdf_per_um if density else linear_pdf_per_um * len(finite_values_um) * bin_width_um
-        )
+        linear_pdf_per_um = np.exp(-0.5 * ((distribution_positions_um - equilibrium_um) / linear_rms_um) ** 2) / (linear_rms_um * np.sqrt(2 * np.pi))
+        linear_values = linear_pdf_per_um if density else linear_pdf_per_um * len(finite_values_um) * bin_width_um
         axis.plot(
             distribution_positions_um,
             linear_values,
@@ -5211,11 +4712,7 @@ if plot_aligned_summary_figure:
     )
 
     uncoupled_hist_axis = summary_fig.add_subplot(summary_grid[2, 1])
-    uncoupled_values_um = (
-        z_uncoupled_nonlinear * 1e6
-        if z_uncoupled_nonlinear is not None
-        else z_baoab * 1e6
-    )
+    uncoupled_values_um = z_uncoupled_nonlinear * 1e6 if z_uncoupled_nonlinear is not None else z_baoab * 1e6
     plot_histogram_summary_panel(
         uncoupled_hist_axis,
         uncoupled_values_um,
@@ -5228,21 +4725,6 @@ if plot_aligned_summary_figure:
     )
 
     finish_plot(name="aligned_summary_figure", fig=summary_fig)
-
-plt.figure(figsize=spectrum_figsize)
-plt.semilogy(baoab_x_welch_freqs, baoab_x_welch_psd, label="x Welch-averaged PSD")
-plt.semilogy(
-    baoab_z_welch_freqs,
-    baoab_z_welch_psd,
-    color="tab:orange",
-    label="z Welch-averaged PSD"
-)
-add_resonance_harmonic_lines(max_frequency=120.0)
-apply_linear_psd_axes(max_frequency=120.0)
-plt.title("Welch-averaged x and z PSDs of BAOAB motion")
-plt.legend()
-plt.grid(True)
-finish_plot(name="psd_xz_welch_linear_0_120Hz")
 
 if include_z_detector_resolution_psd:
     detector_position_resolution_m = detector_position_resolution_nm * 1e-9
@@ -5420,11 +4902,7 @@ ax = fig.add_subplot(111, projection="3d")
 x_3d_um_all = x_baoab[plot_slice] * 1e6
 y_3d_um_all = y_baoab[plot_slice] * 1e6
 z_3d_um_all = z_baoab[plot_slice] * 1e6
-finite_3d_mask = (
-    np.isfinite(x_3d_um_all)
-    & np.isfinite(y_3d_um_all)
-    & np.isfinite(z_3d_um_all)
-)
+finite_3d_mask = np.isfinite(x_3d_um_all) & np.isfinite(y_3d_um_all) & np.isfinite(z_3d_um_all)
 x_3d_um = x_3d_um_all[finite_3d_mask]
 y_3d_um = y_3d_um_all[finite_3d_mask]
 z_3d_um = z_3d_um_all[finite_3d_mask]
@@ -5524,56 +5002,22 @@ fig.suptitle("3D trajectory projections")
 plt.tight_layout()
 finish_plot(name="trajectory_projections")
 
-
-# ****************************************************************************************************************************************************
-# x-component optical-force magnitude heat map
-# ****************************************************************************************************************************************************
-x_fx_heatmap_values = np.linspace(
-    fx_heatmap_x_min,
-    fx_heatmap_x_max,
-    fx_heatmap_x_points
+total_runtime = perf_counter() - script_start_time
+print("Simulation complete.")
+print(f"Plots and CSV outputs saved to: {save_path}")
+print(
+    "Equilibrium position: "
+    f"x={x_eq * 1e6:.3g} um, "
+    f"y={y_eq * 1e6:.3g} um, "
+    f"z={z_eq * 1e6:.3g} um"
 )
-z_fx_heatmap_values = np.linspace(
-    fx_heatmap_z_min,
-    fx_heatmap_z_max,
-    fx_heatmap_z_points
+print(
+    "Expected trap frequencies: "
+    f"fx={expected_fx:.3g} Hz, "
+    f"fy={expected_fy:.3g} Hz, "
+    f"fz={expected_fz:.3g} Hz"
 )
-X_fx_heatmap, Z_fx_heatmap = np.meshgrid(
-    x_fx_heatmap_values,
-    z_fx_heatmap_values,
-    indexing="xy"
-)
-
-Fx_heatmap, _ = F_optical_2d(X_fx_heatmap, Z_fx_heatmap)
-Fx_magnitude_pN = np.abs(Fx_heatmap) * 1e12
-
-fig, ax = plt.subplots(figsize=force_field_figsize)
-mesh = ax.pcolormesh(
-    X_fx_heatmap * 1e6,
-    Z_fx_heatmap * 1e6,
-    Fx_magnitude_pN,
-    shading="auto",
-    cmap="viridis",
-    rasterized=True,
-)
-colorbar = fig.colorbar(mesh, ax=ax)
-colorbar.set_label(r"$|F_x|$ (pN)")
-ax.axvline(0.0, color="white", linestyle=":", linewidth=0.8, alpha=0.85)
-ax.scatter(
-    [x_eq * 1e6],
-    [z_eq * 1e6],
-    color="white",
-    edgecolor="black",
-    linewidth=0.4,
-    s=18,
-    label="selected equilibrium",
-)
-ax.set_xlabel(r"$x$ ($\mu$m)")
-ax.set_ylabel(r"$z$ ($\mu$m)")
-ax.set_title(r"Magnitude of transverse optical force, $|F_x|$")
-ax.legend(loc="upper right")
-plt.tight_layout()
-finish_plot(name="fx_magnitude_heatmap")
+print(f"Total runtime: {total_runtime:.3g} s")
 
 # ****************************************************************************************************************************************************
 # Transverse restoring-force check

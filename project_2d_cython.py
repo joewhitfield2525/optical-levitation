@@ -693,9 +693,7 @@ print("Damping ratio z =", b / (2 * np.sqrt(m * kz)))
 # Damped harmonic oscillator validation
 # ****************************************************************************************************************************************************
 run_damped_oscillator_validation = True
-validation_plot_dir = Path(
-    "/Users/josephwhitfield/Documents/optical levitation/validation_plots"
-)
+validation_plot_dir = Path(__file__).resolve().parent / "validation_plots"
 validation_plot_dir.mkdir(parents=True, exist_ok=True)
 
 

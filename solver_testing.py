@@ -9,6 +9,8 @@ import matplotlib.pyplot as plt
 from matplotlib.ticker import FixedLocator, FuncFormatter, LogLocator
 from scipy.integrate import solve_ivp
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+
 # --- Publication style ---
 fontsize = 7
 mpl.rcParams.update({
@@ -65,7 +67,7 @@ t_start = 0.0
 t_end = 5.0
 t_eval = np.linspace(t_start, t_end, 5000)
 
-output_dir = Path("/Users/josephwhitfield/Documents/optical levitation/solver_validation_plots")
+output_dir = SCRIPT_DIR / "solver_validation_plots"
 output_dir.mkdir(parents=True, exist_ok=True)
 accuracy_runtime_csv = output_dir / "deterministic_solver_accuracy_vs_runtime.csv"
 

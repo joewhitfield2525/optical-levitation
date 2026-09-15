@@ -268,7 +268,9 @@ def find_stable_equilibrium(
 def main() -> None:
     args = parse_args()
     output_dir = Path(args.output_dir)
-    output_dir.mkdir(exist_ok=True)
+    if not output_dir.is_absolute():
+        output_dir = Path(__file__).resolve().parent / output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     gas = Gas(
         temperature=args.gas_temperature,

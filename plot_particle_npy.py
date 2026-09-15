@@ -5,8 +5,9 @@ import numpy as np
 from scipy.signal import welch
 
 
+SCRIPT_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path("/Users/josephwhitfield/Masters/Summer Project/11_06_2026 PSD")
-OUTPUT_DIR = Path("/Users/josephwhitfield/Masters/Summer Project/experimental data")
+OUTPUT_DIR = SCRIPT_DIR / "experimental data"
 
 ADC_MIN = 32500
 ADC_MAX = 31

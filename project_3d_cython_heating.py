@@ -10,6 +10,8 @@ from pathlib import Path
 import csv
 import sys
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+
 CYTHON_DIR = Path("/Users/josephwhitfield/Masters/Summer Project/cython_improved")
 sys.path.insert(0, str(CYTHON_DIR))
 
@@ -339,7 +341,7 @@ force_check_figsize = (8, 5)
 force_field_figsize = (8, 6)
 
 # Validation output
-validation_plot_dir = Path("/Users/josephwhitfield/Documents/optical levitation/validation_plots")
+validation_plot_dir = SCRIPT_DIR / "validation_plots"
 run_brownian_force_scaling_validation = brownian_force_scaling_only
 run_psd_normalisation_validation = True
 run_welch_averaging_validation = True

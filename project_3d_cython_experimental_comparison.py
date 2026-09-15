@@ -12,6 +12,8 @@ from pathlib import Path
 import csv
 import sys
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+
 # --- Publication style ---
 fontsize = 7
 mpl.rcParams.update({
@@ -49,7 +51,7 @@ mpl.rcParams.update({
     # "axes.spines.top": False,
     # "axes.spines.right": False,
 })
-save_path = "./Figures/"
+save_path = SCRIPT_DIR / "Figures"
 os.makedirs(save_path, exist_ok=True)
 
 CYTHON_DIR = Path("/Users/josephwhitfield/Masters/Summer Project/cython_improved")
@@ -113,7 +115,7 @@ wavelength = 532e-9
 M2 = 1.2
 use_m2_rayleigh_range = True
 zR_manual = 100e-6
-P_laser = 0.04           # W, example laser power
+P_laser = 0.075           # W, example laser power
 use_laser_power_noise = True
 laser_noise_model = "synthetic_step"
 # Choose one of:
@@ -153,7 +155,7 @@ ray_grid_points = 200
 k_particle = 0.135       # W/(m K)
 alpha_acc = 1.0
 kappa_t = 1.14
-absorption_fraction = 15e-3
+absorption_fraction = 1e-3
 
 # 3D force lookup table
 use_force_lookup_table = True
@@ -310,7 +312,7 @@ force_check_figsize = publication_figsize
 force_field_figsize = publication_figsize
 
 # Validation output
-validation_plot_dir = Path("/Users/josephwhitfield/Masters/Summer Project/cython_improved/simvexp")
+validation_plot_dir = SCRIPT_DIR / "simvexp"
 run_brownian_force_scaling_validation = brownian_force_scaling_only
 run_psd_normalisation_validation = True
 run_welch_averaging_validation = True

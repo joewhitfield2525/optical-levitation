@@ -29,10 +29,8 @@ from scipy.signal import welch
 # =============================================================================
 # Output
 # =============================================================================
-output_dir = Path(
-    "/Users/josephwhitfield/Documents/optical levitation/"
-    "brownian_solver_validation_plots"
-)
+SCRIPT_DIR = Path(__file__).resolve().parent
+output_dir = SCRIPT_DIR / "brownian_solver_validation_plots"
 output_dir.mkdir(parents=True, exist_ok=True)
 
 
